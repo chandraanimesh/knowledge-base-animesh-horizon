@@ -1,0 +1,11 @@
+{
+  "title": "Doot",
+  "description": "Engage with a soothing, minimalistic chatbot designed to provide unique conversational experiences, enhancing user interaction and satisfaction.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

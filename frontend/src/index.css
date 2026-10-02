@@ -1,0 +1,63 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=Outfit:wght@300;400;500&family=DM+Mono:wght@400;500&display=swap');
+@import 'tailwindcss';
+
+@theme {
+  --font-serif: 'DM Serif Display', Georgia, serif;
+  --font-sans: 'Outfit', system-ui, sans-serif;
+  --font-mono: 'DM Mono', monospace;
+
+  --color-ground: #f0f0eb;
+  --color-surface: #fafaf7;
+  --color-panel: #e8e8e2;
+  --color-border: #d4d4cc;
+  --color-ink: #1a1a18;
+  --color-ink-muted: #6b6b64;
+  --color-teal: #3d7a78;
+  --color-teal-light: #e4f0ef;
+  --color-teal-dim: #2d5a58;
+  --color-user-bubble: #fafaf7;
+  --color-user-text: #1a1a18;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100vh;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+html {
+  font-family: var(--font-sans);
+  background: var(--color-ground);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 2px;
+}
+
+::selection {
+  background: var(--color-teal-light);
+  color: var(--color-teal-dim);
+}
+
+textarea:focus, input:focus {
+  outline: none;
+}
