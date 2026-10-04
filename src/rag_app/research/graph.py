@@ -249,7 +249,9 @@ async def evaluate_sufficiency(
     # RAG is insufficient -> Research Engine.
     if not chunks:
         from rag_app.retrieval.query_parser import is_history_query
-        if is_history_query(state["query"]) or bool(state.get("workspace_thread_context")):
+        has_thread_context = bool(state.get("workspace_thread_context"))
+        has_conv_history = bool(state.get("conversation_history"))
+        if is_history_query(state["query"]) or has_thread_context or has_conv_history:
             logger.info("Empty chunks but detected history or workspace thread context; routing to LLM.")
             return {
                 "is_sufficient": True,

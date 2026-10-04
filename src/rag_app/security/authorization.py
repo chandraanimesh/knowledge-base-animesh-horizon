@@ -1,7 +1,7 @@
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, exists
-from rag_app.db.models import User, Department, Permission, UserDepartment, UserPermission, Document, DocumentPermission
+from rag_app.db.models import User, Department, Permission, UserDepartment, UserPermission, Document, DocumentPermission, Workspace, WorkspaceMember
 
 async def authorize(
     session: AsyncSession,
@@ -206,4 +206,113 @@ async def get_allowed_document_ids(
     )
     result = await session.scalars(stmt)
     return list(result.all())
+
+
+async def get_allowed_workspaces(
+    session: AsyncSession,
+    user: User,
+) -> list[uuid.UUID] | None:
+    """
+    Returns list of Workspace IDs that the user is authorized to access.
+    Evaluates:
+      1. User is active.
+      2. ADMIN -> returns None (global access to all active, non-deleted workspaces).
+      3. USER -> must possess active Department VIEW permission AND active WorkspaceMember role.
+      4. Both Workspace and Department must be active and not deleted.
+    Returns [] for inactive/unauthorized users.
+    """
+    if not user.is_active:
+        return []
+    if user.role == "ADMIN":
+        return None
+    if user.role != "USER":
+        return []
+
+    stmt = (
+        select(Workspace.id)
+        .join(Department, Workspace.department_id == Department.id)
+        .join(
+            UserDepartment,
+            and_(
+                UserDepartment.user_id == user.id,
+                UserDepartment.department_id == Department.id,
+            ),
+        )
+        .join(
+            UserPermission,
+            and_(
+                UserPermission.user_id == user.id,
+                UserPermission.department_id == Department.id,
+            ),
+        )
+        .join(
+            Permission,
+            and_(
+                Permission.id == UserPermission.permission_id,
+                Permission.code == "VIEW",
+                Permission.is_active == True,
+            ),
+        )
+        .join(
+            WorkspaceMember,
+            and_(
+                WorkspaceMember.workspace_id == Workspace.id,
+                WorkspaceMember.user_id == user.id,
+            ),
+        )
+        .where(
+            Workspace.is_active == True,
+            Workspace.deleted_at.is_(None),
+            Department.is_active == True,
+            Department.deleted_at.is_(None),
+        )
+    )
+    result = await session.scalars(stmt)
+    return list(result.all())
+
+
+async def authorize_workspace(
+    session: AsyncSession,
+    user: User,
+    workspace_id: uuid.UUID,
+) -> bool:
+    """
+    Validates whether the user is authorized to access a specific workspace.
+    Fails closed by default.
+    ADMIN has global access provided workspace & department are active and non-deleted.
+    USER requires active department VIEW permission AND workspace membership.
+    """
+    if not user.is_active:
+        return False
+
+    ws = await session.get(Workspace, workspace_id)
+    if not ws or not ws.is_active or ws.deleted_at is not None:
+        return False
+
+    dept = await session.get(Department, ws.department_id)
+    if not dept or not dept.is_active or dept.deleted_at is not None:
+        return False
+
+    if user.role == "ADMIN":
+        return True
+    if user.role != "USER":
+        return False
+
+    # Check department VIEW permission
+    is_dept_auth = await authorize(session, user, "VIEW", dept.code)
+    if not is_dept_auth:
+        return False
+
+    # Check workspace membership
+    is_member = await session.scalar(
+        select(
+            exists().where(
+                and_(
+                    WorkspaceMember.workspace_id == ws.id,
+                    WorkspaceMember.user_id == user.id,
+                )
+            )
+        )
+    )
+    return bool(is_member)
 

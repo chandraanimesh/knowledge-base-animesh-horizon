@@ -4,12 +4,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from rag_app.db.models import ChatMessage, Conversation, User, Workspace, WorkspaceMember, Department
-from rag_app.security.authorization import authorize
+from rag_app.security.authorization import authorize, get_allowed_workspaces
 from rag_app.schemas.rag import (
     ChatMessageResponse,
     ConversationDetailResponse,
@@ -218,6 +218,9 @@ class ConversationService:
 
         if target_ws_id is not None:
             stmt = stmt.where(Conversation.workspace_id == target_ws_id)
+        else:
+            # Global Chat scope: strictly list only Global conversations where workspace_id is NULL
+            stmt = stmt.where(Conversation.workspace_id.is_(None))
 
         stmt = (
             stmt.group_by(Conversation.id, Workspace.name)
@@ -401,19 +404,28 @@ class ConversationService:
             if not conv:
                 raise HTTPException(status_code=404, detail="Conversation not found")
 
-            if conv.workspace_id is not None:
+            # Validate scope match between request and existing conversation
+            if workspace_id is None:
+                # Global Chat request: Conversation must be a global conversation (workspace_id is None)
+                if conv.workspace_id is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Scope mismatch: Cannot use a workspace-scoped conversation in Global Chat.",
+                    )
+            else:
+                # Workspace Chat request: Conversation must belong to the requested workspace
+                if conv.workspace_id is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Scope mismatch: Cannot use a global conversation in Workspace Chat.",
+                    )
                 conv_ws = await self._validate_workspace_access(user, conv.workspace_id)
-                if workspace_id is not None:
-                    req_ws = await self._validate_workspace_access(user, workspace_id)
-                    if conv_ws.id != req_ws.id:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Conversation belongs to workspace '{conv_ws.name}', not requested workspace '{req_ws.name}'.",
-                        )
-            elif workspace_id is not None:
-                # Associating previously null workspace conversation to requested workspace
                 req_ws = await self._validate_workspace_access(user, workspace_id)
-                conv.workspace_id = req_ws.id
+                if conv_ws.id != req_ws.id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Conversation belongs to workspace '{conv_ws.name}', not requested workspace '{req_ws.name}'.",
+                    )
 
             # If the conversation has a placeholder title, assign a deterministic initial title
             if self.is_placeholder_title(conv.title):
@@ -445,13 +457,14 @@ class ConversationService:
     async def search_workspace_threads(
         self,
         user: User,
-        workspace_id: uuid.UUID,
-        query: str,
+        workspace_id: uuid.UUID | None = None,
+        query: str = "",
         current_conversation_id: uuid.UUID | None = None,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         """
-        Retrieves relevant prior conversation messages within the same Workspace.
+        Retrieves relevant prior conversation messages within the authorized Workspace(s).
+        If workspace_id is None, searches across all authorized workspaces for the user.
         """
         from rag_app.retrieval.workspace_thread_retriever import WorkspaceThreadRetriever
         return await WorkspaceThreadRetriever.retrieve_workspace_threads(

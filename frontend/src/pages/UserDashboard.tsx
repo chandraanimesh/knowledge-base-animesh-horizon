@@ -411,7 +411,7 @@ export default function UserDashboard({
       />
 
       {/* WorkspacePanel only visible on chat view */}
-      {activeView === 'chat' && (
+      {(activeView as string) === 'chat' && (
         <WorkspacePanel
           workspaces={workspaces}
           activeWorkspaceId={activeWorkspaceId}
@@ -463,7 +463,7 @@ export default function UserDashboard({
         )}
 
         {/* VIEW 1: Dashboard / Chat */}
-        {activeView === 'chat' && (
+        {(activeView as string) === 'chat' && (
           <RAG
             token={token}
             userName={userName}

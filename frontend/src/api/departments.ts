@@ -1,5 +1,6 @@
 import { apiClient } from './client';
 import { DepartmentResponse } from './admin';
+export type { DepartmentResponse };
 
 export async function getAllDepartments(token: string): Promise<DepartmentResponse[]> {
   return apiClient<DepartmentResponse[]>('/admin/departments', { method: 'GET' }, token);

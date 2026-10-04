@@ -324,7 +324,7 @@ async def ask_question(
     from rag_app.core.observability import init_request_metrics, finalize_request_metrics
     from rag_app.conversation.service import ConversationService
     from rag_app.db.models import Workspace, WorkspaceMember
-    from rag_app.security.authorization import authorize
+    from rag_app.security.authorization import authorize, get_allowed_departments
     
     request_id = str(uuid4())
     init_request_metrics(request_id)
@@ -339,17 +339,24 @@ async def ask_question(
     )
     effective_workspace_id = conv.workspace_id or request.workspace_id
 
-    # 1. Global Admin Chat check & authorization (Requirement 1)
+    # 1. Global vs Workspace Chat authorization & scoping
     if effective_workspace_id is None:
-        if user.role != "ADMIN":
-            raise HTTPException(
-                status_code=403,
-                detail="Forbidden: Global chat across departments is restricted to administrators.",
-            )
-        from rag_app.db.models import Department
-        active_depts = (await session.scalars(select(Department.id).where(Department.is_active == True))).all()
-        allowed_departments = list(active_depts)
-        workspace_thread_context = []
+        # Global Chat: search across all authorized workspaces
+        if user.role == "ADMIN":
+            from rag_app.db.models import Department
+            active_depts = (await session.scalars(select(Department.id).where(Department.is_active == True, Department.deleted_at.is_(None)))).all()
+            allowed_departments = list(active_depts)
+        else:
+            allowed_departments = await get_allowed_departments(session, user)
+
+        # Cross-workspace conversation retrieval across ALL authorized workspaces
+        workspace_thread_context = await conv_service.search_workspace_threads(
+            user=user,
+            workspace_id=None,
+            query=request.query,
+            current_conversation_id=conv.id,
+            limit=5,
+        )
     else:
         # Department workspace chat: scoped strictly to this workspace's department
         ws = await conv_service._validate_workspace_access(user, effective_workspace_id)
@@ -454,11 +461,14 @@ async def ask_question(
             for c in resp.retrieved_chunks
         ]
         for t in workspace_thread_context:
+            title_suffix = f" ({t['workspace_name']})" if t.get("workspace_name") else ""
             sources_payload.append({
                 "type": "thread",
-                "title": f"Thread: \"{t['thread_title']}\"",
+                "title": f"Thread: \"{t['thread_title']}\"{title_suffix}",
                 "thread_id": t["thread_id"],
                 "thread_title": t["thread_title"],
+                "workspace_id": t.get("workspace_id"),
+                "workspace_name": t.get("workspace_name"),
                 "message_id": t["message_id"],
                 "role": t["role"],
                 "excerpt": t["content"],

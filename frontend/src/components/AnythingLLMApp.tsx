@@ -240,7 +240,7 @@ export default function AnythingLLMApp({
         if (targetThreadId) {
           setActiveThreadId(targetThreadId)
         }
-      } else if (isChatUrl && userRole === 'ADMIN') {
+      } else if (isChatUrl) {
         setActiveWorkspace(null)
         setCurrentNavView('chat')
       } else if (dynamicWorkspaces.length > 0) {
@@ -311,10 +311,10 @@ export default function AnythingLLMApp({
   useEffect(() => {
     if (activeWorkspace) {
       loadThreadsForWorkspace(activeWorkspace.id)
-    } else if (currentNavView === 'chat' && currentUser?.role === 'ADMIN') {
+    } else if (currentNavView === 'chat') {
       loadThreadsForWorkspace(null)
     }
-  }, [activeWorkspace, currentNavView, currentUser?.role, loadThreadsForWorkspace])
+  }, [activeWorkspace, currentNavView, loadThreadsForWorkspace])
 
   // 4. Load Conversation Messages when Thread Changes (with stable deduplication)
   useEffect(() => {
@@ -506,8 +506,21 @@ export default function AnythingLLMApp({
   }
 
   const handleCreateNewThread = async () => {
-    if (!activeWorkspace) return
-    await handleCreateNewThreadForWs(activeWorkspace)
+    if (activeWorkspace) {
+      await handleCreateNewThreadForWs(activeWorkspace)
+    } else {
+      try {
+        const newThread = await createConversation('New Thread', token, null)
+        setThreads((prev) => [newThread, ...prev])
+        setActiveThreadId(newThread.id)
+        setMessages([])
+        setActiveWsTab('threads')
+        setCurrentNavView('chat')
+        showToast('success', 'Created new Global Chat thread.')
+      } catch (err: any) {
+        showToast('error', err.message || 'Failed to create new thread.')
+      }
+    }
   }
 
   const handleDeleteThread = async (e: React.MouseEvent, threadId: string) => {
@@ -582,7 +595,14 @@ export default function AnythingLLMApp({
     }
     setSubmittingAccessReq(true)
     try {
-      await accessRequestApi.createAccessRequest(accessReqDept, accessReqPerms, accessReqReason, token)
+      await accessRequestApi.createAccessRequest(
+        {
+          department_code: accessReqDept,
+          requested_permissions: accessReqPerms,
+          reason: accessReqReason,
+        },
+        token
+      )
       showToast('success', `Access request for ${accessReqDept} submitted!`)
       setShowAccessReqModal(false)
       setAccessReqReason('')
@@ -780,19 +800,15 @@ export default function AnythingLLMApp({
           {/* 3. Global Navigation Section */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', marginBottom: '8px' }}>
             {[
-              ...(currentUser?.role === 'ADMIN'
-                ? [
-                    {
-                      id: 'chat',
-                      label: 'Chat',
-                      icon: (
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                        </svg>
-                      ),
-                    },
-                  ]
-                : []),
+              {
+                id: 'chat',
+                label: 'Global Chat',
+                icon: (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                  </svg>
+                ),
+              },
               {
                 id: 'documents',
                 label: 'Documents',
@@ -860,13 +876,11 @@ export default function AnythingLLMApp({
                   key={nav.id}
                   onClick={() => {
                     if (nav.id === 'chat') {
-                      if (currentUser?.role === 'ADMIN') {
-                        setCurrentNavView('chat')
-                        setActiveWorkspace(null)
-                        setActiveThreadId(null)
-                        setMessages([])
-                        navigate('/app/chat')
-                      }
+                      setCurrentNavView('chat')
+                      setActiveWorkspace(null)
+                      setActiveThreadId(null)
+                      setMessages([])
+                      navigate('/app/chat')
                     } else {
                       setCurrentNavView(nav.id as GlobalNavView)
                     }
@@ -974,7 +988,11 @@ export default function AnythingLLMApp({
                     {/* Workspace Card Header */}
                     <div
                       onClick={() => {
-                        setActiveWorkspace(ws)
+                        if (activeWorkspace?.id !== ws.id) {
+                          setActiveWorkspace(ws)
+                          setActiveThreadId(null)
+                          setMessages([])
+                        }
                         setCurrentNavView('chat')
                         setActiveWsTab('threads')
                         navigate(`/app/workspace/${ws.id}`)
@@ -1283,7 +1301,7 @@ export default function AnythingLLMApp({
                     fontWeight: 600,
                   }}
                 >
-                  CROSS-DEPARTMENT · ADMIN
+                  {currentUser?.role === 'ADMIN' ? 'GLOBAL · ADMIN' : 'GLOBAL'}
                 </span>
               </div>
             )}
@@ -1837,7 +1855,7 @@ export default function AnythingLLMApp({
                       accessRequests.map((req) => (
                         <tr key={req.id} style={{ borderBottom: '1px solid #F1F5F9' }}>
                           <td style={{ padding: '8px 12px', fontWeight: 500, color: '#1E293B' }}>{req.department_name || req.department_code}</td>
-                          <td style={{ padding: '8px 12px', color: '#475569' }}>{req.permissions?.join(', ')}</td>
+                          <td style={{ padding: '8px 12px', color: '#475569' }}>{(req.requested_permissions || (req as any).permissions)?.join(', ')}</td>
                           <td style={{ padding: '8px 12px' }}>
                             <span style={{ fontSize: '10.5px', padding: '2px 6px', borderRadius: '4px', background: req.status === 'APPROVED' ? '#ECFDF5' : req.status === 'PENDING' ? '#FFFBEB' : '#FEF2F2', color: req.status === 'APPROVED' ? '#047857' : req.status === 'PENDING' ? '#B45309' : '#991B1B' }}>
                               {req.status}

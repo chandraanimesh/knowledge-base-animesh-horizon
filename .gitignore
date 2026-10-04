@@ -16,6 +16,4 @@ ocr_rapidocr/*
 
 *.egg-info/
 
-directory_extractor/
-directory_extractor.zip
-*.zip
+directory_extractor

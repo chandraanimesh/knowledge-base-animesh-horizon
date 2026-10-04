@@ -4,12 +4,12 @@ import uuid
 from typing import Any
 from datetime import datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from rag_app.db.models import ChatMessage, Conversation, Department, User, Workspace, WorkspaceMember
-from rag_app.security.authorization import authorize
+from rag_app.db.models import ChatMessage, Conversation, Department, Permission, User, UserDepartment, UserPermission, Workspace, WorkspaceMember
+from rag_app.security.authorization import authorize, get_allowed_workspaces
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +54,11 @@ def extract_search_terms(query: str) -> list[str]:
 
 class WorkspaceThreadRetriever:
     """
-    Retrieves relevant conversation messages from prior threads within the SAME Workspace.
-    Strictly scoped to the authorized Workspace boundary.
+    Retrieves relevant conversation messages from prior threads within:
+    - A single Workspace (Workspace Chat), or
+    - Across all authorized Workspaces (Global Chat).
+
+    Strictly applies deterministic server-side RBAC filters at the query level BEFORE ranking.
     """
 
     @classmethod
@@ -63,63 +66,150 @@ class WorkspaceThreadRetriever:
         cls,
         session: AsyncSession,
         user: User,
-        workspace_id: uuid.UUID,
-        query: str,
+        workspace_id: uuid.UUID | None = None,
+        query: str = "",
         current_conversation_id: uuid.UUID | None = None,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         """
-        Searches previous threads in the given workspace for relevant messages.
-        Validates user authorization for the workspace.
+        Searches previous threads in authorized workspace(s) for relevant messages.
+        If workspace_id is provided: scopes search to that single workspace after verifying authorization.
+        If workspace_id is None: searches across all workspaces the user is authorized to access.
         """
-        # 1. Authorize Workspace access
-        ws = await session.scalar(
-            select(Workspace).where(
-                Workspace.id == workspace_id,
-                Workspace.deleted_at.is_(None),
-                Workspace.is_active == True,
-            )
-        )
-        if not ws:
+        if not user.is_active:
+            return []
+
+        authorized_workspaces: dict[uuid.UUID, str] = {}
+
+        # -------------------------------------------------------------
+        # 1. SCOPE RESOLUTION & AUTHORIZATION (BEFORE RETRIEVAL)
+        # -------------------------------------------------------------
+        if workspace_id is not None:
+            # Workspace Chat: Validate single workspace authorization
             ws = await session.scalar(
                 select(Workspace).where(
-                    Workspace.department_id == workspace_id,
+                    Workspace.id == workspace_id,
                     Workspace.deleted_at.is_(None),
                     Workspace.is_active == True,
                 )
             )
-        if not ws:
-            logger.warning(f"Workspace {workspace_id} not found or inactive during thread retrieval.")
+            if not ws:
+                ws = await session.scalar(
+                    select(Workspace).where(
+                        Workspace.department_id == workspace_id,
+                        Workspace.deleted_at.is_(None),
+                        Workspace.is_active == True,
+                    )
+                )
+            if not ws:
+                logger.warning(f"Workspace {workspace_id} not found or inactive during thread retrieval.")
+                return []
+
+            dept = await session.get(Department, ws.department_id)
+            if not dept or not dept.is_active or dept.deleted_at is not None:
+                logger.warning(f"Department for workspace {ws.name} is inactive or deleted.")
+                return []
+
+            if user.role != "ADMIN":
+                if user.role != "USER":
+                    return []
+                # Department VIEW permission check
+                is_dept_auth = await authorize(session, user, "VIEW", dept.code)
+                if not is_dept_auth:
+                    logger.warning(f"User {user.id} unauthorized for department {dept.code}.")
+                    return []
+                # Workspace membership check
+                ws_member = await session.scalar(
+                    select(WorkspaceMember).where(
+                        WorkspaceMember.workspace_id == ws.id,
+                        WorkspaceMember.user_id == user.id,
+                    )
+                )
+                if not ws_member:
+                    logger.warning(f"User {user.id} is not a member of workspace {ws.name}.")
+                    return []
+
+            authorized_workspaces[ws.id] = ws.name
+
+        else:
+            # Global Chat: Retrieve across all workspaces the user is authorized to access
+            if user.role == "ADMIN":
+                stmt = (
+                    select(Workspace.id, Workspace.name)
+                    .join(Department, Workspace.department_id == Department.id)
+                    .where(
+                        Workspace.is_active == True,
+                        Workspace.deleted_at.is_(None),
+                        Department.is_active == True,
+                        Department.deleted_at.is_(None),
+                    )
+                )
+                rows = (await session.execute(stmt)).all()
+                authorized_workspaces = {ws_id: ws_name for ws_id, ws_name in rows}
+            elif user.role == "USER":
+                stmt = (
+                    select(Workspace.id, Workspace.name)
+                    .join(Department, Workspace.department_id == Department.id)
+                    .join(
+                        UserDepartment,
+                        and_(
+                            UserDepartment.user_id == user.id,
+                            UserDepartment.department_id == Department.id,
+                        ),
+                    )
+                    .join(
+                        UserPermission,
+                        and_(
+                            UserPermission.user_id == user.id,
+                            UserPermission.department_id == Department.id,
+                        ),
+                    )
+                    .join(
+                        Permission,
+                        and_(
+                            Permission.id == UserPermission.permission_id,
+                            Permission.code == "VIEW",
+                            Permission.is_active == True,
+                        ),
+                    )
+                    .join(
+                        WorkspaceMember,
+                        and_(
+                            WorkspaceMember.workspace_id == Workspace.id,
+                            WorkspaceMember.user_id == user.id,
+                        ),
+                    )
+                    .where(
+                        Workspace.is_active == True,
+                        Workspace.deleted_at.is_(None),
+                        Department.is_active == True,
+                        Department.deleted_at.is_(None),
+                    )
+                )
+                rows = (await session.execute(stmt)).all()
+                authorized_workspaces = {ws_id: ws_name for ws_id, ws_name in rows}
+            else:
+                return []
+
+        if not authorized_workspaces:
             return []
 
-        if user.role != "ADMIN":
-            dept = await session.get(Department, ws.department_id)
-            if not dept or not (await authorize(session, user, "VIEW", dept.code)):
-                logger.warning(f"User {user.id} unauthorized for department {dept.code if dept else 'None'}.")
-                return []
-            ws_member = await session.scalar(
-                select(WorkspaceMember).where(
-                    WorkspaceMember.workspace_id == ws.id,
-                    WorkspaceMember.user_id == user.id,
-                )
-            )
-            if not ws_member:
-                logger.warning(f"User {user.id} is not a member of workspace {ws.name}.")
-                return []
-
-        effective_ws_id = ws.id
-
-        # 2. Extract search terms
+        # -------------------------------------------------------------
+        # 2. KEYWORD EXTRACTION
+        # -------------------------------------------------------------
         terms = extract_search_terms(query)
         if not terms:
             return []
 
-        # 3. Query other conversations within this workspace
+        # -------------------------------------------------------------
+        # 3. DATABASE RETRIEVAL (STRICTLY CONSTRAINED TO AUTHORIZED WS)
+        # -------------------------------------------------------------
+        target_ws_ids = list(authorized_workspaces.keys())
         conv_stmt = (
             select(Conversation)
             .options(selectinload(Conversation.messages))
             .where(
-                Conversation.workspace_id == effective_ws_id,
+                Conversation.workspace_id.in_(target_ws_ids),
             )
         )
         if current_conversation_id is not None:
@@ -130,38 +220,43 @@ class WorkspaceThreadRetriever:
         if not conversations:
             return []
 
-        # 4. Score messages based on keyword overlap & conversation title relevance
-        scored_messages: list[tuple[float, ChatMessage, Conversation]] = []
-
-        query_lower = query.lower()
+        # -------------------------------------------------------------
+        # 4. RELEVANCE SCORING
+        # -------------------------------------------------------------
+        scored_messages: list[tuple[float, ChatMessage, Conversation, str]] = []
 
         for conv in conversations:
+            ws_name = authorized_workspaces.get(conv.workspace_id, "")
+            ws_name_lower = ws_name.lower()
             title_lower = conv.title.lower() if conv.title else ""
             title_match_count = sum(1 for term in terms if term in title_lower)
+            ws_match_count = sum(1 for term in terms if term in ws_name_lower)
 
             for msg in conv.messages:
                 if msg.role not in ("user", "assistant"):
                     continue
                 content_lower = msg.content.lower()
 
-                # Calculate term frequency / keyword overlap
                 content_match_count = sum(1 for term in terms if term in content_lower)
 
+                # A candidate must have at least one keyword match in its content or thread title.
+                # Workspace name alone must not pull unrelated messages.
                 if content_match_count == 0 and title_match_count == 0:
                     continue
 
                 # Scoring formula:
-                # Content match: 2.0 per matched term
-                # Title match bonus: 1.5 per matched term
-                # Full phrase match bonus (if any 2+ consecutive terms appear): 3.0
-                score = (content_match_count * 2.0) + (title_match_count * 1.5)
+                # Content match: 3.0 per matched term
+                # Title match bonus: 2.0 per matched term
+                # Workspace name match bonus: 1.0 per matched term (only for relevant messages)
+                # Bigram / consecutive terms match bonus: 4.0
+                score = (content_match_count * 3.0) + (title_match_count * 2.0) + (ws_match_count * 1.0)
 
                 for i in range(len(terms) - 1):
                     bigram = f"{terms[i]} {terms[i+1]}"
                     if bigram in content_lower:
-                        score += 3.0
+                        score += 4.0
 
-                scored_messages.append((score, msg, conv))
+                scored_messages.append((score, msg, conv, ws_name))
 
         if not scored_messages:
             return []
@@ -172,11 +267,35 @@ class WorkspaceThreadRetriever:
             reverse=True,
         )
 
-        top_candidates = scored_messages[:limit]
+        # In Global Chat across multiple workspaces, ensure balanced diversity so one workspace does not starve others
+        if workspace_id is None and len(authorized_workspaces) > 1:
+            per_ws_cap = max(2, limit // len(authorized_workspaces) + 1)
+            ws_counts: dict[Any, int] = {}
+            diverse_candidates = []
+            for item in scored_messages:
+                ws_id = item[2].workspace_id
+                if ws_counts.get(ws_id, 0) < per_ws_cap:
+                    diverse_candidates.append(item)
+                    ws_counts[ws_id] = ws_counts.get(ws_id, 0) + 1
+                if len(diverse_candidates) >= limit:
+                    break
+            if len(diverse_candidates) < limit:
+                for item in scored_messages:
+                    if item not in diverse_candidates:
+                        diverse_candidates.append(item)
+                        if len(diverse_candidates) >= limit:
+                            break
+            top_candidates = diverse_candidates
+        else:
+            top_candidates = scored_messages[:limit]
 
         retrieved: list[dict[str, Any]] = [
             {
+                "source_type": "conversation",
+                "workspace_id": str(conv.workspace_id) if conv.workspace_id else None,
+                "workspace_name": ws_name,
                 "thread_id": str(conv.id),
+                "conversation_id": str(conv.id),
                 "thread_title": conv.title,
                 "message_id": str(msg.id),
                 "role": msg.role,
@@ -184,11 +303,11 @@ class WorkspaceThreadRetriever:
                 "created_at": msg.created_at.isoformat() if msg.created_at else None,
                 "score": score,
             }
-            for score, msg, conv in top_candidates
+            for score, msg, conv, ws_name in top_candidates
         ]
 
         logger.info(
-            f"Retrieved {len(retrieved)} relevant workspace thread messages for workspace '{ws.name}'",
-            extra={"workspace_id": str(workspace_id), "count": len(retrieved)},
+            f"Retrieved {len(retrieved)} relevant conversation thread messages across {len(authorized_workspaces)} authorized workspace(s)",
+            extra={"authorized_workspaces_count": len(authorized_workspaces), "retrieved_count": len(retrieved)},
         )
         return retrieved
