@@ -18,10 +18,12 @@ import {
 } from '../api/workspaces'
 import WorkspaceProviderSettingsModal from './WorkspaceProviderSettingsModal'
 import { NavItem } from './Sidebar'
+import { VisualizationRenderer, VisualizationSpec } from './visualizations'
+import { MarkdownRenderer } from './MarkdownRenderer'
 
 type Role = 'user' | 'assistant'
 interface Source { title: string; excerpt: string; }
-interface Message { id: number | string; role: Role; text: string; sources?: Source[]; metrics?: ExecutionMetrics | null; isTyping?: boolean; }
+interface Message { id: number | string; role: Role; text: string; visualization?: VisualizationSpec | null; sources?: Source[]; metrics?: ExecutionMetrics | null; isTyping?: boolean; }
 
 function SourceCard({ source }: { source: Source }) {
   return (
@@ -56,9 +58,9 @@ function ExecutionMetricsView({ metrics }: { metrics: ExecutionMetrics }) {
 
   const retrieval = metrics.stages?.retrieval
   const generation = metrics.stages?.generation
-  const research = metrics.stages?.research
-  const hasResearch = research && (research.llm_calls > 0 || research.latency_ms > 0)
-  const totalTokens = metrics.llm_usage?.total_tokens ?? 0
+  const totalTokens = metrics.total_tokens || metrics.llm_usage?.total_tokens || 0
+  const totalLatency = metrics.total_latency_ms || 0
+  const acceptedCount = metrics.accepted_count || metrics.accepted_results || 0
 
   return (
     <div style={{ marginTop: '14px', fontFamily: 'var(--font-mono)' }}>
@@ -88,7 +90,12 @@ function ExecutionMetricsView({ metrics }: { metrics: ExecutionMetrics }) {
         <span style={{ color: 'var(--color-border)' }}>•</span>
         <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
           <span style={{ fontSize: '10px' }}>⏱</span>
-          <span>{formatDurationCompact(metrics.total_latency_ms)}</span>
+          <span>{formatDurationCompact(totalLatency)}</span>
+        </span>
+        <span style={{ color: 'var(--color-border)' }}>•</span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+          <span style={{ fontSize: '10px' }}>📚</span>
+          <span>{acceptedCount} sources</span>
         </span>
         <span style={{ color: 'var(--color-border)' }}>•</span>
         <span style={{ fontSize: '10px', color: 'var(--color-ink-muted)', textDecoration: 'underline' }}>
@@ -109,7 +116,7 @@ function ExecutionMetricsView({ metrics }: { metrics: ExecutionMetrics }) {
             lineHeight: 1.6,
             color: 'var(--color-ink)',
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
             gap: '16px',
             animation: 'fadeIn 0.2s ease',
           }}
@@ -120,95 +127,155 @@ function ExecutionMetricsView({ metrics }: { metrics: ExecutionMetrics }) {
               Execution Summary
             </div>
             <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-ink)' }}>
-              Total: {formatDurationDetail(metrics.total_latency_ms)}
+              Total: {formatDurationDetail(totalLatency)}
             </div>
-            <div style={{ fontSize: '10px', color: 'var(--color-ink-muted)', marginTop: '8px', wordBreak: 'break-all' }}>
+            {metrics.provider && (
+              <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)', marginTop: '4px' }}>
+                Provider: <strong style={{ color: 'var(--color-ink)' }}>{metrics.provider}</strong> {metrics.model ? `(${metrics.model})` : ''}
+              </div>
+            )}
+            <div style={{ fontSize: '10px', color: 'var(--color-ink-muted)', marginTop: '6px', wordBreak: 'break-all' }}>
               Request ID:
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: '9px', color: 'var(--color-ink)', background: 'var(--color-ground)', padding: '2px 4px', borderRadius: '3px', marginTop: '2px' }}>
                 {metrics.request_id}
               </div>
             </div>
-          </div>
-
-          {/* Retrieval Stage */}
-          <div>
-            <div style={{ fontSize: '10px', letterSpacing: '0.08em', color: 'var(--color-teal)', textTransform: 'uppercase', marginBottom: '6px', fontWeight: 600 }}>
-              Retrieval
-            </div>
-            {retrieval ? (
-              <>
-                <div style={{ fontWeight: 500 }}>{formatDurationDetail(retrieval.latency_ms)}</div>
-                <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>
-                  LLM calls: {retrieval.llm_calls}
+            {metrics.trace_id && metrics.trace_id !== metrics.request_id && (
+              <div style={{ fontSize: '10px', color: 'var(--color-ink-muted)', marginTop: '4px', wordBreak: 'break-all' }}>
+                Trace ID:
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: '9px', color: 'var(--color-ink)', background: 'var(--color-ground)', padding: '2px 4px', borderRadius: '3px', marginTop: '2px' }}>
+                  {metrics.trace_id}
                 </div>
-                {retrieval.llm_calls > 0 && (
-                  <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>
-                    Tokens: {retrieval.llm_usage.total_tokens} (In: {retrieval.llm_usage.input_tokens}, Out: {retrieval.llm_usage.output_tokens})
-                  </div>
-                )}
-                {retrieval.sub_stages && retrieval.sub_stages.length > 0 && (
-                  <div style={{ marginTop: '6px', borderTop: '1px dashed var(--color-border)', paddingTop: '4px' }}>
-                    {retrieval.sub_stages.map((stg, i) => (
-                      <div key={i} style={{ fontSize: '10px', color: 'var(--color-ink-muted)', display: 'flex', justifyContent: 'space-between' }}>
-                        <span>{stg.name.replace(/_/g, ' ')}:</span>
-                        <span>{formatDurationDetail(stg.latency_ms)}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>
-            ) : (
-              <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>Not executed</div>
+              </div>
+            )}
+            {metrics.failure_categories && metrics.failure_categories.length > 0 && (
+              <div style={{ marginTop: '8px' }}>
+                <span style={{ fontSize: '10px', color: 'var(--color-coral)', fontWeight: 600 }}>TAXONOMY: </span>
+                {metrics.failure_categories.map((fc, i) => (
+                  <span key={i} style={{ fontSize: '9px', background: '#ffefef', color: '#d93838', border: '1px solid #ffd0d0', padding: '1px 5px', borderRadius: '4px', marginRight: '4px' }}>
+                    {fc}
+                  </span>
+                ))}
+              </div>
             )}
           </div>
 
-          {/* Generation Stage */}
+          {/* Retrieval Strategies & Candidates */}
           <div>
             <div style={{ fontSize: '10px', letterSpacing: '0.08em', color: 'var(--color-teal)', textTransform: 'uppercase', marginBottom: '6px', fontWeight: 600 }}>
-              Generation
+              Retrieval & Evidence
             </div>
-            {generation ? (
-              <>
-                <div style={{ fontWeight: 500 }}>{formatDurationDetail(generation.latency_ms)}</div>
-                <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>
-                  LLM calls: {generation.llm_calls}
-                </div>
-                <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>
-                  Input: {generation.llm_usage.input_tokens} | Output: {generation.llm_usage.output_tokens}
-                </div>
-                <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>
-                  Total: {generation.llm_usage.total_tokens}
-                </div>
-              </>
-            ) : (
-              <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>Not executed</div>
+            <div style={{ fontWeight: 500 }}>
+              {formatDurationDetail(metrics.retrieval_latency_ms || retrieval?.latency_ms || 0)}
+            </div>
+            {metrics.planned_strategies && metrics.planned_strategies.length > 0 && (
+              <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)', marginTop: '4px' }}>
+                Planned: {metrics.planned_strategies.join(' → ')}
+              </div>
+            )}
+            {metrics.executed_strategies && metrics.executed_strategies.length > 0 && (
+              <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>
+                Executed: {metrics.executed_strategies.join(' → ')}
+              </div>
+            )}
+            <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)', marginTop: '4px' }}>
+              Candidates: <strong>{metrics.candidate_count || 0}</strong> (Vector: {metrics.vector_candidates || 0}, KW: {metrics.keyword_candidates || 0}, Hier: {metrics.hierarchical_candidates || 0})
+            </div>
+            <div style={{ fontSize: '11px', color: 'var(--color-ink)' }}>
+              Accepted Evidence: <strong>{acceptedCount} chunks</strong> {metrics.context_tokens ? `(${metrics.context_tokens} toks)` : ''}
+            </div>
+            {retrieval?.sub_stages && retrieval.sub_stages.length > 0 && (
+              <div style={{ marginTop: '6px', borderTop: '1px dashed var(--color-border)', paddingTop: '4px' }}>
+                {retrieval.sub_stages.map((stg, i) => (
+                  <div key={i} style={{ fontSize: '10px', color: 'var(--color-ink-muted)', display: 'flex', justifyContent: 'space-between' }}>
+                    <span>{stg.name.replace(/_/g, ' ')}:</span>
+                    <span>{formatDurationDetail(stg.latency_ms)}</span>
+                  </div>
+                ))}
+              </div>
             )}
           </div>
 
-          {/* Research / Sufficiency */}
-          {hasResearch && (
-            <div>
-              <div style={{ fontSize: '10px', letterSpacing: '0.08em', color: 'var(--color-teal)', textTransform: 'uppercase', marginBottom: '6px', fontWeight: 600 }}>
-                Research / Sufficiency
-              </div>
-              <div style={{ fontWeight: 500 }}>{formatDurationDetail(research.latency_ms)}</div>
-              <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>
-                LLM calls: {research.llm_calls}
-              </div>
-              <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)' }}>
-                Tokens: {research.llm_usage.total_tokens} (In: {research.llm_usage.input_tokens}, Out: {research.llm_usage.output_tokens})
-              </div>
+          {/* Sufficiency & Grounding */}
+          <div>
+            <div style={{ fontSize: '10px', letterSpacing: '0.08em', color: 'var(--color-teal)', textTransform: 'uppercase', marginBottom: '6px', fontWeight: 600 }}>
+              Verification & Quality
             </div>
-          )}
+            {metrics.sufficiency !== undefined && metrics.sufficiency !== null && (
+              <div style={{ marginBottom: '6px' }}>
+                <span style={{ fontSize: '11px' }}>Sufficiency: </span>
+                <span style={{
+                  fontSize: '10px',
+                  fontWeight: 600,
+                  padding: '2px 6px',
+                  borderRadius: '4px',
+                  background: metrics.sufficiency ? '#e6f7ec' : '#fff3e6',
+                  color: metrics.sufficiency ? '#1c7430' : '#b25900',
+                }}>
+                  {metrics.sufficiency ? '✓ SUFFICIENT' : '⚠ INSUFFICIENT'}
+                </span>
+                {metrics.sufficiency_confidence !== undefined && metrics.sufficiency_confidence !== null && (
+                  <span style={{ fontSize: '10px', color: 'var(--color-ink-muted)', marginLeft: '4px' }}>
+                    ({(metrics.sufficiency_confidence * 100).toFixed(0)}% conf)
+                  </span>
+                )}
+              </div>
+            )}
+            {metrics.grounding !== undefined && metrics.grounding !== null && (
+              <div style={{ marginBottom: '6px' }}>
+                <span style={{ fontSize: '11px' }}>Grounding: </span>
+                <span style={{
+                  fontSize: '10px',
+                  fontWeight: 600,
+                  padding: '2px 6px',
+                  borderRadius: '4px',
+                  background: metrics.grounding ? '#e6f7ec' : '#fce8e6',
+                  color: metrics.grounding ? '#1c7430' : '#c5221f',
+                }}>
+                  {metrics.grounding ? '✓ GROUNDED' : '✖ UNGROUNDED'}
+                </span>
+                {metrics.grounding_confidence !== undefined && metrics.grounding_confidence !== null && (
+                  <span style={{ fontSize: '10px', color: 'var(--color-ink-muted)', marginLeft: '4px' }}>
+                    ({(metrics.grounding_confidence * 100).toFixed(0)}% conf)
+                  </span>
+                )}
+              </div>
+            )}
+            {metrics.repair_triggered && (
+              <div style={{ fontSize: '11px', color: 'var(--color-teal)' }}>
+                ⚡ Auto-repair: Triggered
+              </div>
+            )}
+            {metrics.regeneration_triggered && (
+              <div style={{ fontSize: '11px', color: 'var(--color-teal)' }}>
+                🔄 Constrained Regeneration: Triggered
+              </div>
+            )}
+            {metrics.safe_limitation_triggered && (
+              <div style={{ fontSize: '11px', color: '#b25900' }}>
+                🛡 Safe Limitation Fallback: Active
+              </div>
+            )}
+            {metrics.visualization_requested && (
+              <div style={{ fontSize: '10px', color: 'var(--color-ink-muted)', marginTop: '4px' }}>
+                Visualization: {metrics.visualization_validated ? 'Validated ✓' : (metrics.visualization_dropped ? 'Dropped ✖' : 'Active')}
+              </div>
+            )}
+          </div>
 
           {/* LLM Total Aggregated */}
           <div style={{ gridColumn: '1 / -1', borderTop: '1px solid var(--color-border)', paddingTop: '10px', display: 'flex', flexWrap: 'wrap', gap: '16px', alignItems: 'center' }}>
             <span style={{ fontSize: '10px', letterSpacing: '0.08em', color: 'var(--color-teal)', textTransform: 'uppercase', fontWeight: 600 }}>
-              LLM Totals:
+              Token Usage:
             </span>
-            <span style={{ fontSize: '11px' }}>Input: <strong>{metrics.llm_usage.input_tokens}</strong></span>
-            <span style={{ fontSize: '11px' }}>Output: <strong>{metrics.llm_usage.output_tokens}</strong></span>
-            <span style={{ fontSize: '11px' }}>Total: <strong>{metrics.llm_usage.total_tokens}</strong></span>
+            <span style={{ fontSize: '11px' }}>Input: <strong>{metrics.input_tokens || metrics.llm_usage?.input_tokens || 0}</strong></span>
+            <span style={{ fontSize: '11px' }}>Output: <strong>{metrics.output_tokens || metrics.llm_usage?.output_tokens || 0}</strong></span>
+            <span style={{ fontSize: '11px' }}>Total: <strong>{totalTokens}</strong></span>
+            {generation && (
+              <span style={{ fontSize: '11px', color: 'var(--color-ink-muted)', marginLeft: 'auto' }}>
+                Generation latency: {formatDurationDetail(metrics.generation_latency_ms || generation.latency_ms)}
+              </span>
+            )}
           </div>
         </div>
       )}
@@ -253,17 +320,48 @@ function TypingIndicator() {
   )
 }
 
-function AssistantMessage({ msg }: { msg: Message }) {
+function AssistantMessage({ msg, onVisualize }: { msg: Message; onVisualize?: (msgId: string | number) => void }) {
   return (
     <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-start' }}>
       <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: 'var(--color-teal)', flexShrink: 0, marginTop: '3px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: 'rgba(255,255,255,0.5)' }} />
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontFamily: 'var(--font-mono)', fontSize: '10px', letterSpacing: '0.1em', color: 'var(--color-teal)', marginBottom: '8px', textTransform: 'uppercase' }}>Doot</div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+          <div style={{ fontFamily: 'var(--font-mono)', fontSize: '10px', letterSpacing: '0.1em', color: 'var(--color-teal)', textTransform: 'uppercase' }}>Doot</div>
+          {onVisualize && !msg.isTyping && (
+            <button
+              onClick={() => onVisualize(msg.id)}
+              title="Generate visual chart from this response"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '5px',
+                padding: '3px 8px',
+                fontSize: '11px',
+                fontWeight: 600,
+                color: 'var(--color-teal)',
+                background: 'rgba(2, 132, 199, 0.08)',
+                border: '1px solid rgba(2, 132, 199, 0.2)',
+                borderRadius: '5px',
+                cursor: 'pointer',
+                transition: 'all 0.15s ease',
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = 'rgba(2, 132, 199, 0.16)')}
+              onMouseLeave={(e) => (e.currentTarget.style.background = 'rgba(2, 132, 199, 0.08)')}
+            >
+              <span>📊</span>
+              <span>Visualize this</span>
+            </button>
+          )}
+        </div>
         {msg.isTyping ? <TypingIndicator /> : (
           <>
-            <p style={{ margin: 0, fontFamily: "'Segoe UI', system-ui, sans-serif", fontSize: '17px', lineHeight: 1.7, color: 'var(--color-ink)', whiteSpace: 'pre-wrap' }}>{msg.text}</p>
+            <MarkdownRenderer
+              content={msg.text}
+              style={{ margin: 0, fontFamily: "'Segoe UI', system-ui, sans-serif", fontSize: '16px', lineHeight: 1.7, color: 'var(--color-ink)' }}
+            />
+            {msg.visualization && <VisualizationRenderer spec={msg.visualization} />}
             {msg.sources && msg.sources.length > 0 && (
               <div style={{ marginTop: '12px' }}>
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: '10px', letterSpacing: '0.08em', color: 'var(--color-ink-muted)', textTransform: 'uppercase', marginBottom: '6px' }}>{msg.sources.length} source{msg.sources.length !== 1 ? 's' : ''} retrieved</div>
@@ -464,6 +562,7 @@ export default function RAG({
                 id: m.id,
                 role: m.role as Role,
                 text: m.content,
+                visualization: m.visualization,
                 sources: m.sources || undefined,
                 metrics: m.execution_metrics || undefined,
               })
@@ -603,14 +702,22 @@ export default function RAG({
         }
       }
 
+      const trimmed = text.trim()
+      const isTypingVisualize = trimmed.toLowerCase() === 'visualize this' || trimmed.toLowerCase() === 'visulaize this'
+      const lastAsst = [...messages].reverse().find((m) => m.role === 'assistant' && !m.isTyping)
+      const targetMsgId = isTypingVisualize && lastAsst ? String(lastAsst.id) : undefined
+      const actionVal = isTypingVisualize ? 'visualize' : undefined
+
       const res = await askQuestion(
         {
-          query: text.trim(),
+          query: isTypingVisualize ? 'Visualize this' : trimmed,
           top_k: topK,
           rerank,
           conversation_id: targetConvId,
           workspace_id: chatWorkspaceId || undefined,
           provider_overrides: overrides,
+          action: actionVal,
+          target_message_id: targetMsgId,
         },
         token
       )
@@ -631,7 +738,7 @@ export default function RAG({
       setMessages((m) =>
         m.map((msg) =>
           msg.id === typingMsg.id
-            ? { ...msg, text: res.answer, sources: mappedSources, metrics: res.execution_metrics, isTyping: false }
+            ? { ...msg, id: res.message_id || msg.id, text: res.answer, visualization: res.visualization, sources: mappedSources, metrics: res.execution_metrics, isTyping: false }
             : msg
         )
       )
@@ -644,6 +751,55 @@ export default function RAG({
     } finally {
       setIsLoading(false)
       setTimeout(() => textareaRef.current?.focus(), 50)
+    }
+  }
+
+  async function handleVisualizeThis(targetMessageId: string | number) {
+    if (isLoading) return
+    const typingMsg: Message = { id: Date.now() + 1, role: 'assistant', text: '', isTyping: true }
+    setMessages((m) => [...m, typingMsg])
+    setIsLoading(true)
+
+    try {
+      const res = await askQuestion(
+        {
+          query: 'Visualize this',
+          action: 'visualize',
+          target_message_id: String(targetMessageId),
+          conversation_id: activeConversationId || undefined,
+          workspace_id: chatWorkspaceId || undefined,
+        },
+        token
+      )
+
+      const mappedSources: Source[] = (res.retrieved_chunks || []).map((c: RetrievedChunk) => ({
+        title: `${c.file_name}${c.page_number ? ` (Page ${c.page_number})` : ''}`,
+        excerpt: c.text,
+      }))
+
+      setMessages((m) =>
+        m.map((msg) =>
+          msg.id === typingMsg.id
+            ? {
+                ...msg,
+                id: res.message_id || msg.id,
+                text: res.answer,
+                visualization: res.visualization,
+                sources: mappedSources,
+                metrics: res.execution_metrics,
+                isTyping: false,
+              }
+            : msg
+        )
+      )
+    } catch (err: any) {
+      setMessages((m) =>
+        m.map((msg) =>
+          msg.id === typingMsg.id ? { ...msg, text: `Error: ${err.message}`, isTyping: false } : msg
+        )
+      )
+    } finally {
+      setIsLoading(false)
     }
   }
 
@@ -1077,7 +1233,7 @@ export default function RAG({
         >
           {messages.map((msg) =>
             msg.role === 'assistant' ? (
-              <AssistantMessage key={msg.id} msg={msg} />
+              <AssistantMessage key={msg.id} msg={msg} onVisualize={handleVisualizeThis} />
             ) : (
               <UserMessage key={msg.id} msg={msg} />
             )

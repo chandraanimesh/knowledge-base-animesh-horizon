@@ -16,6 +16,7 @@ from rag_app.schemas.rag import (
     GenerateResponse,
     IngestResponse,
     RetrievalResponse,
+    RetrievedChunk,
 )
 from rag_app.schemas.users import DepartmentResponse, DocumentResponse
 from rag_app.api.dependencies.auth import RequirePermission, get_current_user
@@ -321,9 +322,15 @@ async def ask_question(
 ) -> GenerateResponse:
     from rag_app.core.safety import check_sensitive_request
     from rag_app.research.graph import research_graph
-    from rag_app.core.observability import init_request_metrics, finalize_request_metrics
+    from rag_app.core.observability import (
+        init_request_metrics,
+        finalize_request_metrics,
+        record_request_context,
+        record_failure_category,
+    )
+    from rag_app.schemas.rag import FailureCategory
     from rag_app.conversation.service import ConversationService
-    from rag_app.db.models import Workspace, WorkspaceMember
+    from rag_app.db.models import ChatMessage, Conversation, Department, Workspace, WorkspaceMember
     from rag_app.security.authorization import authorize, get_allowed_departments
     
     request_id = str(uuid4())
@@ -338,6 +345,10 @@ async def ask_question(
         workspace_id=request.workspace_id,
     )
     effective_workspace_id = conv.workspace_id or request.workspace_id
+    record_request_context(
+        workspace_id=str(effective_workspace_id) if effective_workspace_id else None,
+        thread_id=str(conv.id),
+    )
 
     # 1. Global vs Workspace Chat authorization & scoping
     if effective_workspace_id is None:
@@ -389,6 +400,7 @@ async def ask_question(
         can_view_pii=False,
     )
     if safety.blocked:
+        record_failure_category(FailureCategory.QUERY_UNDERSTANDING)
         metrics = finalize_request_metrics()
         blocked_resp = GenerateResponse(
             answer=safety.response or "This request cannot be completed.",
@@ -407,6 +419,7 @@ async def ask_question(
         return blocked_resp
 
     if allowed_departments is not None and len(allowed_departments) == 0:
+        record_failure_category(FailureCategory.AUTHORIZATION)
         metrics = finalize_request_metrics()
         auth_resp = GenerateResponse(
             answer="You do not have access to any departments to fulfill this request.",
@@ -424,6 +437,162 @@ async def ask_question(
         )
         return auth_resp
         
+    # Check for "Visualize this" action targeting the current/previous assistant response
+    is_visualize_action = (
+        (request.action == "visualize")
+        or (request.target_message_id is not None)
+        or (request.query.strip().lower() in ["visualize this", "visulaize this", "visualize", "visulaize"])
+    )
+
+    if is_visualize_action:
+        # 1. Fetch the target assistant message
+        if request.target_message_id:
+            target_msg = await session.get(ChatMessage, request.target_message_id)
+        else:
+            stmt = (
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == conv.id, ChatMessage.role == "assistant")
+                .order_by(ChatMessage.created_at.desc())
+                .limit(1)
+            )
+            target_msg = await session.scalar(stmt)
+
+        if not target_msg or target_msg.conversation_id != conv.id or target_msg.role != "assistant":
+            record_failure_category(FailureCategory.VISUALIZATION)
+            metrics = finalize_request_metrics()
+            safe_resp = GenerateResponse(
+                answer="No prior assistant response found in this conversation to visualize.",
+                citations=[],
+                retrieved_chunks=[],
+                execution_metrics=metrics,
+                conversation_id=str(conv.id),
+                conversation_title=conv.title,
+            )
+            asst_msg = await conv_service.save_assistant_message(
+                conversation_id=conv.id,
+                content=safe_resp.answer,
+                sources=[],
+                execution_metrics=metrics.model_dump() if metrics else None,
+            )
+            safe_resp.message_id = str(asst_msg.id)
+            return safe_resp
+
+        # 2. Reconstruct authorized chunks from target message's sources without second global retrieval
+        reconstructed_chunks: list[RetrievedChunk] = []
+        allowed_dept_strs = {str(d) for d in allowed_departments} if allowed_departments is not None else None
+
+        for idx, s in enumerate(target_msg.sources or []):
+            if s.get("type") == "document" or "excerpt" in s or "text" in s:
+                chunk_dept = s.get("department_id")
+                if allowed_dept_strs is not None and chunk_dept and chunk_dept != "None" and chunk_dept not in allowed_dept_strs:
+                    continue  # Strict department boundary check
+                reconstructed_chunks.append(
+                    RetrievedChunk(
+                        chunk_id=str(s.get("chunk_id") or f"src_{idx}"),
+                        document_id=str(s.get("document_id") or "doc_prior"),
+                        department_id=str(chunk_dept or (str(allowed_departments[0]) if allowed_departments else "None")),
+                        file_name=str(s.get("file_name") or s.get("title") or "Document"),
+                        chunk_index=int(s.get("chunk_index") or idx),
+                        text=str(s.get("excerpt") or s.get("text") or ""),
+                        page_number=s.get("page_number"),
+                    )
+                )
+
+        if not reconstructed_chunks and target_msg.content:
+            reconstructed_chunks.append(
+                RetrievedChunk(
+                    chunk_id="prior_answer_context",
+                    document_id="doc_prior",
+                    department_id=str(allowed_departments[0]) if allowed_departments else "None",
+                    file_name="Previous Assistant Answer",
+                    chunk_index=0,
+                    text=target_msg.content,
+                )
+            )
+
+        # 3. Explicit QueryPlan with CHART presentation intent (bypasses generic PROSE interpretation)
+        from rag_app.schemas.rag import QueryPlan, InformationNeed, PresentationNeed, EvidenceNeed
+        viz_plan = QueryPlan(
+            semantic_query="visualize key metrics and opportunities",
+            information_need=InformationNeed.AGGREGATION,
+            presentation_need=PresentationNeed.CHART,
+            evidence_need=EvidenceNeed.STRUCTURED,
+        )
+
+        from rag_app.retrieval.sufficiency import EvidenceSufficiencyEvaluator
+        evaluator = EvidenceSufficiencyEvaluator()
+        suff_eval = await evaluator.evaluate(
+            query=request.query,
+            chunks=reconstructed_chunks,
+            query_plan=viz_plan,
+            conversation_history=conv_history,
+            workspace_thread_context=workspace_thread_context,
+        )
+
+        if not suff_eval.is_sufficient:
+            record_failure_category(FailureCategory.VISUALIZATION)
+            metrics = finalize_request_metrics()
+            reason_text = suff_eval.reason or "The authorized evidence does not contain sufficient structured numeric data to generate a valid chart."
+            safe_resp = GenerateResponse(
+                answer=f"Unable to generate visualization: {reason_text}",
+                visualization=None,
+                citations=[],
+                retrieved_chunks=reconstructed_chunks,
+                execution_metrics=metrics,
+                conversation_id=str(conv.id),
+                conversation_title=conv.title,
+            )
+            asst_msg = await conv_service.save_assistant_message(
+                conversation_id=conv.id,
+                content=safe_resp.answer,
+                sources=target_msg.sources,
+                execution_metrics=metrics.model_dump() if metrics else None,
+                visualization=None,
+            )
+            safe_resp.message_id = str(asst_msg.id)
+            return safe_resp
+
+        # 4. Generate grounded chart from context
+        viz_prompt = (
+            "Generate a chart visualizing the key metrics, opportunities, or structured comparison data from the authorized evidence. "
+            "Output valid JSON with keys 'answer' and 'visualization'. Ensure all chart values are pure numbers and match the authorized evidence."
+        )
+        rendered_context = (
+            f"Prior Answer:\n{target_msg.content}\n\nAuthorized Evidence:\n"
+            + "\n\n".join(f"[{i+1}] {c.text}" for i, c in enumerate(reconstructed_chunks))
+        )
+        resp = await service.generate_from_context(
+            query=viz_prompt,
+            chunks=reconstructed_chunks,
+            allowed_departments=allowed_departments,
+            rendered_context=rendered_context,
+            conversation_history=conv_history,
+            workspace_thread_context=workspace_thread_context,
+            workspace_id=effective_workspace_id,
+            provider_overrides=request.provider_overrides,
+            sufficiency_evaluation=suff_eval,
+        )
+
+        if not resp.visualization:
+            record_failure_category(FailureCategory.VISUALIZATION)
+            if "unable" not in resp.answer.lower() and "could not" not in resp.answer.lower():
+                resp.answer = f"Unable to generate a valid chart from the authorized evidence.\n\n{resp.answer}"
+
+        metrics = finalize_request_metrics()
+        resp.execution_metrics = metrics
+        resp.conversation_id = str(conv.id)
+        resp.conversation_title = conv.title
+
+        asst_msg = await conv_service.save_assistant_message(
+            conversation_id=conv.id,
+            content=resp.answer,
+            sources=target_msg.sources,
+            execution_metrics=metrics.model_dump() if metrics else None,
+            visualization=resp.visualization,
+        )
+        resp.message_id = str(asst_msg.id)
+        return resp
+
     initial_state = {
         "query": request.query,
         "top_k": request.top_k,
@@ -451,10 +620,16 @@ async def ask_question(
         resp.execution_metrics = metrics
         resp.conversation_id = str(conv.id)
         
-        # Persist assistant message in DB (including document chunks and retrieved workspace thread sources)
+        # Persist assistant message in DB with complete chunk metadata
         sources_payload = [
             {
                 "type": "document",
+                "chunk_id": c.chunk_id,
+                "document_id": str(c.document_id),
+                "department_id": str(c.department_id),
+                "file_name": c.file_name,
+                "chunk_index": c.chunk_index,
+                "page_number": c.page_number,
                 "title": f"{c.file_name}{f' (Page {c.page_number})' if c.page_number else ''}",
                 "excerpt": c.text,
             }
@@ -480,6 +655,7 @@ async def ask_question(
             content=resp.answer,
             sources=sources_payload,
             execution_metrics=metrics_payload,
+            visualization=resp.visualization,
         )
         resp.message_id = str(asst_msg.id)
 

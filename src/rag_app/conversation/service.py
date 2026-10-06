@@ -273,6 +273,7 @@ class ConversationService:
                 conversation_id=str(msg.conversation_id),
                 role=msg.role,
                 content=msg.content,
+                visualization=msg.visualization,
                 sources=msg.sources,
                 execution_metrics=msg.execution_metrics,
                 created_at=msg.created_at,
@@ -541,6 +542,7 @@ class ConversationService:
         content: str,
         sources: list[dict] | None = None,
         execution_metrics: dict | None = None,
+        visualization: dict | None = None,
     ) -> ChatMessage:
         msg = ChatMessage(
             conversation_id=conversation_id,
@@ -548,6 +550,7 @@ class ConversationService:
             content=content,
             sources=sources,
             execution_metrics=execution_metrics,
+            visualization=visualization,
         )
         self.session.add(msg)
 

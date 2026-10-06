@@ -7,11 +7,14 @@ from rag_app.core.observability import (
     record_stage_start,
     record_stage_end,
     record_sub_stage,
+    record_retrieval_metrics,
 )
 from rag_app.retrieval.filter_normalise import normalize_company_filters
 from sqlalchemy import func, literal_column, or_, select
+from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 from rag_app.retrieval.bm25 import GlobalBM25Index
+import re
 from rag_app.retrieval.reranker import AsyncCrossEncoderProvider, get_reranker_provider
 from rag_app.core.config import get_settings
 from rag_app.core.tracing import track
@@ -26,7 +29,12 @@ from rag_app.db.models import (
 )
 from rag_app.ingestion.embedding_v1 import get_embedding_provider
 from rag_app.ingestion.normaliser import normalize_company_id
-from rag_app.retrieval.query_parser import QueryParser, is_greeting, extract_entity_search_term
+from rag_app.retrieval.query_parser import (
+    QueryParser,
+    extract_entity_search_term,
+    is_greeting,
+    strip_presentation_instructions,
+)
 from rag_app.retrieval.router import RetrievalMode, route_query
 from rag_app.retrieval.controller import RetrievalController, RetrievalStrategy
 from rag_app.knowledge.materializer import normalize_string
@@ -36,7 +44,10 @@ from rag_app.schemas.rag import (
     ChunkHierarchyMetadata,
     ChunkProvenance,
     CompanyFilters,
+    EvidenceNeed,
     GraphEdgeProvenance,
+    InformationNeed,
+    PresentationNeed,
     QueryPlan,
     RelationshipQuery,
     RetrievedChunk,
@@ -45,6 +56,7 @@ from rag_app.schemas.rag import (
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+MAX_CHUNKS_PER_DOCUMENT = 2
 
 
 def _format_timestamp(val: object) -> str | None:
@@ -59,7 +71,25 @@ def _format_timestamp(val: object) -> str | None:
                 return res
         except Exception:
             pass
-    return None
+def _extract_hierarchical_query_terms(query: str) -> list[str]:
+    """
+    Extracts informative keywords from query, filtering out common question/stop words.
+    Generic and domain-agnostic.
+    """
+    raw_tokens = re.findall(r"[A-Za-z0-9_-]+", query)
+    stop_words = {
+        "what", "when", "where", "which", "who", "why", "how", "is", "are", "was",
+        "were", "be", "been", "being", "have", "has", "had", "do", "does", "did",
+        "can", "could", "should", "would", "will", "shall", "may", "might", "must",
+        "a", "an", "the", "and", "or", "but", "if", "then", "else", "for", "of",
+        "to", "in", "on", "at", "by", "from", "with", "about", "into", "through",
+        "during", "before", "after", "above", "below", "up", "down", "out", "off",
+        "over", "under", "again", "further", "this", "that", "these", "those",
+        "my", "your", "his", "her", "its", "our", "their", "me", "you", "him",
+        "her", "us", "them", "tell", "show", "give", "list", "describe", "explain",
+        "visualize", "chart", "table", "graph", "plot"
+    }
+    return [t.lower() for t in raw_tokens if len(t) >= 3 and t.lower() not in stop_words]
 
 
 @dataclass
@@ -103,7 +133,7 @@ class RetrievalService:
         self,
         query: str,
         top_k: int | None = None,
-        rerank: bool = False,
+        rerank: bool = True,
         allowed_departments: list[uuid.UUID] | None = None,
         allowed_documents: list[uuid.UUID] | None = None,
         workspace_id: uuid.UUID | None = None,
@@ -125,7 +155,7 @@ class RetrievalService:
         self,
         query: str,
         top_k: int | None = None,
-        rerank: bool = False,
+        rerank: bool = True,
         allowed_departments: list[uuid.UUID] | None = None,
         allowed_documents: list[uuid.UUID] | None = None,
         workspace_id: uuid.UUID | None = None,
@@ -386,6 +416,15 @@ class RetrievalService:
                         chunks=selected,
                         allowed_departments=allowed_departments,
                     )
+                    record_retrieval_metrics(
+                        planned_strategies=[s.value for s in route],
+                        executed_strategies=executed_strategies,
+                        knowledge_candidates=len(knowledge_rows),
+                        candidate_count=len(rows_to_use),
+                        accepted_results=len(selected),
+                        final_context_count=len(selected),
+                        structured_evidence_count=len(selected),
+                    )
                     return RetrievalResponse(
                         query=query,
                         results=selected,
@@ -497,6 +536,7 @@ class RetrievalService:
                     allowed_documents=allowed_documents,
                     provenance_collector=provenance_collector,
                     workspace_id=workspace_id,
+                    information_need=query_plan.information_need,
                 )
                 record_sub_stage(
                     "retrieval",
@@ -559,6 +599,15 @@ class RetrievalService:
                 chunks=selected,
                 allowed_departments=allowed_departments,
             )
+            record_retrieval_metrics(
+                planned_strategies=[s.value for s in route],
+                executed_strategies=executed_strategies,
+                knowledge_candidates=len(knowledge_rows),
+                candidate_count=len(rows_to_use),
+                accepted_results=len(selected),
+                final_context_count=len(selected),
+                structured_evidence_count=len(selected),
+            )
             return RetrievalResponse(
                 query=query,
                 results=selected,
@@ -613,21 +662,26 @@ class RetrievalService:
             ],
         },
     )
-        #=========================================================
+        # =========================================================
+        # CANDIDATE POOL BEFORE RERANK
+        # =========================================================
+        candidates.sort(key=lambda c: c.hybrid_score, reverse=True)
+        pre_rerank_ranks = {
+            str(c.chunk.id): rank for rank, c in enumerate(candidates, start=1)
+        }
+
+        # =========================================================
         # CROSS-ENCODER RERANKING
-        #=========================================================
+        # =========================================================
         retrieval_query = (
             query_plan.semantic_query
             or processed_query
         )
-        
+
+        reranker_executed = False
         if rerank and candidates:
             candidate_texts = [
-                c.chunk.metadata_['embedding_text']
-                if c.chunk.metadata_ and 'embedding_text' in c.chunk.metadata_
-                else (f"{c.chunk.metadata_.get('search_context')}\n\n{c.chunk.text}"
-                      if c.chunk.metadata_ and c.chunk.metadata_.get('search_context')
-                      else c.chunk.text)
+                self._get_candidate_rerank_text(c)
                 for c in candidates
             ]
             _rerank_start = time.perf_counter()
@@ -643,10 +697,11 @@ class RetrievalService:
             # Store reranker score separately, preserving RRF hybrid_score
             for candidate, score in zip(candidates, rerank_scores):
                 candidate.reranker_score = float(score)
+            reranker_executed = True
 
-        #=========================================================
-        # RELEVANCE FILTER
-        #=========================================================
+        # =========================================================
+        # RELEVANCE FILTER & POST-RERANK SORT
+        # =========================================================
 
         relevant_candidates = [
             candidate
@@ -654,30 +709,81 @@ class RetrievalService:
             if self._is_relevant(candidate)
         ]
 
-        relevant_candidates.sort(
-            key=lambda item: (
-                item.reranker_score if item.reranker_score is not None else item.hybrid_score
-            ),
-            reverse=True,
+        def _is_table_chunk(text: str) -> bool:
+            """Detect markdown table content (>=2 rows with pipe chars)."""
+            pipe_rows = sum(
+                1 for line in text.split("\n")
+                if "|" in line and line.strip().startswith("|")
+            )
+            return pipe_rows >= 2
+
+        def _is_list_chunk(text: str) -> bool:
+            """Detect markdown bullet/numbered list content."""
+            list_rows = sum(
+                1 for line in text.split("\n")
+                if re.match(r"^\s*(?:[-*+]|\d+\.)\s+", line)
+            )
+            return list_rows >= 3
+
+        needs_structured_evidence = (
+            query_plan.presentation_need in (PresentationNeed.CHART, PresentationNeed.TABLE)
+            or query_plan.information_need in (InformationNeed.AGGREGATION, InformationNeed.LIST, InformationNeed.COMPARISON)
+            or query_plan.evidence_need in (EvidenceNeed.STRUCTURED, EvidenceNeed.MIXED)
         )
+        needs_hierarchical_evidence = (
+            query_plan.information_need in (InformationNeed.REQUIREMENTS, InformationNeed.OVERVIEW)
+            or query_plan.evidence_need in (EvidenceNeed.HIERARCHICAL, EvidenceNeed.MIXED)
+        )
+
+        if needs_structured_evidence:
+            relevant_candidates.sort(
+                key=lambda item: (
+                    1 if _is_table_chunk(item.chunk.text) or _is_list_chunk(item.chunk.text) else 0,
+                    item.reranker_score if item.reranker_score is not None else item.hybrid_score,
+                ),
+                reverse=True,
+            )
+        else:
+            relevant_candidates.sort(
+                key=lambda item: (
+                    item.reranker_score if item.reranker_score is not None else item.hybrid_score
+                ),
+                reverse=True,
+            )
+
+        post_rerank_ranks = {
+            str(c.chunk.id): rank
+            for rank, c in enumerate(relevant_candidates, start=1)
+        }
+
         for candidate in relevant_candidates:
+            c_id = str(candidate.chunk.id)
             logger.info(
                 "post_rerank_candidate",
                 extra={
-            "file_name": candidate.document.file_name,
-            "reranker_score": candidate.reranker_score,
-            "hybrid_score": candidate.hybrid_score,
-            "vector_similarity": candidate.vector_similarity,
-            "keyword_rank": candidate.keyword_rank,
-        },
-    )
+                    "event": "post_rerank_candidate",
+                    "file_name": candidate.document.file_name,
+                    "chunk_id": c_id,
+                    "reranker_executed": reranker_executed,
+                    "pre_rerank_rank": pre_rerank_ranks.get(c_id),
+                    "post_rerank_rank": post_rerank_ranks.get(c_id),
+                    "reranker_score": candidate.reranker_score,
+                    "hybrid_score": candidate.hybrid_score,
+                    "vector_similarity": candidate.vector_similarity,
+                    "keyword_rank": candidate.keyword_rank,
+                },
+            )
+
         selected = []
         seen_texts = set()
         document_counts = {}
+        diversity_excluded = []
 
-        MAX_CHUNKS_PER_DOCUMENT = 4
+        MAX_DIVERSITY_SCAN = 30
+        for idx, candidate in enumerate(relevant_candidates):
+            if idx >= MAX_DIVERSITY_SCAN and len(selected) >= top_k:
+                break
 
-        for candidate in relevant_candidates:
             normalized_text = " ".join(
                 candidate.chunk.text.lower().split()
             )
@@ -688,17 +794,124 @@ class RetrievalService:
                 continue
 
             if document_counts.get(document_id, 0) >= MAX_CHUNKS_PER_DOCUMENT:
+                # Track candidates excluded solely by document diversity
+                diversity_excluded.append(candidate)
                 continue
 
-            seen_texts.add(normalized_text)
-            document_counts[document_id] = (
-                document_counts.get(document_id, 0) + 1
+            if len(selected) < top_k:
+                seen_texts.add(normalized_text)
+                document_counts[document_id] = (
+                    document_counts.get(document_id, 0) + 1
+                )
+                selected.append(candidate)
+            else:
+                diversity_excluded.append(candidate)
+
+        # =============================================================
+        # BOUNDED EVIDENCE-PRESERVATION RULE
+        # Preserves high-relevance evidence chunks (table, list, section)
+        # that were excluded solely by the per-document diversity cap.
+        # Bounded to at most 1-2 rescues with reranker score >= 80% floor.
+        # =============================================================
+
+        if diversity_excluded and selected:
+            selected_scores = [
+                c.reranker_score for c in selected
+                if c.reranker_score is not None
+            ]
+            score_floor = min(selected_scores) if selected_scores else None
+            selected_node_ids = {
+                str(c.chunk.node_id) for c in selected
+                if getattr(c.chunk, "node_id", None)
+            }
+
+            needs_structured_evidence = (
+                query_plan.presentation_need in (PresentationNeed.CHART, PresentationNeed.TABLE)
+                or query_plan.information_need in (InformationNeed.AGGREGATION, InformationNeed.LIST, InformationNeed.COMPARISON)
+                or query_plan.evidence_need in (EvidenceNeed.STRUCTURED, EvidenceNeed.MIXED)
+            )
+            needs_hierarchical_evidence = (
+                query_plan.information_need in (InformationNeed.REQUIREMENTS, InformationNeed.OVERVIEW)
+                or query_plan.evidence_need in (EvidenceNeed.HIERARCHICAL, EvidenceNeed.MIXED)
             )
 
-            selected.append(candidate)
+            RESCUE_SCORE_RATIO = 0.8
+            rescued_count = 0
+            MAX_RESCUED = 2
 
-            if len(selected) >= top_k:
-                break
+            for candidate in diversity_excluded:
+                if rescued_count >= MAX_RESCUED:
+                    break
+
+                if score_floor is None or candidate.reranker_score is None:
+                    continue
+
+                min_rescue_score = (
+                    score_floor * RESCUE_SCORE_RATIO
+                    if score_floor > 0
+                    else score_floor - abs(score_floor) * 0.25 - 0.5
+                )
+                if candidate.reranker_score < min_rescue_score:
+                    continue
+
+                is_table = _is_table_chunk(candidate.chunk.text)
+                is_list = _is_list_chunk(candidate.chunk.text)
+                cand_node_id = str(candidate.chunk.node_id) if getattr(candidate.chunk, "node_id", None) else None
+                is_new_section = cand_node_id and cand_node_id not in selected_node_ids
+
+                should_rescue = False
+                rescue_reason = ""
+
+                if needs_structured_evidence and (is_table or is_list):
+                    should_rescue = True
+                    rescue_reason = "table_or_list_chunk_above_score_floor"
+                elif needs_hierarchical_evidence and is_new_section:
+                    should_rescue = True
+                    rescue_reason = "hierarchical_section_chunk_above_score_floor"
+                elif is_table:
+                    should_rescue = True
+                    rescue_reason = "table_chunk_above_score_floor"
+
+                if should_rescue:
+                    normalized_rescued = " ".join(candidate.chunk.text.lower().split())
+                    if normalized_rescued not in seen_texts:
+                        seen_texts.add(normalized_rescued)
+                        if cand_node_id:
+                            selected_node_ids.add(cand_node_id)
+                        selected.append(candidate)
+                        rescued_count += 1
+                        logger.info(
+                            "evidence_preservation_rescue",
+                            extra={
+                                "event": "evidence_preservation_rescue",
+                                "chunk_id": str(candidate.chunk.id),
+                                "file_name": candidate.document.file_name,
+                                "reranker_score": candidate.reranker_score,
+                                "score_floor": score_floor,
+                                "reason": rescue_reason,
+                            },
+                        )
+
+        logger.info(
+            "retrieval_accepted_candidates",
+            extra={
+                "event": "retrieval_accepted_candidates",
+                "reranker_executed": reranker_executed,
+                "accepted_count": len(selected),
+                "candidates": [
+                    {
+                        "chunk_id": str(c.chunk.id),
+                        "file_name": c.document.file_name,
+                        "accepted_rank": rank,
+                        "pre_rerank_rank": pre_rerank_ranks.get(str(c.chunk.id)),
+                        "post_rerank_rank": post_rerank_ranks.get(str(c.chunk.id)),
+                        "reranker_score": c.reranker_score,
+                        "hybrid_score": c.hybrid_score,
+                    }
+                    for rank, c in enumerate(selected, start=1)
+                ],
+            },
+        )
 
         # =========================================================
         # 8. RESPONSE
@@ -762,6 +975,8 @@ class RetrievalService:
                     "hybrid_retrieval_completed"
                 ),
                 "query": processed_query,
+                "semantic_query": retrieval_query,
+                "reranker_executed": reranker_executed,
                 "mode": retrieval_mode.value,
                 "planned_strategies": [s.value for s in route],
                 "executed_strategies": executed_strategies,
@@ -788,10 +1003,36 @@ class RetrievalService:
             cid: prov for cid, prov in provenance_collector.items()
             if cid in final_chunk_ids
         }
+        top_reranker_score = max((c.reranker_score for c in selected if c.reranker_score is not None), default=None)
+        bottom_reranker_score = min((c.reranker_score for c in selected if c.reranker_score is not None), default=None)
+        struct_count = sum(1 for c in selected if _is_table_chunk(c.chunk.text) or _is_list_chunk(c.chunk.text))
+        hier_count = sum(1 for c in selected if getattr(c.chunk, "node_id", None))
+
+        record_retrieval_metrics(
+            planned_strategies=[s.value for s in route],
+            executed_strategies=executed_strategies,
+            vector_candidates=len(vector_rows),
+            keyword_candidates=len(keyword_rows),
+            knowledge_candidates=len(knowledge_rows),
+            hierarchical_candidates=len(hierarchical_rows),
+            candidate_count=len(candidates),
+            reranked_candidates=len(candidates) if reranker_executed else 0,
+            accepted_results=len(results),
+            final_context_count=len(results),
+            vector_top_k=top_k,
+            keyword_top_k=top_k,
+            hierarchical_count=len(hierarchical_rows),
+            reranker_top_score=top_reranker_score,
+            reranker_bottom_score=bottom_reranker_score,
+            structured_evidence_count=struct_count,
+            hierarchical_evidence_count=hier_count,
+        )
+
         chunk_hierarchy = await self._resolve_chunk_hierarchies(
             chunks=results,
             allowed_departments=allowed_departments,
         )
+
         return RetrievalResponse(
             query=query,
             results=results,
@@ -912,7 +1153,6 @@ class RetrievalService:
                 )
 
         if allowed_departments is not None or allowed_documents is not None:
-            from sqlalchemy import or_
             doc_conds = []
             if allowed_departments is not None:
                 doc_conds.append(Document.department_id.in_(allowed_departments))
@@ -1023,7 +1263,6 @@ class RetrievalService:
                 statement = statement.where(*conditions)
                 
         if allowed_departments is not None or allowed_documents is not None:
-            from sqlalchemy import or_
             doc_conds = []
             if allowed_departments is not None:
                 doc_conds.append(Document.department_id.in_(allowed_departments))
@@ -1037,12 +1276,17 @@ class RetrievalService:
             statement = statement.where(Document.workspace_id == workspace_id)
 
 
-        rows = await self.session.execute(statement)
+        exec_rows = await self.session.execute(statement)
+        all_rows = exec_rows.all() if hasattr(exec_rows, "all") else []
+        if hasattr(all_rows, "__await__"):
+            all_rows = await all_rows
+        if not isinstance(all_rows, (list, tuple)):
+            all_rows = []
 
         candidates = []
         seen_chunk_ids = set()
 
-        for chunk, document in rows.all():
+        for chunk, document in all_rows:
             if chunk.id in seen_chunk_ids:
                 continue
             seen_chunk_ids.add(chunk.id)
@@ -1076,10 +1320,12 @@ class RetrievalService:
         provenance_collector: dict[str, ChunkProvenance] | None = None,
         max_descendant_depth: int | None = None,
         workspace_id: uuid.UUID | None = None,
+        information_need: InformationNeed | None = None,
     ) -> list[tuple[DocumentChunk, Document, float]]:
         """
         OV-2 Native Hierarchical Retrieval:
-        1. L0 FTS retrieval on DocumentSection.title + l0_abstract with deterministic tie-breaking.
+        1. Section search on DocumentSection (title + l0_abstract + l1_overview) via PostgreSQL FTS
+           and generic multi-term title/overview fallback.
         2. Bounded descendant traversal (L0 -> L1 descendant nodes) up to max_descendant_depth.
         3. L2 chunk expansion via DocumentChunk.node_id with full authorization enforcement.
         4. Preserves existing chunk models, deterministic scoring, provenance, and auth boundaries.
@@ -1091,12 +1337,14 @@ class RetrievalService:
             max_descendant_depth = settings.hierarchical_max_descendant_depth
 
         # -------------------------------------------------------------
-        # 1. L0 Section Search via PostgreSQL FTS
+        # 1. Section Search via PostgreSQL FTS (title + l0_abstract + l1_overview)
         # -------------------------------------------------------------
         text_target = (
             func.coalesce(DocumentSection.title, "")
             + " "
             + func.coalesce(DocumentSection.l0_abstract, "")
+            + " "
+            + func.coalesce(DocumentSection.l1_overview, "")
         )
         ts_vector = func.to_tsvector("english", text_target)
         ts_query = func.plainto_tsquery("english", query)
@@ -1126,7 +1374,6 @@ class RetrievalService:
                 sec_stmt = sec_stmt.where(*conditions)
 
         if allowed_departments is not None or allowed_documents is not None:
-            from sqlalchemy import or_
             doc_conds = []
             if allowed_departments is not None:
                 doc_conds.append(Document.department_id.in_(allowed_departments))
@@ -1138,7 +1385,6 @@ class RetrievalService:
 
         if workspace_id is not None:
             sec_stmt = sec_stmt.where(Document.workspace_id == workspace_id)
-
 
         sec_stmt = (
             sec_stmt
@@ -1160,7 +1406,76 @@ class RetrievalService:
                 sec_rows = []
         except Exception as e:
             logger.warning("hierarchical_fts_query_failed", extra={"error": str(e), "query": query})
-            return []
+            sec_rows = []
+
+        # -------------------------------------------------------------
+        # Fallback / Multi-term Matching if strict FTS returns zero/few
+        # -------------------------------------------------------------
+        matched_section_ids = {row[0].id for row in sec_rows if row}
+        if len(sec_rows) < candidate_k:
+            search_terms = _extract_hierarchical_query_terms(query)
+            fallback_conds = []
+            if search_terms:
+                term_ilikes = []
+                for term in search_terms:
+                    term_ilikes.append(DocumentSection.title.ilike(f"%{term}%"))
+                    term_ilikes.append(DocumentSection.l0_abstract.ilike(f"%{term}%"))
+                    term_ilikes.append(DocumentSection.l1_overview.ilike(f"%{term}%"))
+                fallback_conds.append(or_(*term_ilikes))
+
+            if information_need == InformationNeed.OVERVIEW:
+                # Overview queries: include document root and level 1 sections
+                fallback_conds.append(DocumentSection.level <= 1)
+
+            if fallback_conds:
+                fb_stmt = (
+                    select(
+                        DocumentSection,
+                        Document,
+                        func.coalesce(0.5, literal_column("0.5")).label("fts_score"),
+                    )
+                    .join(
+                        Document,
+                        Document.id == DocumentSection.document_id,
+                    )
+                    .where(or_(*fallback_conds))
+                )
+                if matched_section_ids:
+                    fb_stmt = fb_stmt.where(~DocumentSection.id.in_(matched_section_ids))
+                if filters:
+                    conditions = self._structured_conditions(filters)
+                    if conditions:
+                        fb_stmt = fb_stmt.where(*conditions)
+                if allowed_departments is not None or allowed_documents is not None:
+                    doc_conds = []
+                    if allowed_departments is not None:
+                        doc_conds.append(Document.department_id.in_(allowed_departments))
+                        doc_conds.append(Document.department_id.is_(None))
+                    if allowed_documents:
+                        doc_conds.append(Document.id.in_(allowed_documents))
+                    if doc_conds:
+                        fb_stmt = fb_stmt.where(or_(*doc_conds))
+                if workspace_id is not None:
+                    fb_stmt = fb_stmt.where(Document.workspace_id == workspace_id)
+
+                fb_stmt = (
+                    fb_stmt
+                    .order_by(
+                        DocumentSection.level.asc(),
+                        DocumentSection.ordinal_path.asc(),
+                        DocumentSection.id.asc(),
+                    )
+                    .limit(candidate_k - len(sec_rows))
+                )
+                try:
+                    fb_res = await self.session.execute(fb_stmt)
+                    fb_rows = fb_res.all() if hasattr(fb_res, "all") else []
+                    if hasattr(fb_rows, "__await__"):
+                        fb_rows = await fb_rows
+                    if isinstance(fb_rows, (list, tuple)):
+                        sec_rows.extend(fb_rows)
+                except Exception as fb_err:
+                    logger.debug(f"hierarchical fallback query error: {fb_err}")
 
         if not sec_rows:
             return []
@@ -1199,7 +1514,6 @@ class RetrievalService:
                 .where(DocumentSection.parent_id.in_(current_level_ids))
             )
             if allowed_departments is not None or allowed_documents is not None:
-                from sqlalchemy import or_
                 doc_conds = []
                 if allowed_departments is not None:
                     doc_conds.append(Document.department_id.in_(allowed_departments))
@@ -1241,7 +1555,6 @@ class RetrievalService:
             .where(DocumentChunk.node_id.in_(all_expanded_section_ids))
         )
         if allowed_departments is not None or allowed_documents is not None:
-            from sqlalchemy import or_
             doc_conds = []
             if allowed_departments is not None:
                 doc_conds.append(Document.department_id.in_(allowed_departments))
@@ -1387,8 +1700,6 @@ class RetrievalService:
         Match entities in KnowledgeEntity and resolve to DocumentChunks via KnowledgeEvidence.
         Filters KnowledgeItem.status == 'ACTIVE'.
         """
-        from sqlalchemy import or_
-
         stmt = (
             select(
                 DocumentChunk,
@@ -1432,10 +1743,16 @@ class RetrievalService:
             DocumentChunk.id.asc(),
         )
 
-        rows = await self.session.execute(stmt)
+        exec_res = await self.session.execute(stmt)
+        all_rows = exec_res.all() if hasattr(exec_res, "all") else []
+        if hasattr(all_rows, "__await__"):
+            all_rows = await all_rows
+        if not isinstance(all_rows, (list, tuple)):
+            all_rows = []
+
         seen_chunk_ids = set()
         entity_results = []
-        for row in rows.all():
+        for row in all_rows:
             chunk = row[0]
             doc = row[1]
             score = row[2]
@@ -1484,9 +1801,6 @@ class RetrievalService:
         Pre-filters authorization on KnowledgeItem and Document before returning chunks.
         Filters KnowledgeItem.status == 'ACTIVE'.
         """
-        from sqlalchemy.orm import aliased
-        from sqlalchemy import or_
-
         # -------------------------------------------------------------
         # 2-HOP TRAVERSAL
         # -------------------------------------------------------------
@@ -1795,7 +2109,6 @@ class RetrievalService:
         )
         
         if allowed_departments is not None:
-            from sqlalchemy import or_
             statement = statement.where(
                 or_(
                     Document.department_id.in_(allowed_departments),
@@ -1805,9 +2118,12 @@ class RetrievalService:
             
         statement = statement.limit(candidate_k)
 
-        rows = await self.session.execute(
-            statement
-        )
+        exec_rows = await self.session.execute(statement)
+        all_rows = exec_rows.all() if hasattr(exec_rows, "all") else []
+        if hasattr(all_rows, "__await__"):
+            all_rows = await all_rows
+        if not isinstance(all_rows, (list, tuple)):
+            all_rows = []
 
         return [
             (
@@ -1815,7 +2131,7 @@ class RetrievalService:
                 document,
                 1.0,
             )
-            for chunk, document in rows.all()
+            for chunk, document in all_rows
         ]
 
     # =============================================================
@@ -1922,6 +2238,34 @@ class RetrievalService:
             or knowledge_passed
             or hierarchical_passed
         )
+
+    def _get_candidate_rerank_text(
+        self,
+        candidate: HybridCandidate,
+    ) -> str:
+        chunk = candidate.chunk
+        doc_name = candidate.document.file_name or ""
+        clean_doc = re.sub(r"^[a-f0-9]{32}_", "", doc_name)
+
+        metadata = chunk.metadata_ or {}
+        headers = []
+        for k in sorted(metadata.keys()):
+            if k.startswith("header_") and metadata[k]:
+                headers.append(str(metadata[k]))
+        section_str = " > ".join(headers) if headers else ""
+
+        search_ctx = metadata.get("search_context") or ""
+
+        parts = []
+        if clean_doc:
+            parts.append(f"Document: {clean_doc}")
+        if section_str:
+            parts.append(f"Section: {section_str}")
+        if search_ctx:
+            parts.append(f"Search context: {search_ctx}")
+        parts.append(f"Content: {chunk.text}")
+
+        return "\n".join(parts)
 
     # =============================================================
     # QUERY NORMALIZATION

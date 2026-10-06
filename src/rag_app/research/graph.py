@@ -31,7 +31,7 @@ from rag_app.research.provider import (
     WebSearchResult,
 )
 from rag_app.research.registry import get_provider_registry
-from rag_app.schemas.rag import ChunkProvenance, GenerateResponse, RetrievedChunk
+from rag_app.schemas.rag import ChunkHierarchyMetadata, ChunkProvenance, GenerateResponse, RetrievedChunk
 from rag_app.schemas.research import (
     CleanWebPage,
     SourceSelection,
@@ -61,7 +61,9 @@ class ResearchState(TypedDict):
     retrieved_chunks: list[RetrievedChunk]
     strategy_trace: dict[str, int] | None
     chunk_provenance: dict[str, ChunkProvenance] | None
+    chunk_hierarchy: dict[str, ChunkHierarchyMetadata] | None
     is_sufficient: bool | None
+    sufficiency_evaluation: SufficiencyEvaluation | None
 
     # Research
     research_run_id: str | None
@@ -224,6 +226,7 @@ async def retrieve_rag(
         "retrieved_chunks": response.results,
         "strategy_trace": response.strategy_trace,
         "chunk_provenance": response.chunk_provenance,
+        "chunk_hierarchy": response.chunk_hierarchy,
     }
 
 
@@ -244,116 +247,64 @@ async def evaluate_sufficiency(
         [],
     )
 
-    # No retrieved evidence.
-    # For a KNOWLEDGE query this means:
-    # RAG is insufficient -> Research Engine.
-    if not chunks:
-        from rag_app.retrieval.query_parser import is_history_query
-        has_thread_context = bool(state.get("workspace_thread_context"))
-        has_conv_history = bool(state.get("conversation_history"))
-        if is_history_query(state["query"]) or has_thread_context or has_conv_history:
-            logger.info("Empty chunks but detected history or workspace thread context; routing to LLM.")
-            return {
-                "is_sufficient": True,
-            }
-        return {
-            "is_sufficient": False,
-        }
-
     record_stage_start("research")
     try:
-        llm = get_llm()
+        from rag_app.retrieval.sufficiency import EvidenceSufficiencyEvaluator
+        evaluator = EvidenceSufficiencyEvaluator()
 
-        context_text = "\n\n".join(
-            f"Chunk {i + 1}:\n{chunk.text}"
-            for i, chunk in enumerate(chunks)
+        result = await evaluator.evaluate(
+            query=state["query"],
+            chunks=chunks,
+            query_plan=state.get("query_plan"),
+            chunk_hierarchy=state.get("chunk_hierarchy"),
+            conversation_history=state.get("conversation_history"),
+            workspace_thread_context=state.get("workspace_thread_context"),
         )
+
+        from rag_app.core.observability import record_sufficiency_metrics, record_failure_category
+        from rag_app.schemas.rag import FailureCategory
+        from rag_app.schemas.research import SufficiencyStatus
+
+        status_str = result.status.value if hasattr(result.status, "value") else str(result.status)
+        record_sufficiency_metrics(
+            sufficiency=result.is_sufficient,
+            status=status_str,
+            evidence_found=result.evidence_found,
+            confidence=result.confidence,
+            coverage=result.coverage,
+            reason=result.reason,
+            missing_requirements_count=len(result.missing_requirements),
+            contradiction_count=len(result.contradictions),
+            evidence_types=result.evidence_types,
+        )
+        if result.status == SufficiencyStatus.INSUFFICIENT:
+            record_failure_category(FailureCategory.SUFFICIENCY)
 
         logger.info(
-            "evaluate_sufficiency_input",
+            "sufficiency_evaluation",
             extra={
-                "event": "evaluate_sufficiency_input",
+                "event": "sufficiency_evaluation",
                 "query": state["query"],
                 "candidate_count": len(chunks),
-                "top_candidate_preview": chunks[0].text[:200] if chunks else None,
+                "status": status_str,
+                "is_sufficient": result.is_sufficient,
+                "evidence_found": result.evidence_found,
+                "required_count": len(result.required_information),
+                "supported_count": len(result.supported_information),
+                "missing_count": len(result.missing_requirements),
+                "contradiction_count": len(result.contradictions),
+                "answerable_from_context": result.answerable_from_context,
+                "reason": result.reason,
+                "confidence": result.confidence,
+                "coverage": result.coverage,
+                "evidence_types": result.evidence_types,
             },
         )
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a sufficiency evaluator. "
-                    "Determine whether the provided context contains relevant, factual information "
-                    "or guidelines to answer or address the user's question. "
-                    "Return True if the context contains relevant facts, SOP guidelines, policies, or substantive information addressing the query. "
-                    "Return False only if the context is entirely irrelevant, ungrounded, or lacks information related to the user's question."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Context:\n{context_text}\n\n"
-                    f"Question:\n{state['query']}"
-                ),
-            },
-        ]
-
-        try:
-            structured_llm = (
-                llm.llm.with_structured_output(
-                    SufficiencyEvaluation,
-                    include_raw=True,
-                )
-            )
-
-            _eval_start = time.perf_counter()
-            inv_res = await structured_llm.ainvoke(messages)
-            _eval_latency = (time.perf_counter() - _eval_start) * 1000
-
-            raw_msg = inv_res.get("raw") if isinstance(inv_res, dict) else None
-            usage_meta = getattr(raw_msg, "usage_metadata", None) or {}
-            record_llm_call(
-                stage_name="research",
-                usage=usage_meta,
-                latency_ms=_eval_latency,
-                model_name=getattr(llm.llm, "model_name", None),
-            )
-
-            result: SufficiencyEvaluation = (
-                inv_res.get("parsed") if isinstance(inv_res, dict) else inv_res
-            )
-
-            is_sufficient = result.is_sufficient if result is not None else True
-
-            logger.info(
-                "sufficiency_evaluation",
-                extra={
-                    "event": "sufficiency_evaluation",
-                    "query": state["query"],
-                    "candidate_count": len(chunks),
-                    "is_sufficient": is_sufficient,
-                    "reason": getattr(result, "reason", None) if result else None,
-                },
-            )
-
-        except Exception as exc:
-            logger.error(
-                "sufficiency_evaluation_failed",
-                extra={
-                    "event": "sufficiency_evaluation_failed",
-                    "error": str(exc),
-                },
-            )
-
-            # Preserve your existing behavior:
-            # if evaluator fails but RAG returned chunks,
-            # use standard RAG rather than unnecessarily
-            # launching research.
-            is_sufficient = True
-
         return {
-            "is_sufficient": is_sufficient,
+            "is_sufficient": result.is_sufficient,
+            "sufficiency_status": status_str,
+            "sufficiency_evaluation": result,
         }
     finally:
         record_stage_end("research")
@@ -365,6 +316,12 @@ def decide_next_after_eval(
     "generate_final_answer",
     "no_context",
 ]:
+    from rag_app.schemas.research import SufficiencyStatus, SufficiencyEvaluation
+    suff_eval = state.get("sufficiency_evaluation")
+    if isinstance(suff_eval, SufficiencyEvaluation):
+        if suff_eval.status in (SufficiencyStatus.SUFFICIENT, SufficiencyStatus.PARTIAL):
+            return "generate_final_answer"
+        return "no_context"
 
     if state.get("is_sufficient"):
         return "generate_final_answer"
@@ -865,6 +822,7 @@ async def generate_final_answer(
             is_web_context=False,
             strategy_trace=state.get("strategy_trace"),
             chunk_provenance=state.get("chunk_provenance"),
+            chunk_hierarchy=state.get("chunk_hierarchy"),
         )
 
         response = (
@@ -881,6 +839,7 @@ async def generate_final_answer(
                 conversation_history=state.get("conversation_history"),
                 workspace_thread_context=state.get("workspace_thread_context"),
                 workspace_id=state.get("workspace_id"),
+                sufficiency_evaluation=state.get("sufficiency_evaluation"),
             )
         )
 
@@ -952,6 +911,7 @@ async def generate_final_answer(
                     chunk_hierarchy=compiled_context.chunk_hierarchy,
                     rendered_context=compiled_context.rendered_context,
                     conversation_history=state.get("conversation_history"),
+                    sufficiency_evaluation=state.get("sufficiency_evaluation"),
                 )
             )
 

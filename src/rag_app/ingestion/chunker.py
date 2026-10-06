@@ -236,6 +236,20 @@ def _chunk_markdown(
                 "markdown"
             )
 
+            context_parts = []
+            if "source" in element.metadata:
+                from pathlib import Path
+                filename = Path(element.metadata['source']).name
+                clean_name = re.sub(r'^[a-fA-F0-9]{32}_', '', filename)
+                clean_name = clean_name.replace('.pdf', '').replace('.md', '')
+                clean_name = clean_name.replace('-', ' ').replace('_', ' ')
+                context_parts.append(f"Document: {clean_name}")
+            for k in sorted(metadata.keys()):
+                if k.startswith("header_") and metadata[k]:
+                    context_parts.append(f"Section: {metadata[k]}")
+            if context_parts:
+                metadata["search_context"] = "\n".join(context_parts)
+
             chunks.append(
                 (
                     text,

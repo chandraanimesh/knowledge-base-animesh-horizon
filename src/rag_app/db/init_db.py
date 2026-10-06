@@ -64,6 +64,12 @@ async def init_db() -> None:
             )
         )
 
+        await conn.execute(
+            text(
+                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS visualization JSONB"
+            )
+        )
+
     logger.info(
         "db_initialized",
         extra={"event": "db_initialized"},

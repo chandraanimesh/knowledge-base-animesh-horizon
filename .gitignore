@@ -1,19 +1,35 @@
 .env
+.env.*
+!.env.example
 
 sample_docs/*
 uploaded_docs/*
 
 **/__pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
 .venv/
+env/
+venv/
 
 uv.lock
 
 ocr_rapidocr/*
 
 *.log
+*.zip
+tmp*/
+.codeboarding/
 
 *.egg-info/
+dist/
+build/
 
-directory_extractor
+directory_extractor/

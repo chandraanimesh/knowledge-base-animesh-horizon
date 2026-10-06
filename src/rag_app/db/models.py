@@ -1355,6 +1355,10 @@ class ChatMessage(Base):
         JSONB,
         nullable=True,
     )
+    visualization: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
     execution_metrics: Mapped[dict | None] = mapped_column(
         JSONB,
         nullable=True,

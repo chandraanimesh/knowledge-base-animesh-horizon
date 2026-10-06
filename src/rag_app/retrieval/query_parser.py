@@ -6,7 +6,14 @@ from langsmith import traceable
 
 from rag_app.providers.base.llm import LLMProvider
 from rag_app.generation.llm_factory import get_llm
-from rag_app.schemas.rag import CompanyFilters, QueryPlan, RelationshipQuery
+from rag_app.schemas.rag import (
+    CompanyFilters,
+    EvidenceNeed,
+    InformationNeed,
+    PresentationNeed,
+    QueryPlan,
+    RelationshipQuery,
+)
 from rag_app.core.tracing import track
 
 logger = logging.getLogger(__name__)
@@ -47,8 +54,13 @@ def is_greeting(query: str) -> bool:
     )
 
 HISTORY_PATTERNS = [
-    re.compile(r"\b(what|remind|summarize|tell|can you remind).*(earlier|previous|last|before|discussed|talked|asked|said)\b(?!.*\b\d{4}\b)", re.IGNORECASE),
-    re.compile(r"\b(what did i ask|what was my previous|what did you tell|what i asked)\b", re.IGNORECASE)
+    # Explicit past conversational turns between user and assistant
+    re.compile(r"\b(?:what|which|how|why)\b.*\b(?:did\s+(?:i|we|you)\s+(?:ask|say|tell|mention|discuss|talk\s+about|decide)|(?:i|we|you)\s+(?:asked|said|told|mentioned|discussed|decided|talked\s+about))\b", re.IGNORECASE),
+    re.compile(r"\b(?:what|which)\s+(?:was|were)\s+(?:my|your|our)\s+(?:previous|earlier|last|prior)\s+(?:question|message|turn|prompt|response|discussion|point)\b", re.IGNORECASE),
+    re.compile(r"\b(?:what\s+did\s+(?:i|you|we)\s+(?:ask|say|tell|discuss|mention|talk\s+about|decide))\b", re.IGNORECASE),
+    re.compile(r"\b(?:can\s+you\s+remind\s+me|remind\s+me|tell\s+me)\s+(?:what\s+(?:i|you|we)|about\s+what\s+(?:i|we))\s+(?:asked|said|discussed|mentioned|talked\s+about)\b", re.IGNORECASE),
+    re.compile(r"\b(?:earlier|previously)\s+in\s+(?:this|our)\s+(?:chat|conversation|thread)\b", re.IGNORECASE),
+    re.compile(r"\b(?:which\s+of\s+(?:those|these|them)\s+did\s+we\s+(?:discuss|talk\s+about|mention))\b", re.IGNORECASE),
 ]
 
 def is_history_query(query: str) -> bool:
@@ -61,8 +73,12 @@ def is_history_query(query: str) -> bool:
     if not normalized:
         return False
         
-    # False positive catchers for common document-retrieval patterns
-    if re.search(r"\b(before|after|in|during)\s+(19|20)\d{2}\b", normalized, re.IGNORECASE):
+    # False positive catchers for common document-retrieval / temporal patterns
+    if re.search(r"\b(?:before|after|in|during)\s+(?:19|20)\d{2}\b", normalized, re.IGNORECASE):
+        return False
+    if re.search(r"\b(?:before|after)\s+(?:launch|implementation|release|deployment|start|ready|completion|deadline|production)\b", normalized, re.IGNORECASE):
+        return False
+    if re.search(r"\b(?:last|previous|prior)\s+(?:quarter|year|month|week|fiscal|release|sprint|version|edition)\b", normalized, re.IGNORECASE):
         return False
         
     for pattern in HISTORY_PATTERNS:
@@ -71,6 +87,157 @@ def is_history_query(query: str) -> bool:
             
     return False
 
+
+
+def strip_presentation_instructions(query: str) -> str:
+    """
+    Strips presentation, formatting, visualization, and chart instructions
+    from the query string so semantic retrieval targets factual content.
+    Generic and domain-agnostic.
+    """
+    if not query:
+        return query
+
+    patterns = [
+        r"\b(?:show|render|visualize|display|draw|plot)\s+(?:this\s+)?(?:as\s+)?(?:a\s+)?(?:bar|line|pie|scatter|donut|area)?\s*(?:chart|graph|table|timeline)\b",
+        r"\bas\s+(?:a\s+)?(?:bar|line|pie|scatter|donut|area)?\s*(?:chart|graph|table|timeline|markdown\s+table)\b",
+        r"\bin\s+(?:a\s+)?(?:bar|line|pie|scatter|donut|area)?\s*(?:chart|graph|table|timeline|grid|markdown\s+table)\b",
+        r"\b(?:make|generate|build|create)\s+(?:a\s+)?(?:bar|line|pie|scatter|donut|area)?\s*(?:chart|graph|table|timeline)\b",
+        r"\b(?:as|in)\s+(?:a\s+)?(?:markdown\s+)?table\b",
+        r"\b(?:visualize|plot)\b",
+    ]
+    cleaned = query
+    for pat in patterns:
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+    cleaned = " ".join(cleaned.strip().split())
+    # Clean up leading/trailing prepositions or articles or punctuation left over
+    cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s+(?:as|in|with|using|like)\s*$", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = cleaned.strip("?.,!;: ")
+    return cleaned if cleaned else query
+
+
+def extract_deterministic_intent(query: str) -> tuple[InformationNeed, PresentationNeed, EvidenceNeed, bool, str]:
+    """
+    Extracts high-level information need, presentation need, evidence need,
+    conversation_required flag, and reason deterministically from generic query patterns.
+    """
+    normalized = " ".join(query.strip().split())
+    if not normalized:
+        return InformationNeed.GENERAL, PresentationNeed.NONE, EvidenceNeed.PROSE, False, "empty_query"
+
+    if is_greeting(normalized):
+        return InformationNeed.CONVERSATION, PresentationNeed.NONE, EvidenceNeed.CONVERSATION, True, "greeting_detected"
+
+    if is_history_query(normalized):
+        return InformationNeed.CONVERSATION, PresentationNeed.NONE, EvidenceNeed.CONVERSATION, True, "conversation_history_referenced"
+
+    q_lower = normalized.lower()
+
+    # Presentation Need detection (independent from information need)
+    pres_need = PresentationNeed.NONE
+    if re.search(r"\b(?:bar|line|pie|scatter|donut|area)\s+chart\b|\bchart\b|\bgraph\b|\bplot\b|\bvisualize\b", q_lower):
+        pres_need = PresentationNeed.CHART
+    elif re.search(r"\btable\b|\bgrid\b|\bmatrix\b|\btabular\b", q_lower):
+        pres_need = PresentationNeed.TABLE
+    elif re.search(r"\btimeline\b|\bchronolog(?:y|ical)\b", q_lower):
+        pres_need = PresentationNeed.TIMELINE
+    elif re.search(r"\bnetwork\b|\bgraph\s+relationship\b|\bconnections\b", q_lower):
+        pres_need = PresentationNeed.NETWORK
+
+    # Information Need & Evidence Need detection
+    if re.search(r"\b(what\s+is\s+this\s+document\s+about|overview|summary|summarize|document\s+summary|high-level\s+summary)\b", q_lower):
+        return InformationNeed.OVERVIEW, pres_need, EvidenceNeed.HIERARCHICAL, False, "document_overview_requested"
+
+    if re.search(r"^\s*list\b|\b(list\s+the|enumerate|bullet\s+points|items)\b", q_lower):
+        return InformationNeed.LIST, pres_need, EvidenceNeed.MIXED, False, "list_enumeration_requested"
+
+    if re.search(r"\b(compare|comparison|difference\s+between|differences\s+between|\bvs\b|\bversus\b)\b", q_lower):
+        return InformationNeed.COMPARISON, pres_need, EvidenceNeed.MIXED, False, "comparison_analysis_requested"
+
+    # REQUIREMENTS: explicit terminology + natural-language patterns
+    if re.search(
+        r"\b(requirement|requirements|specifications|mvp"
+        r"|needs?\s+to\s+(?:be\s+)?(?:implemented|completed|built|done|changed|change|modified|modify|updated|update)"
+        r"|need\s+to\s+implement"
+        r"|(?:things?|what|work)\s+(?:that\s+)?(?:i\s+)?(?:need|must|have)\s+to\s+(?:implement|build|complete|do|finish)"
+        r"|(?:what|which)\s+(?:things?\s+)?(?:do\s+i\s+)?need\s+to\s+implement"
+        r"|implement(?:ation)?\s+requirement"
+        r"|what\s+(?:needs|has)\s+to\s+(?:be\s+)?(?:implemented|built|completed|done|changed|change|fixed|fix)"
+        r"|what\s+(?:is|work\s+is|information\s+is)\s+(?:still\s+)?(?:outstanding|required|remaining|needed|missing)"
+        r"|(?:have\s+to|must|need\s+to)\s+(?:build|change|implement|complete)"
+        r"|(?:ready|complete|finished|done)\s+(?:before|for)\b"
+        r"|\bimplementation\s+(?:checklist|tasks?)\b"
+        r"|covered\s+everything\s+that\s+needs"
+        r")\b",
+        q_lower,
+    ):
+        return InformationNeed.REQUIREMENTS, pres_need, EvidenceNeed.HIERARCHICAL, False, "requirements_evidence_requested"
+
+    if re.search(r"\b(total|sum|average|by\s+value|breakdown|distribution|pipeline\s+by\s+value|statistics|aggregation|count\s+of)\b", q_lower) or pres_need in (PresentationNeed.CHART, PresentationNeed.TABLE):
+        return InformationNeed.AGGREGATION, pres_need, EvidenceNeed.STRUCTURED, False, "numerical_aggregation_or_chart_requested"
+
+    if re.search(r"\b(explain|how\s+does|why\s+is|how\s+to|what\s+causes|describe\s+how)\b", q_lower):
+        return InformationNeed.EXPLANATION, pres_need, EvidenceNeed.PROSE, False, "explanation_requested"
+
+    if re.search(r"\b(who\s+is|who\s+was|what\s+is|where\s+is|when\s+did|which\s+is|deadline)\b", q_lower):
+        return InformationNeed.FACTUAL, pres_need, EvidenceNeed.PROSE, False, "factual_lookup_requested"
+
+    return InformationNeed.GENERAL, pres_need, EvidenceNeed.PROSE, False, "general_query"
+
+
+# ============================================================
+# INTENT-BASED SEMANTIC ENRICHMENT
+# ============================================================
+
+# Bounded, deterministic synonym terms per InformationNeed category.
+# These are generic, domain-agnostic terms that improve retrieval
+# recall when the LLM-generated semantic_query strips intent signal.
+_INTENT_SEMANTIC_TERMS: dict[InformationNeed, str] = {
+    InformationNeed.REQUIREMENTS: "requirements implementation specifications tasks",
+    InformationNeed.OVERVIEW: "overview summary introduction",
+    InformationNeed.LIST: "list items enumeration",
+    InformationNeed.COMPARISON: "comparison differences alternatives",
+    InformationNeed.AGGREGATION: "total summary metrics statistics",
+}
+
+
+def enrich_semantic_query(
+    semantic_query: str | None,
+    information_need: InformationNeed,
+) -> str | None:
+    """
+    Appends bounded, deterministic intent-derived synonym terms to the
+    semantic query so that retrieval (vector + keyword + hierarchical)
+    does not lose the intent signal when the LLM strips it.
+
+    Only enriches when:
+    1. A semantic_query exists.
+    2. The intent has registered synonym terms.
+    3. The semantic_query does not already contain a majority of those terms.
+
+    The appended terms are kept short and bounded to avoid diluting the query.
+    """
+    if not semantic_query or not semantic_query.strip():
+        return semantic_query
+
+    enrichment = _INTENT_SEMANTIC_TERMS.get(information_need)
+    if not enrichment:
+        return semantic_query
+
+    sq_lower = semantic_query.lower()
+    enrichment_tokens = enrichment.split()
+    # Only enrich if fewer than half the intent terms are already present
+    present_count = sum(1 for t in enrichment_tokens if t in sq_lower)
+    if present_count >= len(enrichment_tokens) / 2:
+        return semantic_query
+
+    # Append only missing terms
+    missing = [t for t in enrichment_tokens if t not in sq_lower]
+    if not missing:
+        return semantic_query
+
+    return f"{semantic_query.strip()} {' '.join(missing)}"
 
 
 # Words that reliably signal the start of a new clause when they appear
@@ -259,6 +426,9 @@ Return ONLY valid JSON with exactly this structure:
 
 {
   "semantic_query": string or null,
+  "information_need": "OVERVIEW" | "FACTUAL" | "REQUIREMENTS" | "LIST" | "COMPARISON" | "AGGREGATION" | "EXPLANATION" | "CONVERSATION" | "GENERAL",
+  "presentation_need": "TEXT" | "TABLE" | "CHART" | "TIMELINE" | "NETWORK" | "NONE",
+  "evidence_need": "PROSE" | "HIERARCHICAL" | "STRUCTURED" | "MIXED" | "CONVERSATION",
   "filters": {
     "company_id": string or null,
     "company_name_contains": string or null,
@@ -280,86 +450,49 @@ Rules:
 1. Extract only values explicitly supported by the user's query.
    Never invent values.
 
-2. company_id:
-   Extract only when the user explicitly refers to a company identifier.
+2. information_need:
+   Classify the primary information need:
+   - "OVERVIEW": High-level document summary, general topic, what the document is about.
+   - "REQUIREMENTS": Technical requirements, specifications, prerequisites, what needs to be implemented, MVP scope.
+   - "LIST": Enumeration, list of items/features/rules.
+   - "COMPARISON": Comparing two or more entities, approaches, or options.
+   - "AGGREGATION": Numerical summaries, metrics, counts, totals, distributions, pipeline values.
+   - "EXPLANATION": Conceptual or procedural explanations (how/why).
+   - "FACTUAL": Point lookups, specific facts, dates, single entity queries.
+   - "CONVERSATION": Greetings, chitchat, conversation history.
+   - "GENERAL": General questions that do not fit the above.
 
-3. company_name_contains:
-   Extract only when the user explicitly searches, filters, or refers to
-   a company name.
+3. presentation_need:
+   Represent the output format desired by the user (independent from retrieval):
+   - "CHART": User requests a chart, plot, bar graph, line graph, pie chart, or visualization.
+   - "TABLE": User requests a table, grid, or tabular breakdown.
+   - "TIMELINE": User requests a chronological sequence or timeline.
+   - "NETWORK": User requests graph/relationship visual representation.
+   - "TEXT": User requests prose or text output explicitly.
+   - "NONE": Default when no presentation/visualization format is requested.
 
-   Examples:
-   "companies named Nexa"
-   -> company_name_contains = "Nexa"
+4. evidence_need:
+   Represent the likely evidence structure:
+   - "HIERARCHICAL": Document outline, section headers, overview abstracts, requirements structure.
+   - "STRUCTURED": Tabular data, key-value attributes, metrics, numbers.
+   - "PROSE": Paragraphs, explanations, articles.
+   - "MIXED": Combination of structured/table and prose/hierarchy.
+   - "CONVERSATION": Conversation turns or thread history.
 
-   "find Nexa company"
-   -> company_name_contains = "Nexa"
+5. semantic_query:
+   Focus semantic_query purely on the underlying data, facts, entities, or concepts being requested.
+   ALWAYS strip presentation, formatting, visualization, and chart instructions
+   (e.g., 'visualize as a bar chart', 'plot line chart', 'render table', 'show as a pie chart', 'as a bar chart', 'draw a chart', 'in a graph')
+   from semantic_query so retrieval targets the source document's factual content.
 
-   "companies containing Nexa in their name"
-   -> company_name_contains = "Nexa"
-
-   Technical terms such as JWT, FastAPI, SQLAlchemy, programming
-   languages, libraries, protocols, databases, authentication
-   mechanisms, and engineering concepts remain semantic queries unless
-   the user explicitly indicates a company-name search.
-
-4. If something could be both a company name and a technical concept,
-   prefer semantic_query unless company-search intent is explicit.
-
-   "JWT"
-   -> semantic_query = "JWT"
-
-   "information about JWT"
-   -> semantic_query = "information about JWT"
-
-   "company named JWT"
-   -> company_name_contains = "JWT"
-
-5. funding_status may ONLY be:
-   "Funded", "Non-Funded", or null.
-
-6. Extract city or country as structured filters ONLY when the user
-   is explicitly searching for, filtering, or referring to companies
-   or company records.
-
-   For general knowledge, weather, news, travel, or other non-company
-   queries, keep the location inside semantic_query and leave city/country null.
+6. company_id & company_name_contains:
+   Extract only when the user explicitly refers to a company identifier or company name search.
+   Technical terms (JWT, FastAPI, SQLAlchemy, REST, etc.) remain semantic queries.
 
 7. relationship_query:
-   Extract when the user asks about relationships/connections between entities (e.g. who works at Acme, who founded Beta, what products does Gamma develop, which companies did Alice invest in).
-   Examples:
-   "Who works at Acme?" -> relationship_query: {"subject_entity": null, "predicate": "works_at", "object_entity": "Acme", "direction": "in", "hop_limit": 1}
-   "Who founded Acme?" -> relationship_query: {"subject_entity": null, "predicate": "founded", "object_entity": "Acme", "direction": "in", "hop_limit": 1}
-   "Which companies did Alice invest in?" -> relationship_query: {"subject_entity": "Alice", "predicate": "invested_in", "object_entity": null, "direction": "out", "hop_limit": 1}
-   "What does Alice work on?" -> relationship_query: {"subject_entity": "Alice", "predicate": "works_on", "object_entity": null, "direction": "out", "hop_limit": 1}
-   If no relationship query is present, emit relationship_query: null.
+   Extract when the user asks about relationships/connections between entities.
 
-8. semantic_query represents the user's actual information need.
-
-9. Purely structured requests may use semantic_query = null.
-
-10. Technical, engineering, programming, documentation, policy, and
-    general-knowledge queries should preserve their subject in
-    semantic_query, even when only one or two words long.
-
-11. For semantic_query retrieval rewriting, you may use:
-    - synonyms
-    - relevant terminology
-    - section concepts
-    - important entities
-    - numerical concepts
-    - policy terminology
-
-    Do NOT invent facts or change filters.
-
-12. NEVER answer the user's question.
-
-13. NEVER generate SQL.
-
-14. Return JSON only.
-
-15. When uncertain between semantic interpretation and company-name
-    interpretation, prefer semantic interpretation unless explicit
-    company-search intent exists.
+8. NEVER answer the user's question. NEVER generate SQL. Return JSON only.
 """.strip()
 
 
@@ -377,15 +510,16 @@ class QueryParser:
     async def parse(self, query: str) -> QueryPlan:
         """
         Convert a user query into a structured retrieval plan.
-
-        Greetings are handled deterministically and never sent to the LLM.
+        Greetings and conversation history are handled deterministically.
         """
-
         normalized_query = " ".join(query.strip().split())
 
+        # Fast deterministic intent extraction
+        det_info, det_pres, det_ev, det_conv, det_reason = extract_deterministic_intent(normalized_query)
+        cleaned_semantic = strip_presentation_instructions(normalized_query)
+
         # --------------------------------------------------------
-        # IMPORTANT:
-        # Do not spend an LLM call on greetings.
+        # Do not spend an LLM call on greetings or pure history.
         # --------------------------------------------------------
         if is_greeting(normalized_query):
             logger.info(
@@ -395,10 +529,25 @@ class QueryParser:
                     "query": normalized_query,
                 },
             )
-
             return QueryPlan(
                 semantic_query=None,
                 filters=CompanyFilters(),
+                information_need=InformationNeed.CONVERSATION,
+                presentation_need=PresentationNeed.NONE,
+                evidence_need=EvidenceNeed.CONVERSATION,
+                conversation_required=True,
+                reason="greeting",
+            )
+
+        if is_history_query(normalized_query):
+            return QueryPlan(
+                semantic_query=cleaned_semantic,
+                filters=CompanyFilters(),
+                information_need=InformationNeed.CONVERSATION,
+                presentation_need=det_pres,
+                evidence_need=EvidenceNeed.CONVERSATION,
+                conversation_required=True,
+                reason="conversation_history",
             )
 
         messages = [
@@ -428,9 +577,14 @@ class QueryParser:
                 },
             )
             plan = QueryPlan(
-                semantic_query=normalized_query,
+                semantic_query=enrich_semantic_query(cleaned_semantic, det_info),
                 filters=CompanyFilters(),
                 relationship_query=extract_deterministic_relationship(normalized_query),
+                information_need=det_info,
+                presentation_need=det_pres,
+                evidence_need=det_ev,
+                conversation_required=det_conv,
+                reason=det_reason,
             )
             plan.entity_search_term = extract_entity_search_term(plan)
             return plan
@@ -458,20 +612,17 @@ class QueryParser:
 
         if match:
             cleaned = match.group(1).strip()
-
         else:
-            # ----------------------------------------------------
-            # Fallback: extract first JSON object.
-            # ----------------------------------------------------
             start = cleaned.find("{")
             end = cleaned.rfind("}")
-
             if start != -1 and end != -1:
                 cleaned = cleaned[start : end + 1]
 
+        det_info, det_pres, det_ev, det_conv, det_reason = extract_deterministic_intent(original_query)
+        cleaned_semantic = strip_presentation_instructions(original_query)
+
         try:
             payload = json.loads(cleaned)
-
         except json.JSONDecodeError:
             logger.error(
                 "query_parser_invalid_json",
@@ -481,26 +632,43 @@ class QueryParser:
                     "original_query": original_query,
                 },
             )
-
-            # ----------------------------------------------------
-            # Safe fallback:
-            # treat original query as semantic retrieval query.
-            # No filters are invented.
-            # ----------------------------------------------------
             plan = QueryPlan(
-                semantic_query=original_query,
+                semantic_query=cleaned_semantic,
                 filters=CompanyFilters(),
                 relationship_query=extract_deterministic_relationship(original_query),
+                information_need=det_info,
+                presentation_need=det_pres,
+                evidence_need=det_ev,
+                conversation_required=det_conv,
+                reason=det_reason,
             )
             plan.entity_search_term = extract_entity_search_term(plan)
             return plan
 
         try:
             plan = QueryPlan.model_validate(payload)
+            if plan.semantic_query:
+                plan.semantic_query = strip_presentation_instructions(plan.semantic_query)
             if plan.relationship_query is None:
                 plan.relationship_query = extract_deterministic_relationship(original_query)
             if plan.entity_search_term is None:
                 plan.entity_search_term = extract_entity_search_term(plan)
+            # If LLM defaulted intent to GENERAL / NONE but query has clear deterministic pattern, enrich it
+            if plan.information_need == InformationNeed.GENERAL and det_info != InformationNeed.GENERAL:
+                plan.information_need = det_info
+            if plan.presentation_need == PresentationNeed.NONE and det_pres != PresentationNeed.NONE:
+                plan.presentation_need = det_pres
+            if plan.evidence_need == EvidenceNeed.PROSE and det_ev != EvidenceNeed.PROSE:
+                plan.evidence_need = det_ev
+
+            plan.conversation_required = plan.information_need == InformationNeed.CONVERSATION or det_conv
+            plan.reason = det_reason
+
+            # Enrich semantic_query with intent-derived terms
+            plan.semantic_query = enrich_semantic_query(
+                plan.semantic_query, plan.information_need,
+            )
+
             return plan
 
         except Exception:
@@ -514,25 +682,14 @@ class QueryParser:
             )
 
             plan = QueryPlan(
-                semantic_query=original_query,
+                semantic_query=cleaned_semantic,
                 filters=CompanyFilters(),
                 relationship_query=extract_deterministic_relationship(original_query),
+                information_need=det_info,
+                presentation_need=det_pres,
+                evidence_need=det_ev,
+                conversation_required=det_conv,
+                reason=det_reason,
             )
             plan.entity_search_term = extract_entity_search_term(plan)
             return plan
-
-    # ============================================================
-    # CODE FENCE HELPER
-    # ============================================================
-
-    @staticmethod
-    def _remove_code_fence(text: str) -> str:
-        lines = text.splitlines()
-
-        if lines and lines[0].strip().startswith("```"):
-            lines = lines[1:]
-
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-
-        return "\n".join(lines).strip()

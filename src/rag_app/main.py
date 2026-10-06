@@ -107,3 +107,7 @@ app.include_router(access_request_router)
 app.include_router(conversation_router)
 app.include_router(workspace_router)
 app.include_router(router)
+
+# Mount FastMCP Interface over Streamable HTTP at /mcp
+from rag_app.mcp.server import get_mcp_asgi_app
+app.mount("/mcp", get_mcp_asgi_app(transport="streamable-http"))

@@ -1,9 +1,89 @@
-from pydantic import BaseModel, Field
+from enum import StrEnum
+from typing import Any
+from pydantic import BaseModel, Field, model_validator
+
+
+class SufficiencyStatus(StrEnum):
+    SUFFICIENT = "sufficient"
+    PARTIAL = "partial"
+    INSUFFICIENT = "insufficient"
+
 
 class SufficiencyEvaluation(BaseModel):
-    """Evaluation of whether the provided context is sufficient to answer the query."""
-    is_sufficient: bool = Field(description="True if the context contains relevant and factual information to answer or address the query, False otherwise.")
-    reason: str | None = Field(default=None, description="Explanation for why the context is or isn't sufficient.")
+    """
+    Structured evidence sufficiency evaluation result.
+    Evaluates whether retrieved evidence is sufficient, partial, or insufficient
+    to answer the user's information need without hallucination or estimation.
+    """
+    status: SufficiencyStatus = Field(
+        ...,
+        description="Strict sufficiency status: 'sufficient' (all essential facts supported), 'partial' (some supported, some missing, useful grounded answer possible), or 'insufficient' (missing essential facts, cannot produce useful grounded answer)."
+    )
+    evidence_found: bool = Field(
+        default=True,
+        description="Whether any relevant evidence addressing the query was found in retrieved context."
+    )
+    required_information: list[str] = Field(
+        default_factory=list,
+        description="Key facts, dimensions, entities, measures, or tasks required by the query."
+    )
+    supported_information: list[str] = Field(
+        default_factory=list,
+        description="Required information items that are explicitly supported by the retrieved context."
+    )
+    missing_requirements: list[str] = Field(
+        default_factory=list,
+        description="Required information items that are absent from the retrieved context."
+    )
+    contradictions: list[str] = Field(
+        default_factory=list,
+        description="Contradictory statements or conflicting values found across retrieved sources."
+    )
+    answerable_from_context: bool = Field(
+        default=True,
+        description="Whether a useful, fully or partially grounded answer can be produced strictly from context."
+    )
+    reason: str = Field(
+        ...,
+        description="Concise factual explanation for the sufficiency status decision."
+    )
+    confidence: float | None = Field(
+        default=None,
+        description="Confidence score in the sufficiency evaluation (0.0 to 1.0)."
+    )
+    coverage: float | None = Field(
+        default=None,
+        description="Estimated coverage score of requested information (0.0 to 1.0)."
+    )
+    evidence_types: list[str] = Field(
+        default_factory=list,
+        description="Detected evidence types (e.g. 'prose', 'table', 'list', 'hierarchical', 'conversation')."
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_legacy_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "status" not in data and "is_sufficient" in data:
+                data["status"] = SufficiencyStatus.SUFFICIENT if data["is_sufficient"] else SufficiencyStatus.INSUFFICIENT
+            if "reason" not in data or data["reason"] is None:
+                data["reason"] = "No reason provided."
+            # If answerable_from_context not explicitly set
+            if "answerable_from_context" not in data:
+                if data.get("status") == SufficiencyStatus.INSUFFICIENT and not data.get("supported_information"):
+                    data["answerable_from_context"] = False
+                else:
+                    data["answerable_from_context"] = True
+        return data
+
+    @property
+    def is_sufficient(self) -> bool:
+        """Backward-compatible boolean property."""
+        return self.status == SufficiencyStatus.SUFFICIENT
+
+
+# Canonical alias for compatibility with new and existing code
+SufficiencyResult = SufficiencyEvaluation
 
 class SourceSelection(BaseModel):
     """Selection of relevant URLs to crawl from a list of search results."""

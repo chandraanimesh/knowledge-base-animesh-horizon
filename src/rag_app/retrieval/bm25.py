@@ -55,8 +55,17 @@ class GlobalBM25Index:
                 
                 index_text = metadata_.get('embedding_text')
                 if not index_text:
-                    search_context = metadata_.get('search_context', '')
-                    index_text = f"{text}\n{search_context}"
+                    context_parts = []
+                    if metadata_.get('search_context'):
+                        context_parts.append(metadata_['search_context'])
+                    else:
+                        for k in sorted(metadata_.keys()):
+                            if k.startswith('header_') and metadata_[k]:
+                                context_parts.append(str(metadata_[k]))
+                    if context_parts:
+                        index_text = f"{'\n'.join(context_parts)}\n{text}"
+                    else:
+                        index_text = text
                 
                 tokens = self._tokenize(index_text)
                 corpus.append(tokens)

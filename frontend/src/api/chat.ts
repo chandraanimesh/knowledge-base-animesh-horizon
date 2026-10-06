@@ -18,6 +18,8 @@ export interface GenerateRequest {
   conversation_id?: string | null;
   workspace_id?: string | null;
   provider_overrides?: Record<string, string> | null;
+  action?: string | null;
+  target_message_id?: string | null;
 }
 
 export interface TokenUsage {
@@ -48,13 +50,77 @@ export interface ExecutionStages {
 
 export interface ExecutionMetrics {
   request_id: string;
+  trace_id?: string | null;
+  workspace_id?: string | null;
+  thread_id?: string | null;
+  provider?: string | null;
+  model?: string | null;
   total_latency_ms: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  usage_available?: boolean;
   llm_usage: TokenUsage;
+
+  retrieval_latency_ms?: number;
+  generation_latency_ms?: number;
+  grounding_latency_ms?: number;
+  repair_latency_ms?: number;
+  initial_generation_latency_ms?: number;
+  regeneration_latency_ms?: number;
+
+  planned_strategies?: string[];
+  executed_strategies?: string[];
+  vector_candidates?: number;
+  keyword_candidates?: number;
+  knowledge_candidates?: number;
+  hierarchical_candidates?: number;
+  candidate_count?: number;
+  reranked_candidates?: number;
+  accepted_results?: number;
+  accepted_count?: number;
+  final_context_count?: number;
+  context_chunks?: number;
+  context_tokens?: number;
+
+  reranker_top_score?: number | null;
+  reranker_bottom_score?: number | null;
+  structured_evidence_count?: number;
+  hierarchical_evidence_count?: number;
+
+  sufficiency?: boolean | null;
+  sufficiency_confidence?: number | null;
+  sufficiency_coverage?: number | null;
+  sufficiency_reason?: string | null;
+  missing_requirements_count?: number;
+  contradiction_count?: number;
+  evidence_types?: string[];
+
+  grounding?: boolean | null;
+  grounding_confidence?: number | null;
+  unsupported_claim_count?: number;
+  evidence_ref_count?: number;
+  repair_triggered?: boolean;
+  regeneration_triggered?: boolean;
+  safe_limitation_triggered?: boolean;
+
+  visualization_requested?: boolean;
+  visualization_generated?: boolean;
+  visualization_validated?: boolean;
+  visualization_repaired?: boolean;
+  visualization_dropped?: boolean;
+  visualization_failure_reason?: string | null;
+
+  streaming?: boolean;
+  failure_categories?: string[];
   stages: ExecutionStages;
 }
 
+import { VisualizationSpec } from '../components/visualizations/types';
+
 export interface GenerateResponse {
   answer: string;
+  visualization?: VisualizationSpec | null;
   citations: string[];
   retrieved_chunks: RetrievedChunk[];
   execution_metrics?: ExecutionMetrics | null;
@@ -78,6 +144,7 @@ export interface ChatMessageRecord {
   conversation_id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  visualization?: VisualizationSpec | null;
   sources?: Array<{ title: string; excerpt: string }> | null;
   execution_metrics?: ExecutionMetrics | null;
   created_at: string;

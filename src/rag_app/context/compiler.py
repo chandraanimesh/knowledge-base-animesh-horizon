@@ -5,7 +5,7 @@ from rag_app.schemas.rag import ChunkHierarchyMetadata, ChunkProvenance, Compile
 
 logger = logging.getLogger(__name__)
 
-MAX_CHUNKS_PER_DOCUMENT = 4
+MAX_CHUNKS_PER_DOCUMENT = 5
 DEFAULT_MAX_CONTEXT_TOKENS = 4000
 
 
@@ -293,6 +293,16 @@ class ContextCompiler:
         rendered_context = format_docs(compiled_chunks, chunk_hierarchy=filtered_hierarchy if filtered_hierarchy else None)
 
         dropped_count = len(chunks) - len(compiled_chunks)
+
+        try:
+            from rag_app.core.observability import record_retrieval_metrics
+            record_retrieval_metrics(
+                context_chunks=len(compiled_chunks),
+                context_tokens=current_tokens,
+                final_context_count=len(compiled_chunks),
+            )
+        except Exception:
+            pass
 
         logger.info(
             "context_compilation_completed",

@@ -39,6 +39,8 @@ import {
 } from '../api/accessRequests'
 import WorkspaceProviderSettingsModal from './WorkspaceProviderSettingsModal'
 import WorkspaceMembersModal from './WorkspaceMembersModal'
+import { VisualizationRenderer, VisualizationSpec } from './visualizations'
+import { MarkdownRenderer } from './MarkdownRenderer'
 
 type GlobalNavView = 'chat' | 'documents' | 'knowledge' | 'admin' | 'departments' | 'requests'
 type WorkspaceTab = 'threads' | 'documents' | 'knowledge' | 'members' | 'provider'
@@ -99,7 +101,7 @@ export default function AnythingLLMApp({
   const [threads, setThreads] = useState<ConversationItem[]>([])
   const [activeThreadId, setActiveThreadId] = useState<string | null>(propActiveThreadId || null)
   const [loadingThreads, setLoadingThreads] = useState(false)
-  const [messages, setMessages] = useState<Array<{ id: string; role: 'user' | 'assistant' | 'system'; content: string; sources?: Array<{ type?: string; title: string; excerpt?: string; thread_id?: string; thread_title?: string }> }>>([])
+  const [messages, setMessages] = useState<Array<{ id: string; role: 'user' | 'assistant' | 'system'; content: string; visualization?: VisualizationSpec | null; sources?: Array<{ type?: string; title: string; excerpt?: string; thread_id?: string; thread_title?: string }> }>>([])
 
   // Documents State
   const [documents, setDocuments] = useState<DocumentListItem[]>([])
@@ -331,6 +333,7 @@ export default function AnythingLLMApp({
             id: String(m.id),
             role: m.role,
             content: m.content,
+            visualization: m.visualization,
             sources: m.sources,
           }))
           setMessages(deduplicateMessages(loaded))
@@ -410,11 +413,18 @@ export default function AnythingLLMApp({
 
     try {
       const currentThreadId = activeThreadIdRef.current
+      const isTypingVisualize = queryText.toLowerCase() === 'visualize this' || queryText.toLowerCase() === 'visulaize this'
+      const lastAsst = [...messages].reverse().find((m) => m.role === 'assistant')
+      const targetMsgId = isTypingVisualize && lastAsst ? lastAsst.id : undefined
+      const actionVal = isTypingVisualize ? 'visualize' : undefined
+
       const response = await askQuestion(
         {
-          query: queryText,
+          query: isTypingVisualize ? 'Visualize this' : queryText,
           conversation_id: currentThreadId || undefined,
           workspace_id: activeWorkspace?.id || undefined,
+          action: actionVal,
+          target_message_id: targetMsgId,
         },
         token
       )
@@ -430,6 +440,7 @@ export default function AnythingLLMApp({
         id: assistantMsgId,
         role: 'assistant' as const,
         content: response.answer || 'Response generated from workspace documents.',
+        visualization: response.visualization,
         sources: rawSources,
       }
       setMessages((prev) => deduplicateMessages([...prev, assistantMsg]))
@@ -466,6 +477,44 @@ export default function AnythingLLMApp({
           content: `Error: ${err.message || 'Failed to retrieve answer from workspace.'}`,
         },
       ])
+    } finally {
+      setIsSending(false)
+    }
+  }
+
+  const handleVisualizeMessage = async (targetMessageId: string) => {
+    if (isSending) return
+    setIsSending(true)
+    try {
+      const currentThreadId = activeThreadIdRef.current
+      const response = await askQuestion(
+        {
+          query: 'Visualize this',
+          action: 'visualize',
+          target_message_id: targetMessageId,
+          conversation_id: currentThreadId || undefined,
+          workspace_id: activeWorkspace?.id || undefined,
+        },
+        token
+      )
+
+      const rawSources = (response as any).sources || (response.retrieved_chunks ? response.retrieved_chunks.map((c: any) => ({
+        type: 'document',
+        title: `${c.file_name}${c.page_number ? ` (Page ${c.page_number})` : ''}`,
+        excerpt: c.text
+      })) : [])
+
+      const assistantMsgId = response.message_id ? String(response.message_id) : `asst-${Date.now()}`
+      const assistantMsg = {
+        id: assistantMsgId,
+        role: 'assistant' as const,
+        content: response.answer || 'Response generated from workspace documents.',
+        visualization: response.visualization,
+        sources: rawSources,
+      }
+      setMessages((prev) => deduplicateMessages([...prev, assistantMsg]))
+    } catch (err: any) {
+      console.error('Visualization error:', err)
     } finally {
       setIsSending(false)
     }
@@ -1466,12 +1515,37 @@ export default function AnythingLLMApp({
                         maxWidth: '85%',
                       }}
                     >
-                      <span style={{ fontSize: '10px', fontWeight: 600, color: m.role === 'user' ? '#4B5563' : '#1E3A8A', textTransform: 'uppercase' }}>
-                        {m.role === 'user' ? 'You' : `${activeWorkspace?.name || 'Workspace'} Assistant`}
-                      </span>
-                      <div style={{ fontSize: '12px', color: '#1F2937', whiteSpace: 'pre-wrap' }}>
-                        {m.content}
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+                        <span style={{ fontSize: '10px', fontWeight: 600, color: m.role === 'user' ? '#4B5563' : '#1E3A8A', textTransform: 'uppercase' }}>
+                          {m.role === 'user' ? 'You' : `${activeWorkspace?.name || 'Workspace'} Assistant`}
+                        </span>
+                        {m.role === 'assistant' && (
+                          <button
+                            onClick={() => handleVisualizeMessage(m.id)}
+                            title="Visualize this response"
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              padding: '2px 7px',
+                              fontSize: '10.5px',
+                              fontWeight: 600,
+                              color: '#1D4ED8',
+                              background: '#EFF6FF',
+                              border: '1px solid #BFDBFE',
+                              borderRadius: '4px',
+                              cursor: 'pointer',
+                            }}
+                          >
+                            <span>📊</span>
+                            <span>Visualize this</span>
+                          </button>
+                        )}
                       </div>
+                      <MarkdownRenderer content={m.content} style={{ fontSize: '12.5px', color: '#1F2937', lineHeight: 1.6 }} />
+                      {m.role === 'assistant' && m.visualization && (
+                        <VisualizationRenderer spec={m.visualization} />
+                      )}
                       {m.role === 'assistant' && m.sources && m.sources.length > 0 && (
                         <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #F1F5F9', display: 'flex', flexDirection: 'column', gap: '3px' }}>
                           <span style={{ fontSize: '9.5px', fontWeight: 600, color: '#6B7280', textTransform: 'uppercase', letterSpacing: '0.04em' }}>

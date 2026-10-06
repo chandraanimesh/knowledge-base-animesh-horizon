@@ -1,6 +1,12 @@
 import logging
 from enum import StrEnum
-from rag_app.schemas.rag import QueryPlan, RelationshipQuery
+from rag_app.schemas.rag import (
+    EvidenceNeed,
+    InformationNeed,
+    PresentationNeed,
+    QueryPlan,
+    RelationshipQuery,
+)
 from rag_app.retrieval.query_parser import extract_deterministic_relationship
 
 logger = logging.getLogger(__name__)
@@ -23,14 +29,23 @@ class RetrievalController:
 
     def plan_route(self, query_plan: QueryPlan) -> list[RetrievalStrategy]:
         """
-        Determines the priority order of retrieval strategies based on query signals:
-        1. relationship_query -> GRAPH
-        2. entity_search_term -> KNOWLEDGE
-        3. structured filters only -> STRUCTURED
-        4. semantic/hybrid -> SEMANTIC + HIERARCHICAL
-
-        Guarantees no duplicate strategies in the returned route while preserving priority.
+        Determines the priority order of retrieval strategies based on query signals
+        and generic query understanding (information_need, presentation_need, evidence_need):
+        
+        - CONVERSATION -> [] (Conversation/greeting routed via conversation path, skips doc retrieval)
+        - relationship_query -> GRAPH
+        - entity_search_term -> KNOWLEDGE
+        - Pure structured filters only -> STRUCTURED
+        - OVERVIEW -> SEMANTIC + HIERARCHICAL
+        - REQUIREMENTS -> SEMANTIC + HIERARCHICAL
+        - LIST -> SEMANTIC + HIERARCHICAL
+        - COMPARISON -> SEMANTIC + (STRUCTURED if filters) + HIERARCHICAL
+        - AGGREGATION / CHART / TABLE -> SEMANTIC + (STRUCTURED if filters) + HIERARCHICAL
+        - GENERAL / FACTUAL / EXPLANATION -> SEMANTIC + (HIERARCHICAL if evidence warrants)
         """
+        if query_plan.conversation_required or query_plan.information_need == InformationNeed.CONVERSATION or query_plan.evidence_need == EvidenceNeed.CONVERSATION:
+            return []
+
         strategies: list[RetrievalStrategy] = []
 
         has_filters = any(
@@ -42,16 +57,53 @@ class RetrievalController:
             and query_plan.semantic_query.strip()
         )
 
+        # Graph traversal priority
         if query_plan.relationship_query is not None:
             strategies.append(RetrievalStrategy.GRAPH)
+
+        # Entity/knowledge priority
         if query_plan.entity_search_term:
             strategies.append(RetrievalStrategy.KNOWLEDGE)
 
+        # Pure structured query check
         if has_filters and not has_semantic and not query_plan.relationship_query and not query_plan.entity_search_term:
             strategies.append(RetrievalStrategy.STRUCTURED)
         else:
+            # Semantic search is the primary anchor for text queries
             strategies.append(RetrievalStrategy.SEMANTIC)
-            strategies.append(RetrievalStrategy.HIERARCHICAL)
+
+            # Include structured search if structured filters exist in compound/hybrid query
+            if has_filters:
+                strategies.append(RetrievalStrategy.STRUCTURED)
+
+            # Hierarchical strategy planning based on generic information need and evidence need
+            include_hierarchical = False
+            if query_plan.information_need in (
+                InformationNeed.OVERVIEW,
+                InformationNeed.REQUIREMENTS,
+                InformationNeed.LIST,
+                InformationNeed.COMPARISON,
+                InformationNeed.AGGREGATION,
+            ):
+                include_hierarchical = True
+            elif query_plan.evidence_need in (
+                EvidenceNeed.HIERARCHICAL,
+                EvidenceNeed.MIXED,
+                EvidenceNeed.STRUCTURED,
+            ):
+                include_hierarchical = True
+            elif query_plan.presentation_need in (
+                PresentationNeed.CHART,
+                PresentationNeed.TABLE,
+                PresentationNeed.TIMELINE,
+            ):
+                include_hierarchical = True
+            else:
+                # Default for general/factual/explanation queries: allow hierarchy to contribute
+                include_hierarchical = True
+
+            if include_hierarchical:
+                strategies.append(RetrievalStrategy.HIERARCHICAL)
 
         # Deduplicate while preserving insertion order
         seen = set()
@@ -66,6 +118,9 @@ class RetrievalController:
             extra={
                 "event": "retrieval_route_planned",
                 "route": [s.value for s in deduped_route],
+                "information_need": query_plan.information_need.value if hasattr(query_plan.information_need, "value") else str(query_plan.information_need),
+                "presentation_need": query_plan.presentation_need.value if hasattr(query_plan.presentation_need, "value") else str(query_plan.presentation_need),
+                "evidence_need": query_plan.evidence_need.value if hasattr(query_plan.evidence_need, "value") else str(query_plan.evidence_need),
                 "has_relationship": query_plan.relationship_query is not None,
                 "has_entity": bool(query_plan.entity_search_term),
                 "has_filters": has_filters,
