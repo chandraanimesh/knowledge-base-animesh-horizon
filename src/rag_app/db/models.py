@@ -6,11 +6,6 @@ from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, ForeignKeyCo
 from sqlalchemy.dialects.postgresql import UUID,JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
-from rag_app.core.config import get_settings
-
-settings = get_settings()
-
-
 class Base(DeclarativeBase):
     pass
 
@@ -220,7 +215,7 @@ class DocumentChunk(Base):
     )
     
     embedding: Mapped[list[float]] = mapped_column(
-        Vector(settings.embedding_dim),
+        Vector(384),
         nullable=False
         )
     page_number: Mapped[int | None] = mapped_column(
@@ -1192,7 +1187,7 @@ class MemoryItem(Base):
         nullable=False,
     )
     embedding: Mapped[list[float] | None] = mapped_column(
-        Vector(settings.embedding_dim),
+        Vector(384),
         nullable=True,
     )
     structured_data: Mapped[dict | None] = mapped_column(

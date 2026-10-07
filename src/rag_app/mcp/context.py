@@ -20,7 +20,6 @@ from rag_app.core.logging import new_request_id, set_request_id
 from rag_app.db.models import User
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 ALL_ADMIN_SCOPES = frozenset([
     "identity.read",
@@ -96,6 +95,7 @@ async def resolve_mcp_request_context(
         if not token_str:
             raise MCPAuthenticationError("Bearer token is empty.")
 
+        settings = get_settings()
         payload = jwt.decode(
             token_str,
             settings.jwt_secret_key,

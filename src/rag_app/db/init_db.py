@@ -8,12 +8,12 @@ from rag_app.core.logging import setup_logging
 from rag_app.db.models import Base
 from rag_app.db.session import engine
 
-settings = get_settings()
-setup_logging(settings.log_level)
 logger = logging.getLogger(__name__)
 
 
 async def init_db() -> None:
+    settings = get_settings()
+    setup_logging(settings.log_level)
     async with engine.begin() as conn:
         await conn.execute(
             text(

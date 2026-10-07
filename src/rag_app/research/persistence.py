@@ -87,14 +87,11 @@ async def adapt_to_canonical(session: AsyncSession, rk: ResearchKnowledge, evide
     await materialize_knowledge(session, candidate)
 
 import hashlib
-from rag_app.core.config import get_settings
+from rag_app.core.config import settings
 from rag_app.ingestion.embedding_v1 import get_embedding_provider
 from rag_app.ingestion.element import DocumentElement
 from rag_app.ingestion.chunker import chunk_elements
-from rag_app.ingestion.service_v1 import get_text_hash, sanitize_nul_bytes
 from sqlalchemy import insert
-
-settings = get_settings()
 
 async def ingest_knowledge_to_rag(
     session: AsyncSession,

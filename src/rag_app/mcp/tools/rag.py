@@ -37,8 +37,9 @@ from rag_app.security.authorization import (
     get_allowed_document_ids,
 )
 
+from rag_app.core.config import settings
+
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 ALLOWED_SUFFIXES = {".pdf", ".txt", ".md", ".csv", ".xlsx", ".xls", ".docx"}
 

@@ -18,12 +18,11 @@ from rag_app.ingestion.embedding_v1 import get_embedding_provider
 from rag_app.ingestion.hash import hash_file
 from rag_app.ingestion.hierarchy import HierarchyBuilder, section_nodes_to_db_rows
 from rag_app.ingestion.loader import load_document
+from rag_app.core.config import settings
 from rag_app.schemas.rag import IngestResponse
 
 
 logger = logging.getLogger(__name__)
-
-settings = get_settings()
 
 def sanitize_nul_bytes(obj):
     if isinstance(obj, str):

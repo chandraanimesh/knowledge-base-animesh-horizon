@@ -65,3 +65,14 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+class _LazySettings:
+    """Lazy proxy for Settings that defers get_settings() resolution until attribute access."""
+
+    def __getattr__(self, name: str):
+        return getattr(get_settings(), name)
+
+
+settings = _LazySettings()
+

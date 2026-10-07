@@ -1,4 +1,4 @@
-﻿"""
+"""
 OV-1: Native Hierarchical Resource Model — HierarchyBuilder
 
 Constructs a DocumentSection tree from ingested TextChunks and links
@@ -20,10 +20,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from rag_app.core.config import get_settings
+from rag_app.core.config import settings
 from rag_app.ingestion.chunker import TextChunk
-
-settings = get_settings()
 
 # ---------------------------------------------------------------------------
 # Public data structures

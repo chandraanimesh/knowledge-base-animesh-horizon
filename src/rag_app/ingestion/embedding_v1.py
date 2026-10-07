@@ -1,12 +1,8 @@
 import asyncio
 from functools import lru_cache
 
-from rag_app.core.config import get_settings
 from rag_app.core.tracing import track
 from rag_app.providers.base.embedding import EmbeddingProvider as BaseEmbeddingProvider
-
-settings = get_settings()
-
 
 class EmbeddingProvider(BaseEmbeddingProvider):
     """Base embedding provider interface for backwards compatibility."""

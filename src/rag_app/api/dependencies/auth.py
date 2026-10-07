@@ -10,7 +10,6 @@ import jwt
 from rag_app.core.config import get_settings
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
-settings = get_settings()
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
@@ -23,6 +22,7 @@ async def get_current_user(
     )
     
     try:
+        settings = get_settings()
         payload = jwt.decode(
             token, 
             settings.jwt_secret_key, 

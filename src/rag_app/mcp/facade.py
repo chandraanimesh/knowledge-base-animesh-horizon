@@ -41,6 +41,7 @@ from rag_app.mcp.schemas import (
 )
 from rag_app.retrieval.service import RetrievalService
 from rag_app.schemas.rag import GenerateRequest
+from rag_app.core.config import settings
 from rag_app.security.authorization import (
     authorize,
     get_allowed_departments,
@@ -48,7 +49,6 @@ from rag_app.security.authorization import (
 )
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 ALLOWED_SUFFIXES = {".pdf", ".txt", ".md", ".csv", ".xlsx", ".xls", ".docx"}
 
