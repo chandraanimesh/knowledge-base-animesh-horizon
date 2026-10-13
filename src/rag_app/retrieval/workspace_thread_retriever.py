@@ -84,112 +84,59 @@ class WorkspaceThreadRetriever:
         # -------------------------------------------------------------
         # 1. SCOPE RESOLUTION & AUTHORIZATION (BEFORE RETRIEVAL)
         # -------------------------------------------------------------
-        if workspace_id is not None:
-            # Workspace Chat: Validate single workspace authorization
+        if workspace_id is None:
+            # Policy containment: Global Chat (workspace_id is None) must NOT retrieve
+            # raw ChatMessage content from other employee conversations across workspaces.
+            # Product policy: Global Chat may access approved shared organizational knowledge,
+            # but not unapproved raw employee conversations.
+            logger.info("Raw cross-workspace thread retrieval is disabled for Global Chat by security policy.")
+            return []
+
+        # Workspace Chat: Validate single workspace authorization
+        ws = await session.scalar(
+            select(Workspace).where(
+                Workspace.id == workspace_id,
+                Workspace.deleted_at.is_(None),
+                Workspace.is_active == True,
+            )
+        )
+        if not ws:
             ws = await session.scalar(
                 select(Workspace).where(
-                    Workspace.id == workspace_id,
+                    Workspace.department_id == workspace_id,
                     Workspace.deleted_at.is_(None),
                     Workspace.is_active == True,
                 )
             )
-            if not ws:
-                ws = await session.scalar(
-                    select(Workspace).where(
-                        Workspace.department_id == workspace_id,
-                        Workspace.deleted_at.is_(None),
-                        Workspace.is_active == True,
-                    )
+        if not ws:
+            logger.warning(f"Workspace {workspace_id} not found or inactive during thread retrieval.")
+            return []
+
+        dept = await session.get(Department, ws.department_id)
+        if not dept or not dept.is_active or dept.deleted_at is not None:
+            logger.warning(f"Department for workspace {ws.name} is inactive or deleted.")
+            return []
+
+        if user.role != "ADMIN":
+            if user.role != "USER":
+                return []
+            # Department VIEW permission check
+            is_dept_auth = await authorize(session, user, "VIEW", dept.code)
+            if not is_dept_auth:
+                logger.warning(f"User {user.id} unauthorized for department {dept.code}.")
+                return []
+            # Workspace membership check
+            ws_member = await session.scalar(
+                select(WorkspaceMember).where(
+                    WorkspaceMember.workspace_id == ws.id,
+                    WorkspaceMember.user_id == user.id,
                 )
-            if not ws:
-                logger.warning(f"Workspace {workspace_id} not found or inactive during thread retrieval.")
+            )
+            if not ws_member:
+                logger.warning(f"User {user.id} is not a member of workspace {ws.name}.")
                 return []
 
-            dept = await session.get(Department, ws.department_id)
-            if not dept or not dept.is_active or dept.deleted_at is not None:
-                logger.warning(f"Department for workspace {ws.name} is inactive or deleted.")
-                return []
-
-            if user.role != "ADMIN":
-                if user.role != "USER":
-                    return []
-                # Department VIEW permission check
-                is_dept_auth = await authorize(session, user, "VIEW", dept.code)
-                if not is_dept_auth:
-                    logger.warning(f"User {user.id} unauthorized for department {dept.code}.")
-                    return []
-                # Workspace membership check
-                ws_member = await session.scalar(
-                    select(WorkspaceMember).where(
-                        WorkspaceMember.workspace_id == ws.id,
-                        WorkspaceMember.user_id == user.id,
-                    )
-                )
-                if not ws_member:
-                    logger.warning(f"User {user.id} is not a member of workspace {ws.name}.")
-                    return []
-
-            authorized_workspaces[ws.id] = ws.name
-
-        else:
-            # Global Chat: Retrieve across all workspaces the user is authorized to access
-            if user.role == "ADMIN":
-                stmt = (
-                    select(Workspace.id, Workspace.name)
-                    .join(Department, Workspace.department_id == Department.id)
-                    .where(
-                        Workspace.is_active == True,
-                        Workspace.deleted_at.is_(None),
-                        Department.is_active == True,
-                        Department.deleted_at.is_(None),
-                    )
-                )
-                rows = (await session.execute(stmt)).all()
-                authorized_workspaces = {ws_id: ws_name for ws_id, ws_name in rows}
-            elif user.role == "USER":
-                stmt = (
-                    select(Workspace.id, Workspace.name)
-                    .join(Department, Workspace.department_id == Department.id)
-                    .join(
-                        UserDepartment,
-                        and_(
-                            UserDepartment.user_id == user.id,
-                            UserDepartment.department_id == Department.id,
-                        ),
-                    )
-                    .join(
-                        UserPermission,
-                        and_(
-                            UserPermission.user_id == user.id,
-                            UserPermission.department_id == Department.id,
-                        ),
-                    )
-                    .join(
-                        Permission,
-                        and_(
-                            Permission.id == UserPermission.permission_id,
-                            Permission.code == "VIEW",
-                            Permission.is_active == True,
-                        ),
-                    )
-                    .join(
-                        WorkspaceMember,
-                        and_(
-                            WorkspaceMember.workspace_id == Workspace.id,
-                            WorkspaceMember.user_id == user.id,
-                        ),
-                    )
-                    .where(
-                        Workspace.is_active == True,
-                        Workspace.deleted_at.is_(None),
-                        Department.is_active == True,
-                        Department.deleted_at.is_(None),
-                    )
-                )
-                rows = (await session.execute(stmt)).all()
-                authorized_workspaces = {ws_id: ws_name for ws_id, ws_name in rows}
-            else:
-                return []
+        authorized_workspaces[ws.id] = ws.name
 
         if not authorized_workspaces:
             return []
@@ -267,27 +214,7 @@ class WorkspaceThreadRetriever:
             reverse=True,
         )
 
-        # In Global Chat across multiple workspaces, ensure balanced diversity so one workspace does not starve others
-        if workspace_id is None and len(authorized_workspaces) > 1:
-            per_ws_cap = max(2, limit // len(authorized_workspaces) + 1)
-            ws_counts: dict[Any, int] = {}
-            diverse_candidates = []
-            for item in scored_messages:
-                ws_id = item[2].workspace_id
-                if ws_counts.get(ws_id, 0) < per_ws_cap:
-                    diverse_candidates.append(item)
-                    ws_counts[ws_id] = ws_counts.get(ws_id, 0) + 1
-                if len(diverse_candidates) >= limit:
-                    break
-            if len(diverse_candidates) < limit:
-                for item in scored_messages:
-                    if item not in diverse_candidates:
-                        diverse_candidates.append(item)
-                        if len(diverse_candidates) >= limit:
-                            break
-            top_candidates = diverse_candidates
-        else:
-            top_candidates = scored_messages[:limit]
+        top_candidates = scored_messages[:limit]
 
         retrieved: list[dict[str, Any]] = [
             {

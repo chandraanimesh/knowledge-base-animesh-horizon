@@ -124,6 +124,7 @@ class ExecutionMetrics(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    total_llm_calls: int = 1
     usage_available: bool = True
     llm_usage: TokenUsage = Field(default_factory=TokenUsage)
 
@@ -204,8 +205,8 @@ class GenerateRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=5, ge=1, le=20)
     rerank: bool = True
-    conversation_id: uuid.UUID | None = None
-    workspace_id: uuid.UUID | None = None
+    conversation_id: str | uuid.UUID | None = None
+    workspace_id: str | uuid.UUID | None = None
     provider_overrides: dict[str, str] | None = Field(
         default=None,
         description="Optional runtime provider overrides for experiment runs (e.g. {'llm': 'groq', 'embedding': 'sentence_transformers'}). Does not alter stored workspace defaults.",
@@ -214,7 +215,7 @@ class GenerateRequest(BaseModel):
         default=None,
         description="Optional typed action intent, e.g. 'visualize'.",
     )
-    target_message_id: uuid.UUID | None = Field(
+    target_message_id: str | uuid.UUID | None = Field(
         default=None,
         description="Optional target assistant message ID to visualize or follow up on.",
     )
@@ -237,6 +238,7 @@ class GenerateResponse(BaseModel):
     visualization: dict | None = None
     citations: list[str]
     retrieved_chunks: list[RetrievedChunk]
+    sources: list[dict] | None = None
     grounding: AnswerGroundingResult | None = None
     execution_metrics: ExecutionMetrics | None = None
     conversation_id: str | None = None
@@ -262,7 +264,7 @@ class ConversationResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     message_count: int = 0
-    workspace_id: uuid.UUID | None = None
+    workspace_id: uuid.UUID | str | None = None
     workspace_name: str | None = None
 
 
@@ -271,13 +273,13 @@ class ConversationDetailResponse(BaseModel):
     title: str
     created_at: datetime
     updated_at: datetime
-    workspace_id: uuid.UUID | None = None
+    workspace_id: uuid.UUID | str | None = None
     messages: list[ChatMessageResponse] = Field(default_factory=list)
 
 
 class ConversationCreateRequest(BaseModel):
     title: str | None = None
-    workspace_id: uuid.UUID | None = None
+    workspace_id: uuid.UUID | str | None = None
 
 
 
@@ -360,3 +362,15 @@ class QueryPlan(BaseModel):
     evidence_need: EvidenceNeed = EvidenceNeed.PROSE
     conversation_required: bool = False
     reason: str | None = None
+
+
+class DocumentChunkInfo(BaseModel):
+    id: str
+    document_id: str
+    chunk_index: int
+    page_number: int | None = None
+    section_title: str | None = None
+    section_ordinal: str | None = None
+    excerpt: str
+    file_name: str | None = None
+    original_file_name: str | None = None

@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     stirling_api_key: str | None = None
     preprocessing_timeout: int = 60
     max_upload_size: int = 50 * 1024 * 1024 # 50 MB
+    max_chunks_per_document: int = 4
 
     # OV-1: Hierarchical resource model — L0/L1 generation bounds
     node_l0_max_chars: int = 300   # max chars for L0 section abstract
@@ -54,7 +55,11 @@ class Settings(BaseSettings):
 
     langsmith_api_key: str | None = None
     langsmith_tracing: str | None = None
-    langsmith_project: str | None = None
+    # Twenty CRM Integration Settings
+    twenty_base_url: str = "http://localhost:3000"
+    twenty_api_key: str | None = None
+    twenty_timeout_seconds: float = 5.0
+    enable_crm_integration: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -75,4 +80,3 @@ class _LazySettings:
 
 
 settings = _LazySettings()
-

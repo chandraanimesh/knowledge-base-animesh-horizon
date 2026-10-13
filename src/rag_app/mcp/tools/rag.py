@@ -36,10 +36,10 @@ from rag_app.security.authorization import (
     get_allowed_departments,
     get_allowed_document_ids,
 )
-
-from rag_app.core.config import settings
+from rag_app.core.filenames import derive_original_filename
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 ALLOWED_SUFFIXES = {".pdf", ".txt", ".md", ".csv", ".xlsx", ".xls", ".docx"}
 
@@ -116,6 +116,7 @@ async def handle_list_documents(
         {
             "id": str(doc.id),
             "file_name": doc.file_name,
+            "original_file_name": derive_original_filename(doc.file_name, doc.file_path),
             "department_code": dept_code or "GLOBAL",
             "status": doc.status,
             "chunk_count": chunk_count,

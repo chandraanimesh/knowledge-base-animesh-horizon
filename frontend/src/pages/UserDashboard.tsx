@@ -21,6 +21,7 @@ import { listWorkspaces, WorkspaceItem } from '../api/workspaces'
 import WorkspaceProviderSettingsModal from '../components/WorkspaceProviderSettingsModal'
 import WorkspacePanel from '../components/WorkspacePanel'
 import AnythingLLMApp from '../components/AnythingLLMApp'
+import CompanyNotesView from '../components/CompanyNotesView'
 const ALL_PERMS: PermissionCode[] = ['VIEW', 'UPLOAD', 'EDIT', 'DELETE']
 
 const PRESETS: Record<string, PermissionCode[]> = {
@@ -483,6 +484,16 @@ export default function UserDashboard({
           />
         )}
 
+        {/* VIEW: Company Notes & Knowledge Review */}
+        {activeView === 'kb' && (
+          <CompanyNotesView
+            token={token}
+            userRole="USER"
+            userName={userName}
+            onToast={showToast}
+          />
+        )}
+
         {/* VIEW: Documents */}
         {activeView === 'sources' && (
           <div style={{ flex: 1, minHeight: 0, height: '100%', padding: '48px 32px', overflowY: 'auto', overflowX: 'hidden' }}>
@@ -582,7 +593,7 @@ export default function UserDashboard({
                             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                               <span style={{ fontSize: '16px' }}>📄</span>
                               <div>
-                                <div style={{ fontWeight: 600, color: 'var(--color-ink)' }}>{doc.file_name}</div>
+                                <div style={{ fontWeight: 600, color: 'var(--color-ink)' }}>{doc.original_file_name || doc.file_name}</div>
                                 <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)', fontFamily: 'var(--font-mono)' }}>
                                   {doc.mime_type || 'Document'}
                                 </div>
@@ -1565,7 +1576,7 @@ export default function UserDashboard({
                 <span style={{ fontSize: '20px' }}>📄</span>
                 <div>
                   <h2 style={{ margin: 0, fontFamily: 'var(--font-serif)', fontSize: '18px', color: 'var(--color-ink)' }}>
-                    {previewDoc.file_name}
+                    {previewDoc.original_file_name || previewDoc.file_name}
                   </h2>
                   <div style={{ fontSize: '12px', color: 'var(--color-ink-muted)', marginTop: '2px' }}>
                     Department: <strong>{previewDoc.department_name || previewDoc.department_code || 'Unassigned'}</strong> · Uploaded by:{' '}

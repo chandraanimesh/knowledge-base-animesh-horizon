@@ -15,6 +15,7 @@ from rag_app.schemas.users import (
     DocumentDepartmentUpdate, DocumentAdminResponse
 )
 from rag_app.security.authentication import get_password_hash
+from rag_app.core.filenames import derive_original_filename
 
 router = APIRouter(prefix="/admin/users", tags=["admin-users"])
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
@@ -532,6 +533,7 @@ async def update_document_department(
     return DocumentAdminResponse(
         id=doc.id,
         file_name=doc.file_name,
+        original_file_name=derive_original_filename(doc.file_name, doc.file_path),
         department_id=doc.department_id,
         department_code=dept.code,
         department_name=dept.name,

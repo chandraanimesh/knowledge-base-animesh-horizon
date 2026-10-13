@@ -31,6 +31,7 @@ export async function uploadDocument(
 export interface DocumentAdminResponse {
   id: string;
   file_name: string;
+  original_file_name?: string;
   department_id?: string;
   department_code?: string;
   department_name?: string;
@@ -55,6 +56,7 @@ export async function updateDocumentDepartment(
 export interface DocumentListItem {
   id: string;
   file_name: string;
+  original_file_name?: string;
   department_id?: string;
   department_code?: string;
   department_name?: string;
@@ -68,6 +70,13 @@ export interface DocumentListItem {
   status: string;
   created_at: string;
   preview_url?: string;
+}
+
+export function getDocumentDisplayName(
+  doc?: { file_name?: string | null; original_file_name?: string | null } | null
+): string {
+  if (!doc) return 'Authorized Document';
+  return doc.original_file_name || doc.file_name || 'Authorized Document';
 }
 
 export async function listDocuments(token: string): Promise<DocumentListItem[]> {

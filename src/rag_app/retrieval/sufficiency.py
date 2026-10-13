@@ -25,6 +25,48 @@ from rag_app.retrieval.query_parser import (
 logger = logging.getLogger(__name__)
 
 
+def is_personal_memory_relevant(query: str, personal_mem_text: str) -> bool:
+    """
+    Determines if previously saved personal memory/context contains information
+    relevant to the user's query.
+    """
+    if not personal_mem_text or not personal_mem_text.strip():
+        return False
+
+    q_lower = query.lower().strip()
+    mem_lower = personal_mem_text.lower().strip()
+
+    # 1. Meta-queries about personal context, profile, identity, or preferences
+    user_pref_patterns = (
+        r"\b(?:my\s+(?:preferences?|profile|role|job|title|format|style|persona|background|context|notes?|details?))\b",
+        r"\b(?:what\s+do\s+you\s+(?:remember|know|have)\s+about\s+(?:me|my\s+role|my\s+preferences?))\b",
+        r"\b(?:how\s+do\s+i\s+(?:prefer|like)\b)",
+        r"\b(?:what\s+(?:did\s+i\s+tell\s+you|is\s+saved\s+in\s+my\s+memory|do\s+you\s+recall))\b",
+        r"\b(?:remember\s+about\s+me)\b",
+    )
+    if any(re.search(pat, q_lower) for pat in user_pref_patterns):
+        return True
+
+    # 2. Extract meaningful content words from the query (excluding stop words)
+    stop_words = {
+        "a", "about", "all", "an", "and", "any", "are", "as", "at", "be", "been", "being",
+        "can", "could", "did", "do", "does", "doing", "for", "from", "had", "has", "have",
+        "how", "i", "if", "in", "is", "it", "its", "know", "me", "my", "no", "not", "of",
+        "on", "or", "our", "please", "show", "so", "some", "tell", "than", "that", "the",
+        "their", "them", "then", "there", "these", "they", "this", "those", "to", "u",
+        "us", "was", "we", "were", "what", "when", "where", "which", "who", "whom",
+        "why", "will", "with", "would", "you", "your", "give", "much", "many", "details",
+        "info", "information", "something", "anything"
+    }
+
+    words = [w for w in re.findall(r"\b[a-zA-Z0-9_\-]+\b", q_lower) if w not in stop_words]
+    for word in words:
+        if len(word) >= 3 and word in mem_lower:
+            return True
+
+    return False
+
+
 class EvidenceSufficiencyEvaluator:
     """
     Evidence-aware sufficiency evaluator.
@@ -65,7 +107,11 @@ class EvidenceSufficiencyEvaluator:
         consistency and safety contracts.
         """
         # Rule 1: No evidence found cannot be SUFFICIENT or PARTIAL
-        if not result.evidence_found or (chunks is not None and len(chunks) == 0):
+        has_non_doc_evidence = bool(
+            result.evidence_types
+            and any(t in result.evidence_types for t in ("personal_memory", "conversation_context"))
+        )
+        if not result.evidence_found or (chunks is not None and len(chunks) == 0 and not has_non_doc_evidence):
             if result.status != SufficiencyStatus.INSUFFICIENT:
                 result.status = SufficiencyStatus.INSUFFICIENT
                 result.evidence_found = False
@@ -126,8 +172,21 @@ class EvidenceSufficiencyEvaluator:
             conv_req = query_plan.conversation_required
 
         evidence_types = self.detect_evidence_types(chunks)
-        has_conv_history = bool(conversation_history and len(conversation_history) > 0)
+        dialog_history = [
+            m for m in (conversation_history or [])
+            if m.get("role") in ("user", "assistant") and m.get("name") != "personal_memory"
+        ]
+        has_conv_history = bool(dialog_history)
         has_thread_ctx = bool(workspace_thread_context and len(workspace_thread_context) > 0)
+
+        personal_mems = [
+            m for m in (conversation_history or [])
+            if m.get("name") == "personal_memory" or (
+                m.get("role") == "system" and "[User Personal Preferences & Context]" in m.get("content", "")
+            )
+        ]
+        personal_mem_text = "\n".join(m.get("content", "") for m in personal_mems).strip()
+        has_relevant_personal_memory = bool(personal_mem_text and is_personal_memory_relevant(q_clean, personal_mem_text))
 
         # ----------------------------------------------------
         # 1. Pure Conversation Queries
@@ -210,6 +269,53 @@ class EvidenceSufficiencyEvaluator:
         # 2. Empty Document Chunks for Corpus Queries
         # ----------------------------------------------------
         if not chunks:
+            doc_keywords = ("document", "doc", "report", "file", "pdf", "policy", "handbook", "guideline", "contract", "whitepaper", "article")
+            is_doc_query = any(re.search(r"\b" + kw + r"\b", q_lower) for kw in doc_keywords)
+
+            # Claims genuinely requiring authoritative document evidence MUST NOT be satisfied by memory alone
+            if is_doc_query:
+                return SufficiencyEvaluation(
+                    status=SufficiencyStatus.INSUFFICIENT,
+                    evidence_found=False,
+                    required_information=[q_clean],
+                    supported_information=[],
+                    missing_requirements=["document_evidence"],
+                    answerable_from_context=False,
+                    reason="No document evidence was retrieved for the document query; personal memory or conversation history alone cannot satisfy document facts.",
+                    confidence=1.0,
+                    coverage=0.0,
+                    evidence_types=[],
+                )
+
+            # If user has relevant personal memory context and query does not require official document facts
+            if has_relevant_personal_memory:
+                return SufficiencyEvaluation(
+                    status=SufficiencyStatus.SUFFICIENT,
+                    evidence_found=True,
+                    required_information=[q_clean],
+                    supported_information=["previously_saved_personal_context"],
+                    missing_requirements=[],
+                    answerable_from_context=True,
+                    reason="Relevant personal memory context is available to address the query as previously saved personal context.",
+                    confidence=0.9,
+                    coverage=1.0,
+                    evidence_types=["personal_memory"],
+                )
+
+            if not conv_req and info != InformationNeed.CONVERSATION:
+                return SufficiencyEvaluation(
+                    status=SufficiencyStatus.INSUFFICIENT,
+                    evidence_found=False,
+                    required_information=[q_clean],
+                    supported_information=[],
+                    missing_requirements=["document_evidence"],
+                    answerable_from_context=False,
+                    reason="No document evidence was retrieved for the document query; personal memory or conversation history alone cannot satisfy document facts.",
+                    confidence=1.0,
+                    coverage=0.0,
+                    evidence_types=[],
+                )
+
             if has_conv_history or has_thread_ctx:
                 return SufficiencyEvaluation(
                     status=SufficiencyStatus.SUFFICIENT,

@@ -1,4 +1,7 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+const rawApiUrl = import.meta.env.VITE_API_BASE_URL || '';
+// Avoid mixed-content blocking: if page is on HTTPS, never fetch insecure http://
+const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
+const API_BASE_URL = (isHttps && rawApiUrl.startsWith('http://')) ? '' : rawApiUrl;
 
 export class ApiError extends Error {
   constructor(public message: string, public status: number, public data?: any) {

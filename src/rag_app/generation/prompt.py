@@ -1,3 +1,4 @@
+from typing import Any, Optional
 from rag_app.generation.citations import build_chunk_reference
 from rag_app.schemas.rag import ConflictNotice, RetrievedChunk
 
@@ -27,6 +28,19 @@ Rules:
 - Respond in the same language as the user, and if could not answer, reject humbly.
 - If the context only mentions a concept but does not explain it, DO NOT explain the concept from your own knowledge. Instead say: "The provided context mentions <concept>, but does not explain what it means or how it works."
 - Do not include email addresses or phone numbers in the answer unless the user explicitly requests them and the application has authorized that access.
+- When answering questions based on previously saved personal memory/context (and no authoritative document evidence is available), answer using that saved personal context and clearly label the answer as previously saved personal context—not independently verified company facts or documents. Do not invent document citations for personal memory.
+
+Source Authority & Temporal Correctness Hierarchy:
+1. Authoritative Structured Records & Approved Shared Knowledge: Reviewed organizational knowledge, company notes, and verified records represent the authoritative current organizational state.
+2. Document Evidence: Claims supported by authorized source documents represent verified evidence.
+3. Personal Memory: User-scoped preferences and explicitly remembered context. When answering questions from personal memory in the absence of authoritative documents, respond using the saved personal context while explicitly labelling it as previously saved personal context rather than verified company facts. Personal memory MUST NOT override organizational knowledge or authoritative document facts when they exist.
+4. Conversation History & Historical Discussions: Past statements, prior decisions, and historical notes retain provenance as chronological events, but MUST NOT override current authoritative records or document evidence.
+
+Temporal & Conflict Rules:
+- Do not assume that a newer timestamp always makes a source more authoritative than an official verified record.
+- If an authoritative current source conflicts with older personal memory, a prior conversation statement, or a historical note, preserve the historical record (e.g. note what was previously stated/decided) but DO NOT present it as the current operational state.
+- If no authoritative source is available to resolve conflicting claims, communicate the uncertainty honestly and cite the conflicting sources rather than inventing a resolution.
+- Never present personal memory opinions or user conversational statements as authoritative company knowledge.
 
 Output Format:
 You MUST format your output as a single valid JSON object with the following schema:
@@ -110,8 +124,48 @@ def build_rag_messages(
     chunks: list[RetrievedChunk] | None = None,
     conversation_history: list[dict[str, str]] | None = None,
     workspace_thread_context: list[dict] | None = None,
+    personal_memories: Any | None = None,
 ) -> list[dict[str, str]]:
     user_content = ""
+
+    # 1. Explicit, clearly labelled personal memory section under strict token budget
+    mem_lines = []
+    if personal_memories:
+        if isinstance(personal_memories, str):
+            mem_lines.append(personal_memories.strip())
+        elif isinstance(personal_memories, list):
+            for m in personal_memories:
+                if hasattr(m, "content"):
+                    m_type = m.memory_type.value if hasattr(m.memory_type, "value") else str(m.memory_type)
+                    mem_lines.append(f"- [{m_type}] {m.content}")
+                else:
+                    mem_lines.append(f"- {m}")
+    elif conversation_history:
+        for msg in conversation_history:
+            if msg.get("name") == "personal_memory" or (
+                msg.get("role") == "system" and "[User Personal Preferences & Context]" in msg.get("content", "")
+            ):
+                raw_c = msg.get("content", "")
+                c_stripped = raw_c.replace("[User Personal Preferences & Context]", "").strip()
+                if c_stripped:
+                    mem_lines.append(c_stripped)
+
+    if mem_lines:
+        # Enforce strict memory-context token budget (max ~300 tokens / 1200 characters)
+        MAX_MEM_CHARS = 1200
+        mem_block = "\n".join(mem_lines)
+        if len(mem_block) > MAX_MEM_CHARS:
+            mem_block = mem_block[:MAX_MEM_CHARS].rsplit("\n", 1)[0]
+        user_content += f"User Personal Preferences & Context:\n{mem_block}\n\n"
+        if not chunks:
+            user_content += (
+                "Guidance on Personal Context:\n"
+                "- No verified company documents were retrieved for this query.\n"
+                "- Answer the user's question using the saved User Personal Preferences & Context above.\n"
+                "- Clearly and explicitly state that this information is based on previously saved personal context/memory—not independently verified company facts or documents.\n"
+                "- Do not invent citations or claim it comes from verified documents.\n\n"
+            )
+
     if workspace_thread_context:
         thread_lines = []
         for t in workspace_thread_context:
@@ -154,7 +208,10 @@ def build_rag_messages(
     user_content += f"Question:\n{question}"
 
     # Take latest 5 turns (max 10 user/assistant messages) from conversation history
-    history_window = (conversation_history or [])[-10:]
+    history_window = [
+        msg for msg in (conversation_history or [])
+        if msg.get("role") in ("user", "assistant") and msg.get("name") != "personal_memory"
+    ][-10:]
     history_messages = [
         {"role": msg["role"], "content": msg["content"]}
         for msg in history_window

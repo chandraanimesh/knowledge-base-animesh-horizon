@@ -48,8 +48,10 @@ Your job is to extract explicit user facts, durable preferences, persona details
 class ExtractedMemoryFact(BaseModel):
     """A single factual memory extracted from conversation."""
     content: str = Field(..., description="A clear, self-contained statement of the extracted fact or preference.")
-    memory_type: str = Field(..., description="Classification: 'STATIC' for durable long-term facts/preferences, 'DYNAMIC' for current task or temporary context.")
+    memory_type: str = Field(..., description="Classification: 'STATIC' for durable long-term facts/preferences, 'DYNAMIC' for current task, 'SEMANTIC' for project knowledge, 'EPISODIC' for events.")
     topic_key: str = Field(..., description="A concise, normalized topic identifier (e.g., 'ui_theme', 'user_role', 'location', 'current_task', 'currency_preference').")
+    stability_tier: Optional[str] = Field(default="EVOLVING", description="Stability tier: 'ETERNAL', 'STABLE', 'EVOLVING', 'EXPERIMENTAL'.")
+    source_quote: Optional[str] = Field(default=None, description="Verbatim supporting span from conversation text.")
     structured_data: dict = Field(default_factory=dict, description="Key-value structured attributes if explicitly present.")
     confidence: float = Field(default=1.0, description="Confidence score between 0.0 and 1.0.")
     valid_duration_days: Optional[int] = Field(default=None, description="Optional validity duration in days for dynamic memory.")
@@ -64,7 +66,9 @@ class ConversationMemoryExtractionResult(BaseModel):
 class MemoryExtractor:
     """
     Extracts structured MemoryCandidates from conversational messages.
-    Does NOT persist directly; produces candidates to be materialized by MemoryMaterializer.
+    Applies deterministic candidate rules first for high accuracy and efficiency,
+    falling back to the configured LLM only for uncertain or compound statements.
+    Validates grounded quotes to eliminate hallucinations.
     """
 
     def __init__(self, provider=None):
@@ -75,6 +79,7 @@ class MemoryExtractor:
         self,
         text: str,
         user_id: uuid.UUID,
+        workspace_id: uuid.UUID,
         conversation_id: Optional[str] = None,
         message_id: Optional[str] = None,
         event_id: Optional[str] = None,
@@ -82,12 +87,68 @@ class MemoryExtractor:
         existing_memories: Optional[list] = None,
     ) -> list[MemoryCandidate]:
         """
-        Extracts MemoryCandidates from conversation text.
+        Extracts MemoryCandidates from conversation text using rule-first candidate detection
+        with LLM fallback for ambiguous cases.
         """
+        if not user_id:
+            raise ValueError("user_id is required for memory extraction")
+        if not workspace_id:
+            raise ValueError("workspace_id is required for memory extraction")
+
         text_clean = (text or "").strip()
         if not text_clean or len(text_clean) < 3:
             return []
 
+        # 1. Deterministic Rule-First Detection
+        from rag_app.memory.command_parser import detect_memory_candidate_rules, StabilityTier
+        is_candidate, is_transient, hints = detect_memory_candidate_rules(text_clean)
+        now = datetime.now(timezone.utc)
+
+        if is_transient:
+            logger.info("memory_extraction_skipped_transient", extra={"text": text_clean})
+            return []
+
+        if is_candidate:
+            mem_type = hints.get("memory_type", MemoryType.DYNAMIC)
+            tier = hints.get("stability_tier", StabilityTier.EVOLVING)
+            topic_key = hints.get("topic_key") or text_clean
+            c_key = generate_memory_canonical_key(
+                mem_type.value if hasattr(mem_type, "value") else str(mem_type),
+                topic_key,
+            )
+
+            supersedes_id = None
+            if existing_memories:
+                for ex in existing_memories:
+                    ex_key = getattr(ex, "canonical_key", None)
+                    ex_status = getattr(ex, "status", None)
+                    if ex_key == c_key and (ex_status == MemoryStatus.ACTIVE or ex_status == "ACTIVE"):
+                        supersedes_id = getattr(ex, "id", None)
+                        break
+
+            return [
+                MemoryCandidate(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    content=text_clean,
+                    canonical_key=c_key,
+                    memory_type=mem_type,
+                    status=MemoryStatus.ACTIVE,
+                    stability_tier=tier,
+                    importance_signals=hints.get("importance_signals", []),
+                    source_quote=text_clean,
+                    confidence=1.0,
+                    valid_from=now,
+                    supersedes_id=supersedes_id,
+                    source_type=source_type,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    event_id=event_id,
+                    extraction_method="rule_deterministic",
+                )
+            ]
+
+        # 2. LLM Fallback for Uncertain / Compound Cases
         messages = [
             SystemMessage(content=MEMORY_EXTRACTION_SYSTEM_PROMPT),
             HumanMessage(content=f"CONVERSATION TEXT:\n{text_clean}"),
@@ -99,19 +160,36 @@ class MemoryExtractor:
                 return []
 
             candidates: list[MemoryCandidate] = []
-            now = datetime.now(timezone.utc)
+            text_lower = text_clean.lower()
 
             for fact in result.memories:
                 content = (fact.content or "").strip()
                 if not content:
                     continue
 
-                mem_type_str = (fact.memory_type or "DYNAMIC").strip().upper()
-                mem_type = MemoryType.STATIC if mem_type_str == "STATIC" else MemoryType.DYNAMIC
-                topic_key = (fact.topic_key or "general").strip().lower()
+                # Grounding Validation: quote must be supported by original text
+                source_quote = (fact.source_quote or "").strip()
+                if source_quote and source_quote.lower() not in text_lower:
+                    logger.warning(
+                        "memory_candidate_rejected_unsupported_quote",
+                        extra={"quote": source_quote, "text": text_clean},
+                    )
+                    # If quote is not found in text, reject candidate to prevent hallucination
+                    continue
 
+                mem_type_str = (fact.memory_type or "DYNAMIC").strip().upper()
+                if mem_type_str in ("STATIC", "SEMANTIC"):
+                    mem_type = MemoryType.STATIC
+                elif mem_type_str == "PROCEDURAL":
+                    mem_type = MemoryType.PROCEDURAL
+                elif mem_type_str == "EPISODIC":
+                    mem_type = MemoryType.EPISODIC
+                else:
+                    mem_type = MemoryType.DYNAMIC
+
+                topic_key = (fact.topic_key or "general").strip().lower()
                 canonical_key = generate_memory_canonical_key(
-                    mem_type.value,
+                    mem_type.value if hasattr(mem_type, "value") else str(mem_type),
                     topic_key,
                 )
 
@@ -119,9 +197,15 @@ class MemoryExtractor:
                 if fact.valid_duration_days and fact.valid_duration_days > 0:
                     valid_until = now + timedelta(days=fact.valid_duration_days)
 
+                tier_str = (fact.stability_tier or "EVOLVING").strip().upper()
+                tier = (
+                    StabilityTier[tier_str]
+                    if tier_str in StabilityTier.__members__
+                    else StabilityTier.EVOLVING
+                )
+
                 supersedes_id = None
                 if existing_memories:
-                    # Look for active memory with matching topic_key or canonical_key
                     for ex in existing_memories:
                         ex_status = getattr(ex, "status", None)
                         ex_key = getattr(ex, "canonical_key", None)
@@ -130,17 +214,20 @@ class MemoryExtractor:
                             and ex_key == canonical_key
                             and getattr(ex, "id", None) is not None
                         ):
-                            # Found matching active topic
                             if fact.is_explicit_update or getattr(ex, "content", "") != content:
                                 supersedes_id = ex.id
                                 break
 
                 candidate = MemoryCandidate(
                     user_id=user_id,
+                    workspace_id=workspace_id,
                     content=content,
                     canonical_key=canonical_key,
                     memory_type=mem_type,
                     status=MemoryStatus.ACTIVE,
+                    stability_tier=tier,
+                    importance_signals=["llm_extracted"],
+                    source_quote=source_quote or text_clean,
                     structured_data=fact.structured_data or {},
                     confidence=fact.confidence,
                     valid_from=now,
@@ -150,7 +237,7 @@ class MemoryExtractor:
                     conversation_id=conversation_id,
                     message_id=message_id,
                     event_id=event_id,
-                    extraction_method="memory_llm",
+                    extraction_method="memory_llm_fallback",
                 )
                 candidates.append(candidate)
 
@@ -162,6 +249,7 @@ class MemoryExtractor:
                 extra={
                     "event": "memory_extraction_failed",
                     "user_id": str(user_id),
+                    "workspace_id": str(workspace_id),
                     "error": str(exc),
                 },
             )

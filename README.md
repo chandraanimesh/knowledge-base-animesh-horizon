@@ -209,14 +209,158 @@ flowchart TD
 
 ---
 
-## 5. Verification & Testing
+## 5. Model Context Protocol (MCP) & Twenty CRM Integration
+
+The backend exposes an authoritative **Model Context Protocol (MCP)** interface with **52 domain tools** (covering RAG retrieval, document ingestion, conversation history, workspace isolation, admin controls, and system diagnostics).
+
+### Architecture Overview
+
+MCP uses a **Hub & Spoke** architecture. External AI clients (Cline, Cursor, Claude Desktop, ChatGPT) act as the orchestrator/brain and connect simultaneously to multiple MCP servers:
+
+```text
+              ┌──────────────────────────────────────┐
+              │  AI Client / Host (Cline / Cursor)   │
+              └──────────────────┬───────────────────┘
+                                 │
+            ┌────────────────────┴────────────────────┐
+            ▼                                         ▼
+ ┌──────────────────────┐                  ┌──────────────────────┐
+ │    Twenty CRM        │                  │  Production RAG      │
+ │    (MCP Server 1)    │                  │  (MCP Server 2)      │
+ │  localhost:3000/mcp  │                  │  localhost:8000/mcp  │
+ └──────────────────────┘                  └──────────────────────┘
+   (Leads & Contacts Data)                   (Documents & Policies)
+```
+
+---
+
+### Endpoints
+
+| Endpoint | Protocol | Purpose |
+| :--- | :--- | :--- |
+| `http://localhost:8000/mcp` | HTTP GET | **Discovery & Status**: Returns HTTP 200 with server status, tool count, and SSE endpoints. |
+| `http://localhost:8000/mcp/sse` | Server-Sent Events (SSE) | **Live MCP Stream**: Connection URL for external clients. |
+| `http://localhost:8000/mcp/messages/` | HTTP POST | **JSON-RPC Dispatcher**: Inbound message endpoint for tool execution. |
+
+---
+
+### Step 1: Start the Backend Server
+
+```bash
+uv run uvicorn rag_app.main:app --host 127.0.0.1 --port 8000
+```
+Verify status:
+```bash
+curl http://localhost:8000/mcp
+```
+
+---
+
+### Step 2: Generate a Local Authentication Token
+
+For secure client connections requiring a Bearer token:
+```bash
+uv run python scripts/generate_mcp_token.py
+```
+This prints an active 30-day Admin JWT token and a ready-to-copy configuration block.
+
+> **Note on Local Development**: When running with `ENV=dev`, the backend automatically permits connections configured with **"No authentication"** (synthesizing a local development admin context), enabling zero-friction local testing.
+
+---
+
+### Step 3: Connect Your MCP Client
+
+#### Option A: VS Code (Cline / Roo Code / Continue)
+Add to your extension's `settings.json` (MCP Servers section):
+```json
+{
+  "mcpServers": {
+    "twenty-crm": {
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_TWENTY_API_KEY>"
+      }
+    },
+    "production-rag": {
+      "url": "http://localhost:8000/mcp/sse"
+    }
+  }
+}
+```
+
+#### Option B: Cursor / Claude Desktop
+Add to your `claude_desktop_config.json` (Windows: `%APPDATA%\Claude\claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "twenty-crm": {
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_TWENTY_API_KEY>"
+      }
+    },
+    "production-rag": {
+      "url": "http://localhost:8000/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer <YOUR_GENERATED_RAG_TOKEN>"
+      }
+    }
+  }
+}
+```
+
+#### Option C: ChatGPT ("Add custom MCP server")
+Because ChatGPT runs on cloud servers, expose your local port via a secure tunnel:
+1. Start an HTTPS tunnel:
+   ```bash
+   npx ngrok http 8000
+   ```
+2. In ChatGPT under **Plugins → Add custom MCP server**:
+   - **Name**: `Production RAG`
+   - **Connection**: Select **Server URL** (not Tunnel)
+   - **Server URL**: `https://<your-ngrok-id>.ngrok-free.app/mcp`
+   - **Authentication**: Select **No authentication**
+3. Save and connect.
+
+#### Option D: Interactive Testing with MCP Inspector
+Inspect and test all 52 tools through Anthropic's visual web dashboard:
+```bash
+npx @modelcontextprotocol/inspector
+```
+1. Open the inspector in your browser (`http://localhost:5173`).
+2. Set **Transport** to `SSE`.
+3. Set **URL** to `http://localhost:8000/mcp/sse`.
+4. Click **Connect** and test any tool (e.g. `list_documents`, `rag_ask`, `rag_search`).
+
+---
+
+### Direct CRM Ingestion (Twenty CRM -> RAG)
+
+To sync company and customer records directly from a local Twenty CRM instance into the RAG vector store without an AI client in the loop:
+1. Ensure your `.env` contains:
+   ```ini
+   TWENTY_BASE_URL=http://localhost:3000
+   TWENTY_API_KEY=your_twenty_api_key_here
+   RAG_BASE_URL=http://localhost:8000
+   ```
+2. Execute the sync runner:
+   ```bash
+   uv run python scripts/twenty_sync_demo.py
+   ```
+
+---
+
+## 6. Verification & Testing
 
 ### Running the Test Suite
-The repository includes a comprehensive unit and integration test suite covering retrieval algorithms, sufficiency gates, provider registries, and security ACLs:
+The repository includes a comprehensive unit and integration test suite covering retrieval algorithms, sufficiency gates, provider registries, security ACLs, and network MCP endpoints:
 
 ```bash
 # Run all backend tests
 uv run pytest tests/ -v
+
+# Run MCP-specific integration tests
+uv run pytest tests/test_mcp_network_endpoint.py tests/test_mcp_discovery.py tests/test_mcp_auth_failclosed.py -v
 ```
 
 ### Production Build Validation

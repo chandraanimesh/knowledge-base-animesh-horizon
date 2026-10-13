@@ -20,8 +20,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from rag_app.core.config import settings
+from rag_app.core.config import get_settings
 from rag_app.ingestion.chunker import TextChunk
+
+settings = get_settings()
 
 # ---------------------------------------------------------------------------
 # Public data structures

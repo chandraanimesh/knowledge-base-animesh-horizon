@@ -248,6 +248,15 @@ class WorkspaceService:
         now = datetime.now(timezone.utc)
         created_any = False
         for dept in active_depts:
+            dept_code = dept.code or ""
+            dept_upper = dept_code.upper()
+            if (
+                any(dept_upper.startswith(p) for p in ("TEST_", "MCP_", "DISC_", "WS_"))
+                or any(dept_upper.endswith(s) for s in ("_TEST", "_TEST_WS", "_MOCK"))
+                or (len(dept_upper) > 7 and any(dept_upper.startswith(p) for p in ("SALES_", "FIN_", "HR_")))
+            ):
+                continue
+
             if dept.id not in existing_ws_depts:
                 new_ws = Workspace(
                     name=dept.name,
@@ -295,7 +304,24 @@ class WorkspaceService:
         stmt = stmt.order_by(Workspace.name.asc())
         result = await self.session.scalars(stmt)
         workspaces = result.all()
-        return [self._format_response(w) for w in workspaces]
+
+        def _is_test_workspace(ws: Workspace) -> bool:
+            c = (ws.code or "").lower()
+            dept_c = (ws.department.code or "").lower() if ws.department else ""
+            if c in ("hr_ws", "finance_ws", "sales_ws", "unclassified_ws"):
+                return False
+            if dept_c in ("hr", "finance", "sales", "unclassified"):
+                return False
+            for code_to_check in (c, dept_c):
+                if any(code_to_check.startswith(p) for p in ("test_", "mcp_", "disc_", "ws_sales_test", "ws_finance_test", "ws_hr_test")):
+                    return True
+                if any(code_to_check.endswith(s) for s in ("_test", "_test_ws", "_mock")):
+                    return True
+                if len(code_to_check) > 8 and any(code_to_check.startswith(p) for p in ("sales_", "fin_", "hr_")):
+                    return True
+            return False
+
+        return [self._format_response(w) for w in workspaces if not _is_test_workspace(w)]
 
     async def update_workspace(
         self,

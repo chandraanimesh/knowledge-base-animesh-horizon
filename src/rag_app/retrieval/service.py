@@ -1,5 +1,6 @@
 
 import logging
+import math
 from dataclasses import dataclass
 import uuid
 import time
@@ -10,7 +11,7 @@ from rag_app.core.observability import (
     record_retrieval_metrics,
 )
 from rag_app.retrieval.filter_normalise import normalize_company_filters
-from sqlalchemy import func, literal_column, or_, select
+from sqlalchemy import and_, func, literal_column, or_, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 from rag_app.retrieval.bm25 import GlobalBM25Index
@@ -57,7 +58,7 @@ from rag_app.schemas.rag import (
 from rag_app.core.config import settings
 
 logger = logging.getLogger(__name__)
-MAX_CHUNKS_PER_DOCUMENT = 2
+MAX_CHUNKS_PER_DOCUMENT = getattr(settings, "max_chunks_per_document", 4)
 
 
 def _format_timestamp(val: object) -> str | None:
@@ -268,6 +269,7 @@ class RetrievalService:
                         rel_query=query_plan.relationship_query,
                         allowed_departments=allowed_departments,
                         provenance_collector=provenance_collector,
+                        workspace_id=workspace_id,
                     )
                     for chunk, doc, score in graph_rows:
                         chunk_id_str = str(chunk.id)
@@ -315,6 +317,7 @@ class RetrievalService:
                         search_term=search_term,
                         allowed_departments=allowed_departments,
                         provenance_collector=provenance_collector,
+                        workspace_id=workspace_id,
                     )
                     for chunk, doc, score in entity_rows:
                         chunk_id_str = str(chunk.id)
@@ -686,19 +689,49 @@ class RetrievalService:
                 for c in candidates
             ]
             _rerank_start = time.perf_counter()
-            rerank_scores = await self.reranker_provider.rerank(
-                query=retrieval_query,
-                texts=candidate_texts,
-            )
-            record_sub_stage(
-                "retrieval",
-                "reranking",
-                (time.perf_counter() - _rerank_start) * 1000,
-            )
-            # Store reranker score separately, preserving RRF hybrid_score
-            for candidate, score in zip(candidates, rerank_scores):
-                candidate.reranker_score = float(score)
-            reranker_executed = True
+            try:
+                rerank_scores = await self.reranker_provider.rerank(
+                    query=retrieval_query,
+                    texts=candidate_texts,
+                )
+                record_sub_stage(
+                    "retrieval",
+                    "reranking",
+                    (time.perf_counter() - _rerank_start) * 1000,
+                )
+                if isinstance(rerank_scores, (list, tuple)) and len(rerank_scores) == len(candidates):
+                    parsed_scores: list[float] = []
+                    valid_batch = True
+                    for s in rerank_scores:
+                        if s is None or isinstance(s, bool):
+                            valid_batch = False
+                            break
+                        try:
+                            score_val = float(s)
+                            if not math.isfinite(score_val):
+                                valid_batch = False
+                                break
+                            parsed_scores.append(score_val)
+                        except (ValueError, TypeError):
+                            valid_batch = False
+                            break
+
+                    if valid_batch and len(parsed_scores) == len(candidates):
+                        for candidate, score in zip(candidates, parsed_scores):
+                            candidate.reranker_score = score
+                        reranker_executed = True
+                    else:
+                        logger.warning(
+                            "Reranker returned non-finite, non-numeric, or null scores; falling back to hybrid ranking."
+                        )
+                else:
+                    logger.warning(
+                        "Reranker returned mismatched score count (%s vs %s candidates); falling back to hybrid ranking.",
+                        len(rerank_scores) if isinstance(rerank_scores, (list, tuple)) else "non-sequence",
+                        len(candidates),
+                    )
+            except Exception as e:
+                logger.warning(f"Reranker provider failed with error ({e}); falling back to hybrid ranking.")
 
         # =========================================================
         # RELEVANCE FILTER & POST-RERANK SORT
@@ -724,7 +757,7 @@ class RetrievalService:
                 1 for line in text.split("\n")
                 if re.match(r"^\s*(?:[-*+]|\d+\.)\s+", line)
             )
-            return list_rows >= 3
+            return list_rows >= 2
 
         needs_structured_evidence = (
             query_plan.presentation_need in (PresentationNeed.CHART, PresentationNeed.TABLE)
@@ -736,21 +769,24 @@ class RetrievalService:
             or query_plan.evidence_need in (EvidenceNeed.HIERARCHICAL, EvidenceNeed.MIXED)
         )
 
-        if needs_structured_evidence:
-            relevant_candidates.sort(
-                key=lambda item: (
-                    1 if _is_table_chunk(item.chunk.text) or _is_list_chunk(item.chunk.text) else 0,
-                    item.reranker_score if item.reranker_score is not None else item.hybrid_score,
-                ),
-                reverse=True,
-            )
-        else:
-            relevant_candidates.sort(
-                key=lambda item: (
-                    item.reranker_score if item.reranker_score is not None else item.hybrid_score
-                ),
-                reverse=True,
-            )
+        use_reranker_scores = (
+            reranker_executed
+            and all(c.reranker_score is not None for c in relevant_candidates)
+        )
+
+        relevant_candidates.sort(
+            key=lambda item: (
+                item.reranker_score if use_reranker_scores else item.hybrid_score,
+                (1 if _is_table_chunk(item.chunk.text) or _is_list_chunk(item.chunk.text) else 0)
+                if needs_structured_evidence
+                else 0,
+                item.hybrid_score if use_reranker_scores else 0.0,
+                1 if getattr(item.chunk, "chunk_index", None) is not None else 0,
+                -item.chunk.chunk_index if getattr(item.chunk, "chunk_index", None) is not None else 0,
+                str(item.chunk.id),
+            ),
+            reverse=True,
+        )
 
         post_rerank_ranks = {
             str(c.chunk.id): rank
@@ -794,7 +830,8 @@ class RetrievalService:
             if normalized_text in seen_texts:
                 continue
 
-            if document_counts.get(document_id, 0) >= MAX_CHUNKS_PER_DOCUMENT:
+            max_chunks_limit = getattr(settings, "max_chunks_per_document", MAX_CHUNKS_PER_DOCUMENT)
+            if document_counts.get(document_id, 0) >= max_chunks_limit:
                 # Track candidates excluded solely by document diversity
                 diversity_excluded.append(candidate)
                 continue
@@ -1372,7 +1409,12 @@ class RetrievalService:
         if filters:
             conditions = self._structured_conditions(filters)
             if conditions:
-                sec_stmt = sec_stmt.where(*conditions)
+                doc_subq = (
+                    select(DocumentChunk.document_id)
+                    .where(*conditions)
+                    .scalar_subquery()
+                )
+                sec_stmt = sec_stmt.where(Document.id.in_(doc_subq))
 
         if allowed_departments is not None or allowed_documents is not None:
             doc_conds = []
@@ -1446,7 +1488,12 @@ class RetrievalService:
                 if filters:
                     conditions = self._structured_conditions(filters)
                     if conditions:
-                        fb_stmt = fb_stmt.where(*conditions)
+                        doc_subq = (
+                            select(DocumentChunk.document_id)
+                            .where(*conditions)
+                            .scalar_subquery()
+                        )
+                        fb_stmt = fb_stmt.where(Document.id.in_(doc_subq))
                 if allowed_departments is not None or allowed_documents is not None:
                     doc_conds = []
                     if allowed_departments is not None:
@@ -1696,11 +1743,15 @@ class RetrievalService:
         search_term: str,
         allowed_departments: list[uuid.UUID] | None = None,
         provenance_collector: dict[str, ChunkProvenance] | None = None,
+        workspace_id: uuid.UUID | None = None,
     ) -> list[tuple[DocumentChunk, Document, float]]:
         """
         Match entities in KnowledgeEntity and resolve to DocumentChunks via KnowledgeEvidence.
-        Filters KnowledgeItem.status == 'ACTIVE'.
+        Filters KnowledgeItem.status == 'ACTIVE' and KnowledgeItem.approval_status == 'APPROVED'.
         """
+        if allowed_departments is not None and len(allowed_departments) == 0:
+            return []
+
         stmt = (
             select(
                 DocumentChunk,
@@ -1719,24 +1770,29 @@ class RetrievalService:
             .join(Document, Document.id == DocumentChunk.document_id)
             .where(
                 KnowledgeItem.status == "ACTIVE",
+                KnowledgeItem.approval_status != "REJECTED",
+                or_(
+                    KnowledgeItem.approval_status == "APPROVED",
+                    and_(
+                        func.coalesce(KnowledgeItem.visibility, "WORKSPACE") == "WORKSPACE",
+                        KnowledgeItem.source_type.in_(("DOCUMENT", "RESEARCH")),
+                    ),
+                ),
                 or_(
                     KnowledgeEntity.canonical_name.ilike(f"%{search_term}%"),
                     KnowledgeEntity.entity_type.ilike(f"%{search_term}%"),
-                )
+                ),
             )
         )
 
         if allowed_departments is not None:
             stmt = stmt.where(
-                or_(
-                    KnowledgeItem.department_id.in_(allowed_departments),
-                    KnowledgeItem.department_id.is_(None),
-                ),
-                or_(
-                    Document.department_id.in_(allowed_departments),
-                    Document.department_id.is_(None),
-                ),
+                KnowledgeItem.department_id.in_(allowed_departments),
+                Document.department_id.in_(allowed_departments),
             )
+
+        if workspace_id is not None:
+            stmt = stmt.where(Document.workspace_id == workspace_id)
 
         stmt = stmt.order_by(
             KnowledgeItem.confidence.desc().nullslast(),
@@ -1796,12 +1852,16 @@ class RetrievalService:
         rel_query: RelationshipQuery,
         allowed_departments: list[uuid.UUID] | None = None,
         provenance_collector: dict[str, ChunkProvenance] | None = None,
+        workspace_id: uuid.UUID | None = None,
     ) -> list[tuple[DocumentChunk, Document, float]]:
         """
         Perform 1-hop or 2-hop PostgreSQL graph traversal for relationship queries.
         Pre-filters authorization on KnowledgeItem and Document before returning chunks.
-        Filters KnowledgeItem.status == 'ACTIVE'.
+        Filters KnowledgeItem.status == 'ACTIVE' and KnowledgeItem.approval_status == 'APPROVED'.
         """
+        if allowed_departments is not None and len(allowed_departments) == 0:
+            return []
+
         # -------------------------------------------------------------
         # 2-HOP TRAVERSAL
         # -------------------------------------------------------------
@@ -1845,16 +1905,35 @@ class RetrievalService:
                 .where(
                     Item1.status == "ACTIVE",
                     Item2.status == "ACTIVE",
+                    Item1.approval_status != "REJECTED",
+                    Item2.approval_status != "REJECTED",
+                    or_(
+                        Item1.approval_status == "APPROVED",
+                        and_(
+                            func.coalesce(Item1.visibility, "WORKSPACE") == "WORKSPACE",
+                            Item1.source_type.in_(("DOCUMENT", "RESEARCH")),
+                        ),
+                    ),
+                    or_(
+                        Item2.approval_status == "APPROVED",
+                        and_(
+                            func.coalesce(Item2.visibility, "WORKSPACE") == "WORKSPACE",
+                            Item2.source_type.in_(("DOCUMENT", "RESEARCH")),
+                        ),
+                    ),
                 )
             )
 
             # Strict pre-filter authorization
             if allowed_departments is not None:
                 stmt_2hop = stmt_2hop.where(
-                    or_(Item1.department_id.in_(allowed_departments), Item1.department_id.is_(None)),
-                    or_(Item2.department_id.in_(allowed_departments), Item2.department_id.is_(None)),
-                    or_(Document.department_id.in_(allowed_departments), Document.department_id.is_(None)),
+                    Item1.department_id.in_(allowed_departments),
+                    Item2.department_id.in_(allowed_departments),
+                    Document.department_id.in_(allowed_departments),
                 )
+
+            if workspace_id is not None:
+                stmt_2hop = stmt_2hop.where(Document.workspace_id == workspace_id)
 
             if rel_query.subject_entity:
                 stmt_2hop = stmt_2hop.where(Subj1.canonical_name.ilike(f"%{rel_query.subject_entity.strip()}%"))
@@ -1961,22 +2040,27 @@ class RetrievalService:
             .join(Obj, Obj.id == KnowledgeRelationship.object_entity_id)
             .join(Document, Document.id == DocumentChunk.document_id)
             .where(
-                KnowledgeItem.status == "ACTIVE"
+                KnowledgeItem.status == "ACTIVE",
+                KnowledgeItem.approval_status != "REJECTED",
+                or_(
+                    KnowledgeItem.approval_status == "APPROVED",
+                    and_(
+                        func.coalesce(KnowledgeItem.visibility, "WORKSPACE") == "WORKSPACE",
+                        KnowledgeItem.source_type.in_(("DOCUMENT", "RESEARCH")),
+                    ),
+                ),
             )
         )
 
         # Strict pre-filter authorization
         if allowed_departments is not None:
             stmt = stmt.where(
-                or_(
-                    KnowledgeItem.department_id.in_(allowed_departments),
-                    KnowledgeItem.department_id.is_(None),
-                ),
-                or_(
-                    Document.department_id.in_(allowed_departments),
-                    Document.department_id.is_(None),
-                ),
+                KnowledgeItem.department_id.in_(allowed_departments),
+                Document.department_id.in_(allowed_departments),
             )
+
+        if workspace_id is not None:
+            stmt = stmt.where(Document.workspace_id == workspace_id)
 
         # Predicate filtering
         if rel_query.predicate:

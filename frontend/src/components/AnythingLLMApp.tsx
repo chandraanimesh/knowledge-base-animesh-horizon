@@ -31,6 +31,7 @@ import {
   documentApi,
   DocumentListItem,
   uploadDocument,
+  getDocumentDisplayName,
 } from '../api/documents'
 import {
   accessRequestApi,
@@ -41,6 +42,19 @@ import WorkspaceProviderSettingsModal from './WorkspaceProviderSettingsModal'
 import WorkspaceMembersModal from './WorkspaceMembersModal'
 import { VisualizationRenderer, VisualizationSpec } from './visualizations'
 import { MarkdownRenderer } from './MarkdownRenderer'
+import CompanyNotesView from './CompanyNotesView'
+import {
+  SlashCommandMenu,
+  SlashCommandGuidance,
+  useSlashCommands,
+  getCommandProgressMessage,
+  formatCommandResponse,
+} from './SlashCommandAutocomplete'
+import {
+  UploadQueueReview,
+  useUploadQueue,
+} from './UploadQueueReview'
+import { ExecutionMetricsModal, ExecutionMetrics } from './ExecutionMetricsModal'
 
 type GlobalNavView = 'chat' | 'documents' | 'knowledge' | 'admin' | 'departments' | 'requests'
 type WorkspaceTab = 'threads' | 'documents' | 'knowledge' | 'members' | 'provider'
@@ -81,8 +95,10 @@ export default function AnythingLLMApp({
     }
   }, [onLogout, navigate])
 
+
   // User & Auth State
   const [currentUser, setCurrentUser] = useState<{ id: string; email: string; role: 'ADMIN' | 'USER' } | null>(null)
+  const isAdmin = (currentUser?.role || '').toUpperCase() === 'ADMIN'
   const [userAccess, setUserAccess] = useState<Record<string, string[]>>({})
   const [authLoading, setAuthLoading] = useState(true)
 
@@ -101,12 +117,16 @@ export default function AnythingLLMApp({
   const [threads, setThreads] = useState<ConversationItem[]>([])
   const [activeThreadId, setActiveThreadId] = useState<string | null>(propActiveThreadId || null)
   const [loadingThreads, setLoadingThreads] = useState(false)
-  const [messages, setMessages] = useState<Array<{ id: string; role: 'user' | 'assistant' | 'system'; content: string; visualization?: VisualizationSpec | null; sources?: Array<{ type?: string; title: string; excerpt?: string; thread_id?: string; thread_title?: string }> }>>([])
+  const [messages, setMessages] = useState<Array<{ id: string; role: 'user' | 'assistant' | 'system'; content: string; visualization?: VisualizationSpec | null; sources?: Array<{ type?: string; title: string; excerpt?: string; thread_id?: string; thread_title?: string }>; execution_metrics?: ExecutionMetrics | null }>>([])
+  const [selectedMetrics, setSelectedMetrics] = useState<ExecutionMetrics | null>(null)
 
   // Documents State
   const [documents, setDocuments] = useState<DocumentListItem[]>([])
   const [loadingDocs, setLoadingDocs] = useState(false)
+  const [docListError, setDocListError] = useState<string | null>(null)
+  const [docFilterDeptCode, setDocFilterDeptCode] = useState<string>('ALL')
   const [uploadFile, setUploadFile] = useState<File | null>(null)
+  const [globalUploadDepartmentCode, setGlobalUploadDepartmentCode] = useState('')
   const [isUploading, setIsUploading] = useState(false)
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null)
   const [uploadError, setUploadError] = useState<string | null>(null)
@@ -127,16 +147,122 @@ export default function AnythingLLMApp({
 
   const [settingsModalWs, setSettingsModalWs] = useState<WorkspaceItem | null>(null)
   const [membersModalWs, setMembersModalWs] = useState<WorkspaceItem | null>(null)
+  const [showSettingsModal, setShowSettingsModal] = useState(false)
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false)
+  const [isLoggingOut, setIsLoggingOut] = useState(false)
+
+  const handleConfirmLogout = useCallback(() => {
+    if (isLoggingOut) return
+    setIsLoggingOut(true)
+    try {
+      handleLogout()
+    } finally {
+      setIsLoggingOut(false)
+      setShowLogoutConfirm(false)
+    }
+  }, [handleLogout, isLoggingOut])
+
+  // Resizable Sidebar State
+  const DEFAULT_SIDEBAR_WIDTH = 220
+  const MIN_SIDEBAR_WIDTH = 180
+  const MAX_SIDEBAR_WIDTH = 420
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('rag_workspace_sidebar_width')
+      if (saved) {
+        const parsed = parseInt(saved, 10)
+        if (!isNaN(parsed) && parsed >= MIN_SIDEBAR_WIDTH && parsed <= MAX_SIDEBAR_WIDTH) {
+          return parsed
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+    return DEFAULT_SIDEBAR_WIDTH
+  })
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false)
+
+  const startResizing = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    setIsResizingSidebar(true)
+  }, [])
+
+  useEffect(() => {
+    if (!isResizingSidebar) return
+
+    const handleMouseMove = (e: MouseEvent) => {
+      const newWidth = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, e.clientX))
+      setSidebarWidth(newWidth)
+    }
+
+    const handleMouseUp = () => {
+      setIsResizingSidebar(false)
+    }
+
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isResizingSidebar])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('rag_workspace_sidebar_width', String(sidebarWidth))
+    } catch (e) {
+      // ignore
+    }
+  }, [sidebarWidth])
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (showLogoutConfirm && !isLoggingOut) {
+          setShowLogoutConfirm(false)
+        } else if (showSettingsModal) {
+          setShowSettingsModal(false)
+        }
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [showLogoutConfirm, isLoggingOut, showSettingsModal])
 
   // Composer & UI State
   const [searchQuery, setSearchQuery] = useState('')
   const [messageInput, setMessageInput] = useState('')
+  const composerTextareaRef = useRef<HTMLTextAreaElement>(null)
+  const {
+    isOpen: isSlashMenuOpen,
+    selectedIndex: slashSelectedIndex,
+    filteredCommands: slashFilteredCommands,
+    activeCommand: slashActiveCommand,
+    argumentText: slashArgumentText,
+    selectCommand: handleSelectSlashCommand,
+    handleKeyDown: handleSlashKeyDown,
+  } = useSlashCommands({
+    text: messageInput,
+    setText: setMessageInput,
+    textareaRef: composerTextareaRef,
+  })
   const [isSending, setIsSending] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
   const [toolsOpen, setToolsOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  // Multi-File Upload Queue State & Controls
+  const uploadQueue = useUploadQueue()
+  const toolsFileInputRef = useRef<HTMLInputElement>(null)
+
+  const handleToolsFilesSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      uploadQueue.addFiles(Array.from(e.target.files))
+      e.target.value = ''
+    }
+  }
 
   const showToast = useCallback((type: 'success' | 'error', message: string) => {
     setToast({ type, message })
@@ -155,12 +281,13 @@ export default function AnythingLLMApp({
         userApi.getMe(token),
         userApi.getMyAccess(token).catch(() => ({})),
       ])
-      setCurrentUser({ id: me.id, email: me.email, role: me.role as 'ADMIN' | 'USER' })
+      setCurrentUser({ id: me.id, email: me.email, role: (me.role || 'USER').toUpperCase() as 'ADMIN' | 'USER' })
       setUserAccess(access || {})
       return { user: me, access }
     } catch (err: any) {
       console.error('Failed to load user access:', err)
       showToast('error', 'Session expired or invalid token.')
+      onLogout?.()
       return null
     } finally {
       setAuthLoading(false)
@@ -220,9 +347,10 @@ export default function AnythingLLMApp({
       const cleanPath = window.location.pathname.replace(/^\/app/, '').replace(/^\/admin/, '')
       const threadM = cleanPath.match(/^\/workspace\/([^\/]+)\/thread\/([^\/]+)/)
       const wsM = cleanPath.match(/^\/workspace\/([^\/]+)/)
+      const globalThreadM = cleanPath.match(/^\/chat\/thread\/([^\/]+)/)
       const isChatUrl = cleanPath.startsWith('/chat') || window.location.pathname.includes('/chat')
       const targetWsId = threadM?.[1] || wsM?.[1] || null
-      const targetThreadId = threadM?.[2] || null
+      const targetThreadId = threadM?.[2] || globalThreadM?.[1] || null
 
       let matchedWs: WorkspaceItem | null = null
       if (targetWsId) {
@@ -242,9 +370,26 @@ export default function AnythingLLMApp({
         if (targetThreadId) {
           setActiveThreadId(targetThreadId)
         }
-      } else if (isChatUrl) {
+      } else if (isChatUrl && userRole === 'ADMIN') {
         setActiveWorkspace(null)
         setCurrentNavView('chat')
+        if (targetThreadId) {
+          setActiveThreadId(targetThreadId)
+        }
+      } else if (isChatUrl) {
+        const firstWorkspace = dynamicWorkspaces[0]
+        if (firstWorkspace) {
+          setActiveWorkspace(firstWorkspace)
+          setCurrentNavView('chat')
+          navigate(`/app/workspace/${firstWorkspace.id}`, { replace: true })
+        } else {
+          setActiveWorkspace(null)
+          setCurrentNavView('documents')
+        }
+      } else if (userRole === 'ADMIN') {
+        setActiveWorkspace(null)
+        setCurrentNavView('chat')
+        navigate('/app/chat', { replace: true })
       } else if (dynamicWorkspaces.length > 0) {
         if (!activeWorkspaceRef.current || !dynamicWorkspaces.some((w) => w.id === activeWorkspaceRef.current?.id)) {
           setActiveWorkspace(dynamicWorkspaces[0])
@@ -258,13 +403,14 @@ export default function AnythingLLMApp({
     } finally {
       setLoadingWorkspaces(false)
     }
-  }, [token])
+  }, [token, navigate])
 
   // Initial load
   useEffect(() => {
     loadUserAndAccess().then((res) => {
       if (res) {
-        loadDepartmentsAndWorkspaces(res.user.role as 'ADMIN' | 'USER', res.access)
+        const normalizedRole = ((res.user.role || 'USER').toUpperCase()) as 'ADMIN' | 'USER'
+        loadDepartmentsAndWorkspaces(normalizedRole, res.access)
       }
     })
   }, [token])
@@ -281,8 +427,8 @@ export default function AnythingLLMApp({
     for (const m of msgs) {
       if (m.id && !seen.has(m.id)) {
         seen.add(m.id)
-        result.push(m)
       }
+      result.push(m)
     }
     return result
   }, [])
@@ -298,6 +444,9 @@ export default function AnythingLLMApp({
       if (convs.length > 0) {
         if (!currentId || !convs.some((c) => c.id === currentId)) {
           setActiveThreadId(convs[0].id)
+          if (!wsId && !currentId) {
+            navigate(`/app/chat/thread/${convs[0].id}`, { replace: true })
+          }
         }
       } else {
         setActiveThreadId(null)
@@ -308,15 +457,17 @@ export default function AnythingLLMApp({
     } finally {
       setLoadingThreads(false)
     }
-  }, [token])
+  }, [token, navigate])
 
   useEffect(() => {
     if (activeWorkspace) {
       loadThreadsForWorkspace(activeWorkspace.id)
     } else if (currentNavView === 'chat') {
-      loadThreadsForWorkspace(null)
+      if (isAdmin) {
+        loadThreadsForWorkspace(null)
+      }
     }
-  }, [activeWorkspace, currentNavView, loadThreadsForWorkspace])
+  }, [activeWorkspace, currentNavView, isAdmin, loadThreadsForWorkspace])
 
   // 4. Load Conversation Messages when Thread Changes (with stable deduplication)
   useEffect(() => {
@@ -335,6 +486,7 @@ export default function AnythingLLMApp({
             content: m.content,
             visualization: m.visualization,
             sources: m.sources,
+            execution_metrics: m.execution_metrics || null,
           }))
           setMessages(deduplicateMessages(loaded))
         }
@@ -351,11 +503,13 @@ export default function AnythingLLMApp({
   const loadDocuments = useCallback(async () => {
     if (!token) return
     setLoadingDocs(true)
+    setDocListError(null)
     try {
       const data = await documentApi.listDocuments(token)
       setDocuments(data)
     } catch (err: any) {
       console.error('Failed to load documents:', err)
+      setDocListError(err.message || 'Failed to load documents.')
     } finally {
       setLoadingDocs(false)
     }
@@ -396,15 +550,40 @@ export default function AnythingLLMApp({
     return userAccess[deptCode.toUpperCase()] || []
   }
 
-  const activeDeptCode = activeWorkspace?.department_code || activeWorkspace?.code
+  const activeDeptCode = activeWorkspace?.department_code || (
+    departments.find((d) => d.id === activeWorkspace?.department_id)?.code
+  ) || activeWorkspace?.code
   const currentPermissions = getDeptPermissions(activeDeptCode)
   const canUpload = currentPermissions.includes('UPLOAD') || currentPermissions.includes('ALL') || currentUser?.role === 'ADMIN'
   const canDelete = currentPermissions.includes('DELETE') || currentPermissions.includes('ALL') || currentUser?.role === 'ADMIN'
+  const uploadableDepartments = departments.filter((department) => {
+    const permissions = getDeptPermissions(department.code)
+    return department.is_active && (
+      currentUser?.role === 'ADMIN' || permissions.includes('UPLOAD') || permissions.includes('ALL')
+    )
+  })
+
+  // Auto-select single unambiguous department if only one is available
+  useEffect(() => {
+    if (!globalUploadDepartmentCode && uploadableDepartments.length === 1) {
+      setGlobalUploadDepartmentCode(uploadableDepartments[0].code)
+    }
+  }, [uploadableDepartments, globalUploadDepartmentCode])
+
+  const uploadDepartmentCode = activeWorkspace ? activeDeptCode : globalUploadDepartmentCode
+  const hasUploadDestination = Boolean(
+    uploadDepartmentCode && (
+      activeWorkspace || uploadableDepartments.some((department) => department.code === uploadDepartmentCode)
+    )
+  )
+
+  const [sendingQuery, setSendingQuery] = useState('')
 
   // Chat message sending with department & workspace scoping
   const handleSendMessage = async () => {
     if (!messageInput.trim() || isSending) return
     const queryText = messageInput.trim()
+    setSendingQuery(queryText)
     const tempUserMsgId = `user-${Date.now()}`
     const userMsg = { id: tempUserMsgId, role: 'user' as const, content: queryText }
     setMessages((prev) => deduplicateMessages([...prev, userMsg]))
@@ -436,12 +615,17 @@ export default function AnythingLLMApp({
       })) : [])
 
       const assistantMsgId = response.message_id ? String(response.message_id) : `asst-${Date.now()}`
+      const formattedContent = formatCommandResponse(
+        queryText,
+        response.answer || 'Response generated from workspace documents.'
+      )
       const assistantMsg = {
         id: assistantMsgId,
         role: 'assistant' as const,
-        content: response.answer || 'Response generated from workspace documents.',
+        content: formattedContent,
         visualization: response.visualization,
         sources: rawSources,
+        execution_metrics: response.execution_metrics || null,
       }
       setMessages((prev) => deduplicateMessages([...prev, assistantMsg]))
 
@@ -558,13 +742,18 @@ export default function AnythingLLMApp({
     if (activeWorkspace) {
       await handleCreateNewThreadForWs(activeWorkspace)
     } else {
+      if (!isAdmin) {
+        showToast('error', 'Global Chat is available to administrators only.')
+        return
+      }
       try {
         const newThread = await createConversation('New Thread', token, null)
-        setThreads((prev) => [newThread, ...prev])
+        setThreads((prev) => [newThread, ...prev.filter((t) => t.id !== newThread.id)])
         setActiveThreadId(newThread.id)
         setMessages([])
         setActiveWsTab('threads')
         setCurrentNavView('chat')
+        navigate(`/app/chat/thread/${newThread.id}`)
         showToast('success', 'Created new Global Chat thread.')
       } catch (err: any) {
         showToast('error', err.message || 'Failed to create new thread.')
@@ -580,6 +769,9 @@ export default function AnythingLLMApp({
       if (activeThreadId === threadId) {
         setActiveThreadId(null)
         setMessages([])
+        if (!activeWorkspace) {
+          navigate('/app/chat')
+        }
       }
       showToast('success', 'Thread deleted.')
     } catch (err: any) {
@@ -590,19 +782,19 @@ export default function AnythingLLMApp({
   // Document Upload
   const handleUploadDocument = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!uploadFile || !activeDeptCode) {
-      setUploadError('Please select a file to upload.')
+    if (!uploadFile || !uploadDepartmentCode) {
+      setUploadError('Select a valid upload department and file.')
       return
     }
     setIsUploading(true)
     setUploadError(null)
     setUploadSuccess(null)
     try {
-      await uploadDocument(uploadFile, activeDeptCode, token, activeWorkspace?.id)
-      setUploadSuccess(`Uploaded ${uploadFile.name} successfully.`)
+      await uploadDocument(uploadFile, uploadDepartmentCode, token, activeWorkspace?.id)
+      setUploadSuccess(`${uploadFile.name} was uploaded and indexed. Knowledge enrichment may continue in the background.`)
       setUploadFile(null)
-      loadDocuments()
-      showToast('success', `Uploaded ${uploadFile.name} to ${activeWorkspace?.name}`)
+      await loadDocuments()
+      showToast('success', `${uploadFile.name} was uploaded to ${uploadDepartmentCode}.`)
     } catch (err: any) {
       setUploadError(err.message || 'Upload failed. Check your department permissions.')
       showToast('error', err.message || 'Upload failed.')
@@ -669,12 +861,24 @@ export default function AnythingLLMApp({
     (ws.department_code && ws.department_code.toLowerCase().includes(searchQuery.toLowerCase()))
   )
 
-  // Scoped documents for active department
-  const workspaceDocs = documents.filter((d) =>
-    d.department_code?.toUpperCase() === activeDeptCode?.toUpperCase() ||
-    d.department_id === activeWorkspace?.department_id ||
-    d.workspace_id === activeWorkspace?.id
-  )
+  // Scoped documents for active department / view
+  const workspaceDocs = documents.filter((d) => {
+    if (activeWorkspace) {
+      return (
+        d.workspace_id === activeWorkspace.id ||
+        d.department_id === activeWorkspace.department_id ||
+        (activeDeptCode && d.department_code?.toUpperCase() === activeDeptCode.toUpperCase())
+      )
+    }
+    // Global Documents view (no active workspace selected)
+    if (docFilterDeptCode && docFilterDeptCode !== 'ALL') {
+      return (
+        d.department_code?.toUpperCase() === docFilterDeptCode.toUpperCase() ||
+        d.department_id === docFilterDeptCode
+      )
+    }
+    return true
+  })
 
   return (
     <div
@@ -711,14 +915,14 @@ export default function AnythingLLMApp({
       )}
 
       {/* ========================================================================= */}
-      {/* LEFT SIDEBAR (~148px)                                                     */}
+      {/* LEFT SIDEBAR (Resizable)                                                  */}
       {/* ========================================================================= */}
       {!sidebarCollapsed && (
         <aside
           style={{
-            width: '148px',
-            minWidth: '148px',
-            maxWidth: '148px',
+            width: `${sidebarWidth}px`,
+            minWidth: `${sidebarWidth}px`,
+            maxWidth: `${sidebarWidth}px`,
             height: '100vh',
             background: '#F7F7F7',
             borderRight: '1px solid #E5E5E5',
@@ -726,8 +930,9 @@ export default function AnythingLLMApp({
             flexDirection: 'column',
             padding: '10px 8px 8px 8px',
             boxSizing: 'border-box',
-            userSelect: 'none',
+            userSelect: isResizingSidebar ? 'none' : 'auto',
             flexShrink: 0,
+            position: 'relative',
           }}
         >
           {/* 1. Top Brand Header */}
@@ -849,7 +1054,7 @@ export default function AnythingLLMApp({
           {/* 3. Global Navigation Section */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', marginBottom: '8px' }}>
             {[
-              {
+              ...(isAdmin ? [{
                 id: 'chat',
                 label: 'Global Chat',
                 icon: (
@@ -857,7 +1062,7 @@ export default function AnythingLLMApp({
                     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                   </svg>
                 ),
-              },
+              }] : []),
               {
                 id: 'documents',
                 label: 'Documents',
@@ -887,7 +1092,7 @@ export default function AnythingLLMApp({
                   </svg>
                 ),
               },
-              ...(currentUser?.role === 'ADMIN'
+              ...(isAdmin
                 ? [
                     {
                       id: 'departments',
@@ -921,43 +1126,176 @@ export default function AnythingLLMApp({
                 ? (currentNavView === 'chat' && activeWorkspace === null)
                 : (currentNavView === nav.id)
               return (
-                <div
-                  key={nav.id}
-                  onClick={() => {
-                    if (nav.id === 'chat') {
-                      setCurrentNavView('chat')
-                      setActiveWorkspace(null)
-                      setActiveThreadId(null)
-                      setMessages([])
-                      navigate('/app/chat')
-                    } else {
-                      setCurrentNavView(nav.id as GlobalNavView)
-                    }
-                  }}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '6px',
-                    padding: '4px 6px',
-                    borderRadius: '5px',
-                    fontSize: '11px',
-                    fontWeight: isSelected ? 600 : 400,
-                    color: isSelected ? '#1E3A8A' : '#4B5563',
-                    background: isSelected ? '#E5EFFF' : 'transparent',
-                    cursor: 'pointer',
-                    transition: 'background 0.12s ease',
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!isSelected) e.currentTarget.style.background = '#EEEEEE'
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!isSelected) e.currentTarget.style.background = 'transparent'
-                  }}
-                >
-                  <span style={{ display: 'flex', alignItems: 'center', color: isSelected ? '#1E3A8A' : '#6B7280' }}>
-                    {nav.icon}
-                  </span>
-                  <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{nav.label}</span>
+                <div key={nav.id} style={{ display: 'flex', flexDirection: 'column' }}>
+                  <div
+                    onClick={() => {
+                      if (nav.id === 'chat') {
+                        setCurrentNavView('chat')
+                        if (activeWorkspace !== null) {
+                          setActiveWorkspace(null)
+                          setActiveThreadId(null)
+                          setMessages([])
+                          setThreads([])
+                          navigate('/app/chat')
+                        } else {
+                          if (!activeThreadId && threads.length > 0) {
+                            setActiveThreadId(threads[0].id)
+                            navigate(`/app/chat/thread/${threads[0].id}`)
+                          } else if (activeThreadId) {
+                            navigate(`/app/chat/thread/${activeThreadId}`)
+                          } else {
+                            navigate('/app/chat')
+                          }
+                        }
+                      } else {
+                        setCurrentNavView(nav.id as GlobalNavView)
+                        if (nav.id === 'documents' || nav.id === 'knowledge' || nav.id === 'departments' || nav.id === 'requests') {
+                          setActiveWorkspace(null)
+                        }
+                      }
+                    }}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '4px 6px',
+                      borderRadius: '5px',
+                      fontSize: '11px',
+                      fontWeight: isSelected ? 600 : 400,
+                      color: isSelected ? '#1E3A8A' : '#4B5563',
+                      background: isSelected ? '#E5EFFF' : 'transparent',
+                      cursor: 'pointer',
+                      transition: 'background 0.12s ease',
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!isSelected) e.currentTarget.style.background = '#EEEEEE'
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!isSelected) e.currentTarget.style.background = 'transparent'
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 }}>
+                      <span style={{ display: 'flex', alignItems: 'center', color: isSelected ? '#1E3A8A' : '#6B7280' }}>
+                        {nav.icon}
+                      </span>
+                      <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{nav.label}</span>
+                    </div>
+                    {nav.id === 'chat' && isAdmin && (
+                      <span
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleCreateNewThread()
+                        }}
+                        title="New Chat"
+                        style={{
+                          fontSize: '11px',
+                          fontWeight: 700,
+                          color: '#2563EB',
+                          padding: '0 4px',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        +
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Admin Global Chat Threads Sub-tree */}
+                  {nav.id === 'chat' && isSelected && isAdmin && (
+                    <div
+                      style={{
+                        paddingLeft: '10px',
+                        marginLeft: '12px',
+                        borderLeft: '1.5px solid #CBD5E1',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '2px',
+                        marginTop: '3px',
+                        marginBottom: '3px',
+                      }}
+                    >
+                      {loadingThreads ? (
+                        <div style={{ fontSize: '10px', color: '#9CA3AF', padding: '2px 4px' }}>Loading…</div>
+                      ) : threads.length === 0 ? (
+                        <div style={{ fontSize: '10px', color: '#9CA3AF', padding: '2px 4px' }}>No previous chats</div>
+                      ) : (
+                        threads.map((thread) => {
+                          const isSelectedThread = thread.id === activeThreadId
+                          return (
+                            <div
+                              key={thread.id}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setActiveThreadId(thread.id)
+                                setCurrentNavView('chat')
+                                setActiveWorkspace(null)
+                                navigate(`/app/chat/thread/${thread.id}`)
+                              }}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                padding: '2px 5px',
+                                borderRadius: '4px',
+                                fontSize: '10.5px',
+                                fontWeight: isSelectedThread ? 500 : 400,
+                                color: isSelectedThread ? '#1E3A8A' : '#4B5563',
+                                background: isSelectedThread ? '#CCE0FC' : 'transparent',
+                                cursor: 'pointer',
+                                whiteSpace: 'nowrap',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                              }}
+                              onMouseEnter={(e) => {
+                                if (!isSelectedThread) e.currentTarget.style.background = '#F3F4F6'
+                              }}
+                              onMouseLeave={(e) => {
+                                if (!isSelectedThread) e.currentTarget.style.background = 'transparent'
+                              }}
+                            >
+                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{thread.title}</span>
+                              {isSelectedThread && (
+                                <span
+                                  onClick={(e) => handleDeleteThread(e, thread.id)}
+                                  title="Delete thread"
+                                  style={{ fontSize: '10px', color: '#9CA3AF', marginLeft: '4px', cursor: 'pointer' }}
+                                  onMouseEnter={(e) => (e.currentTarget.style.color = '#EF4444')}
+                                  onMouseLeave={(e) => (e.currentTarget.style.color = '#9CA3AF')}
+                                >
+                                  ×
+                                </span>
+                              )}
+                            </div>
+                          )
+                        })
+                      )}
+
+                      {/* + New Chat Link */}
+                      <div
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleCreateNewThread()
+                        }}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '3px',
+                          padding: '2px 4px',
+                          marginTop: '2px',
+                          fontSize: '10px',
+                          fontWeight: 500,
+                          color: '#2563EB',
+                          cursor: 'pointer',
+                          borderRadius: '3px',
+                        }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = '#EFF6FF')}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                      >
+                        <span style={{ fontSize: '11px', fontWeight: 700 }}>+</span>
+                        <span>New Chat</span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )
             })}
@@ -1217,62 +1555,126 @@ export default function AnythingLLMApp({
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'space-between',
-              padding: '8px 4px 2px 4px',
+              padding: '8px 6px 4px 6px',
               borderTop: '1px solid #EBEBEB',
               marginTop: 'auto',
             }}
           >
             <button
-              onClick={() => {
-                if (activeWorkspace) setSettingsModalWs(activeWorkspace)
+              onClick={() => setShowSettingsModal(true)}
+              title="Settings & Access"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                padding: '4px 6px',
+                color: '#6B7280',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '5px',
+                borderRadius: '5px',
+                fontSize: '11px',
+                fontWeight: 500,
+                transition: 'background 0.12s ease, color 0.12s ease',
               }}
-              title="Settings"
-              style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px', color: '#6B7280' }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.color = '#111827'
+                e.currentTarget.style.background = '#EEEEEE'
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.color = '#6B7280'
+                e.currentTarget.style.background = 'transparent'
+              }}
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="3" />
                 <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
               </svg>
+              <span>Settings</span>
             </button>
+
             <button
-              onClick={() => setShowAccessReqModal(true)}
-              title="Request Access"
-              style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px', color: '#6B7280' }}
-            >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-                <circle cx="8.5" cy="7" r="4" />
-                <line x1="20" y1="8" x2="20" y2="14" />
-                <line x1="23" y1="11" x2="17" y2="11" />
-              </svg>
-            </button>
-            <button
-              onClick={() => {
-                if (activeWorkspace) setMembersModalWs(activeWorkspace)
-              }}
-              title="Members & Roles"
-              style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px', color: '#6B7280' }}
-            >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-                <circle cx="9" cy="7" r="4" />
-                <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-                <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-              </svg>
-            </button>
-            <button
-              onClick={handleLogout}
+              onClick={() => setShowLogoutConfirm(true)}
               title="Log out"
-              style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px', color: '#6B7280' }}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                padding: '4px 6px',
+                color: '#6B7280',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '5px',
+                borderRadius: '5px',
+                fontSize: '11px',
+                fontWeight: 500,
+                transition: 'background 0.12s ease, color 0.12s ease',
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.color = '#DC2626'
+                e.currentTarget.style.background = '#FEE2E2'
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.color = '#6B7280'
+                e.currentTarget.style.background = 'transparent'
+              }}
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
                 <polyline points="16 17 21 12 16 7" />
                 <line x1="21" y1="12" x2="9" y2="12" />
               </svg>
+              <span>Logout</span>
             </button>
           </div>
         </aside>
+      )}
+
+      {/* Draggable Divider Resize Handle */}
+      {!sidebarCollapsed && (
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-orientation="vertical"
+          aria-valuenow={sidebarWidth}
+          aria-valuemin={MIN_SIDEBAR_WIDTH}
+          aria-valuemax={MAX_SIDEBAR_WIDTH}
+          aria-label="Resize sidebar"
+          onMouseDown={startResizing}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowLeft') {
+              e.preventDefault()
+              setSidebarWidth((w) => Math.max(MIN_SIDEBAR_WIDTH, w - 10))
+            } else if (e.key === 'ArrowRight') {
+              e.preventDefault()
+              setSidebarWidth((w) => Math.min(MAX_SIDEBAR_WIDTH, w + 10))
+            }
+          }}
+          onDoubleClick={() => setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
+          title="Drag to resize sidebar (double-click to reset)"
+          style={{
+            width: '6px',
+            cursor: 'col-resize',
+            height: '100vh',
+            position: 'relative',
+            zIndex: 30,
+            background: isResizingSidebar ? '#3B82F6' : 'transparent',
+            transition: isResizingSidebar ? 'none' : 'background 0.15s ease',
+            userSelect: 'none',
+            flexShrink: 0,
+            marginLeft: '-3px',
+            marginRight: '-3px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+          onMouseEnter={(e) => {
+            if (!isResizingSidebar) e.currentTarget.style.background = '#93C5FD'
+          }}
+          onMouseLeave={(e) => {
+            if (!isResizingSidebar) e.currentTarget.style.background = 'transparent'
+          }}
+        />
       )}
 
       {/* ========================================================================= */}
@@ -1335,23 +1737,46 @@ export default function AnythingLLMApp({
                 </span>
               </div>
             ) : (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ fontSize: '13px', fontWeight: 600, color: '#1E3A8A' }}>
-                  Global Chat
-                </span>
-                <span
-                  style={{
-                    fontSize: '9.5px',
-                    padding: '1px 6px',
-                    borderRadius: '10px',
-                    background: '#E5EFFF',
-                    color: '#1E3A8A',
-                    fontFamily: 'monospace',
-                    fontWeight: 600,
-                  }}
-                >
-                  {currentUser?.role === 'ADMIN' ? 'GLOBAL · ADMIN' : 'GLOBAL'}
-                </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ fontSize: '13px', fontWeight: 600, color: '#1E3A8A' }}>
+                    {threads.find((t) => t.id === activeThreadId)?.title || 'Global Chat'}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: '9.5px',
+                      padding: '1px 6px',
+                      borderRadius: '10px',
+                      background: '#E5EFFF',
+                      color: '#1E3A8A',
+                      fontFamily: 'monospace',
+                      fontWeight: 600,
+                    }}
+                  >
+                    {isAdmin ? 'GLOBAL · ADMIN' : 'GLOBAL'}
+                  </span>
+                </div>
+                {isAdmin && (
+                  <button
+                    onClick={handleCreateNewThread}
+                    style={{
+                      background: '#EFF6FF',
+                      border: '1px solid #BFDBFE',
+                      borderRadius: '5px',
+                      padding: '3px 8px',
+                      fontSize: '11px',
+                      fontWeight: 500,
+                      color: '#2563EB',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '3px',
+                    }}
+                  >
+                    <span style={{ fontSize: '12px', fontWeight: 700 }}>+</span>
+                    <span>New Chat</span>
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -1413,10 +1838,10 @@ export default function AnythingLLMApp({
         </header>
 
         {/* Scrollable View Content */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 28px 95px 28px', boxSizing: 'border-box' }}>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px 140px 20px', boxSizing: 'border-box' }}>
           {/* TAB 1: THREADS / CHAT VIEW */}
           {activeWsTab === 'threads' && currentNavView === 'chat' && (
-            <div style={{ maxWidth: '820px', margin: '0 auto', fontSize: '11.5px', lineHeight: 1.6, color: '#252525' }}>
+            <div style={{ maxWidth: '768px', margin: '0 auto', width: '100%', fontSize: '12px', lineHeight: 1.6, color: '#252525' }}>
               {/* If no conversation messages yet, render the workspace reference overview */}
               {messages.length === 0 ? (
                 <div
@@ -1499,82 +1924,186 @@ export default function AnythingLLMApp({
                 </div>
               ) : (
                 /* Live Conversation Messages */
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', width: '100%' }}>
                   {messages.map((m) => (
                     <div
                       key={m.id}
                       style={{
                         display: 'flex',
                         flexDirection: 'column',
-                        gap: '4px',
-                        padding: '8px 12px',
-                        borderRadius: '8px',
-                        background: m.role === 'user' ? '#F3F4F6' : '#FFFFFF',
-                        border: m.role === 'user' ? '1px solid #E5E7EB' : '1px solid #E2E8F0',
-                        alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
-                        maxWidth: '85%',
+                        width: '100%',
+                        alignItems: m.role === 'user' ? 'flex-end' : 'flex-start',
+                        boxSizing: 'border-box',
                       }}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-                        <span style={{ fontSize: '10px', fontWeight: 600, color: m.role === 'user' ? '#4B5563' : '#1E3A8A', textTransform: 'uppercase' }}>
-                          {m.role === 'user' ? 'You' : `${activeWorkspace?.name || 'Workspace'} Assistant`}
-                        </span>
-                        {m.role === 'assistant' && (
-                          <button
-                            onClick={() => handleVisualizeMessage(m.id)}
-                            title="Visualize this response"
+                      {m.role === 'user' ? (
+                        <div
+                          style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'flex-end',
+                            maxWidth: '75%',
+                          }}
+                        >
+                          <div
                             style={{
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              gap: '4px',
-                              padding: '2px 7px',
-                              fontSize: '10.5px',
+                              fontSize: '10px',
                               fontWeight: 600,
-                              color: '#1D4ED8',
-                              background: '#EFF6FF',
-                              border: '1px solid #BFDBFE',
-                              borderRadius: '4px',
-                              cursor: 'pointer',
+                              color: '#6B7280',
+                              textTransform: 'uppercase',
+                              letterSpacing: '0.04em',
+                              marginBottom: '3px',
+                              paddingRight: '6px',
                             }}
                           >
-                            <span>📊</span>
-                            <span>Visualize this</span>
-                          </button>
-                        )}
-                      </div>
-                      <MarkdownRenderer content={m.content} style={{ fontSize: '12.5px', color: '#1F2937', lineHeight: 1.6 }} />
-                      {m.role === 'assistant' && m.visualization && (
-                        <VisualizationRenderer spec={m.visualization} />
-                      )}
-                      {m.role === 'assistant' && m.sources && m.sources.length > 0 && (
-                        <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #F1F5F9', display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                          <span style={{ fontSize: '9.5px', fontWeight: 600, color: '#6B7280', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                            Sources
-                          </span>
-                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                            {m.sources.map((s, sIdx) => {
-                              const isThread = s.type === 'thread' || s.title?.startsWith('Thread:')
-                              return (
-                                <span
-                                  key={sIdx}
-                                  title={s.excerpt || s.title}
+                            You
+                          </div>
+                          <div
+                            style={{
+                              background: '#F3F4F6',
+                              border: '1px solid #E5E7EB',
+                              borderRadius: '16px 16px 4px 16px',
+                              padding: '10px 14px',
+                              fontSize: '13px',
+                              lineHeight: 1.55,
+                              color: '#1F2937',
+                              wordBreak: 'break-word',
+                              boxShadow: '0 1px 2px rgba(0,0,0,0.02)',
+                            }}
+                          >
+                            <MarkdownRenderer content={m.content} style={{ fontSize: '13px', color: '#1F2937', lineHeight: 1.55 }} />
+                          </div>
+                        </div>
+                      ) : (
+                        <div
+                          style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            width: '100%',
+                            background: '#FFFFFF',
+                            borderRadius: '8px',
+                            padding: '4px 0',
+                            boxSizing: 'border-box',
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <div
+                                style={{
+                                  width: '20px',
+                                  height: '20px',
+                                  borderRadius: '4px',
+                                  background: '#E5EFFF',
+                                  color: '#1E3A8A',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  fontSize: '11px',
+                                  fontWeight: 700,
+                                }}
+                              >
+                                ✦
+                              </div>
+                              <span style={{ fontSize: '11.5px', fontWeight: 600, color: '#1E3A8A' }}>
+                                {activeWorkspace ? `${activeWorkspace.name} Assistant` : 'Workspace Assistant'}
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              {m.execution_metrics && (
+                                <button
+                                  onClick={() => setSelectedMetrics(m.execution_metrics || null)}
+                                  title="View query retrieval steps, LLM calls, and token metrics"
                                   style={{
                                     display: 'inline-flex',
                                     alignItems: 'center',
-                                    gap: '3px',
-                                    fontSize: '10px',
-                                    padding: '2px 6px',
+                                    gap: '4px',
+                                    padding: '2px 8px',
+                                    fontSize: '10.5px',
+                                    fontWeight: 600,
+                                    color: '#0369A1',
+                                    background: '#F0F9FF',
+                                    border: '1px solid #BAE6FD',
                                     borderRadius: '4px',
-                                    background: isThread ? '#EFF6FF' : '#F1F5F9',
-                                    color: isThread ? '#1D4ED8' : '#374151',
-                                    border: isThread ? '1px solid #BFDBFE' : '1px solid #E2E8F0',
+                                    cursor: 'pointer',
+                                    transition: 'all 0.15s ease',
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    e.currentTarget.style.background = '#E0F2FE'
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.currentTarget.style.background = '#F0F9FF'
                                   }}
                                 >
-                                  {isThread ? '💬 ' : '📄 '}
-                                  {s.title}
+                                  <span>ℹ️</span>
+                                  <span>Details</span>
+                                </button>
+                              )}
+                              <button
+                                onClick={() => handleVisualizeMessage(m.id)}
+                                title="Visualize this response"
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '4px',
+                                  padding: '2px 8px',
+                                  fontSize: '10.5px',
+                                  fontWeight: 600,
+                                  color: '#1D4ED8',
+                                  background: '#EFF6FF',
+                                  border: '1px solid #BFDBFE',
+                                  borderRadius: '4px',
+                                  cursor: 'pointer',
+                                }}
+                              >
+                                <span>📊</span>
+                                <span>Visualize this</span>
+                              </button>
+                            </div>
+                          </div>
+                          <div style={{ paddingLeft: '26px' }}>
+                            <MarkdownRenderer content={m.content} style={{ fontSize: '13px', color: '#1F2937', lineHeight: 1.65 }} />
+                            {m.visualization && (
+                              <div style={{ marginTop: '10px' }}>
+                                <VisualizationRenderer spec={m.visualization} />
+                              </div>
+                            )}
+                            {m.sources && m.sources.length > 0 && (
+                              <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid #F1F5F9', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                <span style={{ fontSize: '10px', fontWeight: 600, color: '#6B7280', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                                  Sources
                                 </span>
-                              )
-                            })}
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                                  {m.sources.map((s, sIdx) => {
+                                    const isThread = s.type === 'thread' || s.title?.startsWith('Thread:')
+                                    const isMemory = s.type === 'memory' || s.title?.startsWith('🧠 Personal Memory:')
+                                    return (
+                                      <span
+                                        key={sIdx}
+                                        title={s.excerpt || s.title}
+                                        style={{
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '3px',
+                                          fontSize: '10px',
+                                          padding: '2px 6px',
+                                          borderRadius: '4px',
+                                          background: isMemory ? '#F5F3FF' : isThread ? '#EFF6FF' : '#F1F5F9',
+                                          color: isMemory ? '#6D28D9' : isThread ? '#1D4ED8' : '#374151',
+                                          border: isMemory ? '1px solid #DDD6FE' : isThread ? '1px solid #BFDBFE' : '1px solid #E2E8F0',
+                                          maxWidth: '280px',
+                                          overflow: 'hidden',
+                                          textOverflow: 'ellipsis',
+                                          whiteSpace: 'nowrap',
+                                        }}
+                                      >
+                                        {isMemory ? '' : isThread ? '💬 ' : '📄 '}
+                                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
+                                      </span>
+                                    )
+                                  })}
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
                       )}
@@ -1582,7 +2111,7 @@ export default function AnythingLLMApp({
                   ))}
                   {isSending && (
                     <div style={{ fontSize: '11px', color: '#6B7280', fontStyle: 'italic', padding: '4px 8px' }}>
-                      Retrieving department context & generating answer…
+                      {getCommandProgressMessage(sendingQuery)}
                     </div>
                   )}
                   <div ref={messagesEndRef} />
@@ -1594,59 +2123,113 @@ export default function AnythingLLMApp({
           {/* TAB 2: DOCUMENTS VIEW */}
           {(activeWsTab === 'documents' || currentNavView === 'documents') && (
             <div style={{ maxWidth: '900px', margin: '0 auto' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px', flexWrap: 'wrap', gap: '12px' }}>
                 <div>
                   <h2 style={{ fontSize: '18px', fontWeight: 700, margin: 0, color: '#111827' }}>
                     {activeWorkspace ? `${activeWorkspace.name} Documents` : 'All Authorized Documents'}
                   </h2>
                   <div style={{ fontSize: '12px', color: '#6B7280', marginTop: '2px' }}>
-                    Department Scope: <strong>{activeDeptCode || 'ALL'}</strong> · Permission: <strong>{currentPermissions.join(', ')}</strong>
+                    Department Scope: <strong>{activeWorkspace ? (activeDeptCode || 'ALL') : (docFilterDeptCode || 'ALL')}</strong> · Permission: <strong>{activeWorkspace ? currentPermissions.join(', ') : (currentUser?.role === 'ADMIN' ? 'ALL' : (docFilterDeptCode !== 'ALL' ? getDeptPermissions(docFilterDeptCode).join(', ') : 'VIEW, UPLOAD'))}</strong>
                   </div>
                 </div>
 
-                {canUpload && (
-                  <form onSubmit={handleUploadDocument} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <input
-                      type="file"
-                      id="doc-upload"
-                      style={{ display: 'none' }}
-                      onChange={(e) => {
-                        if (e.target.files && e.target.files[0]) {
-                          setUploadFile(e.target.files[0])
-                        }
-                      }}
-                    />
-                    <label
-                      htmlFor="doc-upload"
-                      style={{
-                        padding: '6px 12px',
-                        borderRadius: '6px',
-                        background: '#FFFFFF',
-                        border: '1px solid #D1D5DB',
-                        fontSize: '11.5px',
-                        cursor: 'pointer',
-                        color: '#374151',
-                      }}
-                    >
-                      {uploadFile ? uploadFile.name : 'Choose File'}
-                    </label>
-                    <button
-                      type="submit"
-                      disabled={!uploadFile || isUploading}
-                      style={{
-                        padding: '6px 14px',
-                        borderRadius: '6px',
-                        background: uploadFile ? '#1E293B' : '#94A3B8',
-                        color: '#FFFFFF',
-                        border: 'none',
-                        fontSize: '11.5px',
-                        cursor: uploadFile && !isUploading ? 'pointer' : 'default',
-                      }}
-                    >
-                      {isUploading ? 'Uploading…' : '+ Upload Document'}
-                    </button>
-                  </form>
-                )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                  {/* Department Filter (when in global view) */}
+                  {!activeWorkspace && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <label htmlFor="doc-dept-filter" style={{ fontSize: '11.5px', color: '#64748B', fontWeight: 500 }}>
+                        Filter:
+                      </label>
+                      <select
+                        id="doc-dept-filter"
+                        aria-label="Filter department"
+                        value={docFilterDeptCode}
+                        onChange={(e) => setDocFilterDeptCode(e.target.value)}
+                        style={{
+                          padding: '6px 8px',
+                          borderRadius: '6px',
+                          background: '#FFFFFF',
+                          border: '1px solid #D1D5DB',
+                          fontSize: '11.5px',
+                          color: '#374151',
+                        }}
+                      >
+                        <option value="ALL">All Authorized Departments (ALL)</option>
+                        {departments.map((department) => (
+                          <option key={department.id} value={department.code}>
+                            {department.name} ({department.code})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {canUpload && (
+                    <form onSubmit={handleUploadDocument} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      {!activeWorkspace && (
+                        <select
+                          aria-label="Upload department"
+                          value={globalUploadDepartmentCode}
+                          onChange={(e) => setGlobalUploadDepartmentCode(e.target.value)}
+                          style={{
+                            padding: '6px 8px',
+                            borderRadius: '6px',
+                            background: '#FFFFFF',
+                            border: '1px solid #D1D5DB',
+                            fontSize: '11.5px',
+                            color: '#374151',
+                          }}
+                        >
+                          <option value="">Select department</option>
+                          {uploadableDepartments.map((department) => (
+                            <option key={department.id} value={department.code}>
+                              {department.name} ({department.code})
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      <input
+                        type="file"
+                        id="doc-upload"
+                        style={{ display: 'none' }}
+                        onChange={(e) => {
+                          if (e.target.files && e.target.files[0]) {
+                            setUploadFile(e.target.files[0])
+                          }
+                        }}
+                      />
+                      <label
+                        htmlFor="doc-upload"
+                        style={{
+                          padding: '6px 12px',
+                          borderRadius: '6px',
+                          background: '#FFFFFF',
+                          border: '1px solid #D1D5DB',
+                          fontSize: '11.5px',
+                          cursor: 'pointer',
+                          color: '#374151',
+                        }}
+                      >
+                        {uploadFile ? uploadFile.name : 'Choose File'}
+                      </label>
+                      <button
+                        type="submit"
+                        disabled={!uploadFile || !hasUploadDestination || isUploading}
+                        style={{
+                          padding: '6px 14px',
+                          borderRadius: '6px',
+                          background: uploadFile && hasUploadDestination ? '#1E293B' : '#94A3B8',
+                          color: '#FFFFFF',
+                          border: 'none',
+                          fontSize: '11.5px',
+                          cursor: uploadFile && hasUploadDestination && !isUploading ? 'pointer' : 'default',
+                        }}
+                      >
+                        {isUploading ? 'Uploading…' : '+ Upload Document'}
+                      </button>
+                    </form>
+                  )}
+                </div>
               </div>
 
               {uploadSuccess && <div style={{ fontSize: '12px', color: '#166534', marginBottom: '10px' }}>{uploadSuccess}</div>}
@@ -1669,34 +2252,88 @@ export default function AnythingLLMApp({
                       <tr>
                         <td colSpan={5} style={{ padding: '24px', textAlign: 'center', color: '#9CA3AF' }}>Loading documents…</td>
                       </tr>
+                    ) : docListError ? (
+                      <tr>
+                        <td colSpan={5} style={{ padding: '24px', textAlign: 'center', color: '#DC2626' }}>
+                          <div>{docListError}</div>
+                          <button
+                            onClick={() => loadDocuments()}
+                            style={{
+                              marginTop: '8px',
+                              padding: '4px 10px',
+                              background: '#FEE2E2',
+                              border: '1px solid #FCA5A5',
+                              borderRadius: '4px',
+                              color: '#991B1B',
+                              cursor: 'pointer',
+                              fontSize: '11px',
+                            }}
+                          >
+                            Retry
+                          </button>
+                        </td>
+                      </tr>
                     ) : workspaceDocs.length === 0 ? (
                       <tr>
                         <td colSpan={5} style={{ padding: '24px', textAlign: 'center', color: '#9CA3AF' }}>
-                          No documents uploaded to this department yet.
+                          {activeWorkspace
+                            ? `No documents uploaded to ${activeWorkspace.name} yet.`
+                            : docFilterDeptCode !== 'ALL'
+                            ? `No documents found for department ${docFilterDeptCode}.`
+                            : 'No documents uploaded yet.'}
                         </td>
                       </tr>
                     ) : (
-                      workspaceDocs.map((doc) => (
-                        <tr key={doc.id} style={{ borderBottom: '1px solid #F1F5F9' }}>
-                          <td style={{ padding: '8px 12px', fontWeight: 500, color: '#1E293B' }}>
-                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#64748B" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                                <polyline points="14 2 14 8 20 8" />
-                              </svg>
-                              {doc.file_name}
-                            </span>
-                          </td>
-                          <td style={{ padding: '8px 12px', color: '#475569' }}>{doc.department_name || doc.department_code || 'Unassigned'}</td>
-                          <td style={{ padding: '8px 12px', color: '#64748B' }}>{doc.uploaded_by_email || 'System'}</td>
-                          <td style={{ padding: '8px 12px', color: '#64748B' }}>{doc.created_at ? new Date(doc.created_at).toLocaleDateString() : '-'}</td>
-                          <td style={{ padding: '8px 12px' }}>
-                            <span style={{ fontSize: '10px', padding: '2px 6px', borderRadius: '4px', background: '#ECFDF5', color: '#047857', border: '1px solid #A7F3D0' }}>
-                              Indexed
-                            </span>
-                          </td>
-                        </tr>
-                      ))
+                      workspaceDocs.map((doc) => {
+                        const displayName = getDocumentDisplayName(doc)
+                        const uploaderDisplay = doc.uploaded_by_name
+                          ? (doc.uploaded_by_email ? `${doc.uploaded_by_name} (${doc.uploaded_by_email})` : doc.uploaded_by_name)
+                          : (doc.uploaded_by_email || 'System')
+                        const statusUpper = (doc.status || 'READY').toUpperCase()
+                        const isReady = statusUpper === 'READY' || statusUpper === 'INDEXED'
+                        const isProcessing = statusUpper === 'PROCESSING' || statusUpper === 'PENDING'
+                        const isFailed = statusUpper === 'FAILED'
+
+                        return (
+                          <tr key={doc.id} style={{ borderBottom: '1px solid #F1F5F9' }}>
+                            <td style={{ padding: '8px 12px', fontWeight: 500, color: '#1E293B' }}>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }} title={doc.file_name}>
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#64748B" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                  <polyline points="14 2 14 8 20 8" />
+                                </svg>
+                                {displayName}
+                              </span>
+                            </td>
+                            <td style={{ padding: '8px 12px', color: '#475569' }}>
+                              {doc.department_name
+                                ? `${doc.department_name} (${doc.department_code || ''})`
+                                : (doc.department_code || 'Unassigned')}
+                            </td>
+                            <td style={{ padding: '8px 12px', color: '#64748B' }}>
+                              {uploaderDisplay}
+                            </td>
+                            <td style={{ padding: '8px 12px', color: '#64748B' }}>
+                              {doc.created_at ? new Date(doc.created_at).toLocaleString() : '-'}
+                            </td>
+                            <td style={{ padding: '8px 12px' }}>
+                              <span
+                                style={{
+                                  fontSize: '10px',
+                                  padding: '2px 6px',
+                                  borderRadius: '4px',
+                                  background: isReady ? '#ECFDF5' : isProcessing ? '#FEF3C7' : isFailed ? '#FEE2E2' : '#F3F4F6',
+                                  color: isReady ? '#047857' : isProcessing ? '#B45309' : isFailed ? '#B91C1C' : '#4B5563',
+                                  border: isReady ? '1px solid #A7F3D0' : isProcessing ? '1px solid #FDE68A' : isFailed ? '1px solid #FECACA' : '1px solid #E5E7EB',
+                                  fontWeight: 500,
+                                }}
+                              >
+                                {isReady ? 'Indexed' : isProcessing ? 'Processing' : isFailed ? 'Failed' : doc.status}
+                              </span>
+                            </td>
+                          </tr>
+                        )
+                      })
                     )}
                   </tbody>
                 </table>
@@ -1704,51 +2341,16 @@ export default function AnythingLLMApp({
             </div>
           )}
 
-          {/* TAB 3: KNOWLEDGE VIEW */}
+          {/* TAB 3: KNOWLEDGE / COMPANY NOTES VIEW */}
           {(activeWsTab === 'knowledge' || currentNavView === 'knowledge') && (
-            <div style={{ maxWidth: '820px', margin: '0 auto' }}>
-              <h2 style={{ fontSize: '18px', fontWeight: 700, margin: '0 0 8px 0', color: '#111827' }}>
-                {activeWorkspace ? `${activeWorkspace.name} Knowledge Base` : 'Knowledge Explorer'}
-              </h2>
-              <p style={{ fontSize: '12px', color: '#64748B', marginBottom: '16px' }}>
-                Extracted entities, facts, and relationships scoped strictly to {activeWorkspace?.name || 'your authorized departments'}.
-              </p>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '12px' }}>
-                <div style={{ padding: '14px', border: '1px solid #E2E8F0', borderRadius: '8px', background: '#F8FAFC' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, fontSize: '13px', color: '#1E293B' }}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#475569" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="4" y="2" width="16" height="20" rx="2" ry="2" />
-                      <line x1="9" y1="22" x2="9" y2="22.01" />
-                      <line x1="15" y1="22" x2="15" y2="22.01" />
-                    </svg>
-                    <span>Companies & Entities</span>
-                  </div>
-                  <div style={{ fontSize: '11px', color: '#64748B', marginTop: '4px' }}>Department-scoped extracted organization entities.</div>
-                </div>
-                <div style={{ padding: '14px', border: '1px solid #E2E8F0', borderRadius: '8px', background: '#F8FAFC' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, fontSize: '13px', color: '#1E293B' }}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#475569" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-                      <circle cx="9" cy="7" r="4" />
-                      <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-                      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-                    </svg>
-                    <span>People & Roles</span>
-                  </div>
-                  <div style={{ fontSize: '11px', color: '#64748B', marginTop: '4px' }}>Extracted staff, stakeholders, and department owners.</div>
-                </div>
-                <div style={{ padding: '14px', border: '1px solid #E2E8F0', borderRadius: '8px', background: '#F8FAFC' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, fontSize: '13px', color: '#1E293B' }}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#475569" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <line x1="18" y1="20" x2="18" y2="10" />
-                      <line x1="12" y1="20" x2="12" y2="4" />
-                      <line x1="6" y1="20" x2="6" y2="14" />
-                    </svg>
-                    <span>Extracted Facts</span>
-                  </div>
-                  <div style={{ fontSize: '11px', color: '#64748B', marginTop: '4px' }}>Knowledge triples and verified attributes for citations.</div>
-                </div>
-              </div>
+            <div style={{ maxWidth: '1350px', margin: '0 auto', height: '100%', minHeight: '680px', display: 'flex', flexDirection: 'column' }}>
+              <CompanyNotesView
+                token={token}
+                userRole={currentUser?.role || 'USER'}
+                userName={currentUser?.email || 'User'}
+                onToast={(msg, type) => showToast(type || 'success', msg)}
+                workspaceId={activeWorkspace?.id || null}
+              />
             </div>
           )}
 
@@ -1953,36 +2555,152 @@ export default function AnythingLLMApp({
           <div
             style={{
               position: 'absolute',
-              bottom: '16px',
-              left: '50%',
-              transform: 'translateX(-50%)',
-              width: '400px',
-              maxWidth: 'calc(100% - 32px)',
-              background: '#FFFFFF',
-              border: '1px solid #E3E3E3',
-              borderRadius: '13px',
-              boxShadow: '0 4px 18px rgba(0, 0, 0, 0.06)',
-              padding: '7px 10px 6px 10px',
-              boxSizing: 'border-box',
+              bottom: 0,
+              left: 0,
+              right: 0,
               display: 'flex',
-              flexDirection: 'column',
-              gap: '3px',
+              justifyContent: 'center',
+              padding: '0 20px 20px 20px',
+              background: 'linear-gradient(to top, rgba(255, 255, 255, 1) 60%, rgba(255, 255, 255, 0) 100%)',
+              pointerEvents: 'none',
               zIndex: 10,
             }}
           >
+            <div
+              style={{
+                width: '100%',
+                maxWidth: '768px',
+                pointerEvents: 'auto',
+                background: '#FFFFFF',
+                border: '1px solid #E2E8F0',
+                borderRadius: '14px',
+                boxShadow: '0 4px 20px rgba(0, 0, 0, 0.06)',
+                padding: '8px 12px 6px 12px',
+                boxSizing: 'border-box',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '3px',
+              }}
+            >
+            {!activeWorkspace && uploadQueue.queue.length > 0 && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  padding: '2px 2px 5px',
+                  fontSize: '10.5px',
+                  color: '#4B5563',
+                }}
+              >
+                <label htmlFor="global-upload-department" style={{ whiteSpace: 'nowrap' }}>
+                  Upload to
+                </label>
+                <select
+                  id="global-upload-department"
+                  value={globalUploadDepartmentCode}
+                  onChange={(e) => setGlobalUploadDepartmentCode(e.target.value)}
+                  disabled={uploadQueue.isProcessing}
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    padding: '4px 6px',
+                    borderRadius: '5px',
+                    border: '1px solid #D1D5DB',
+                    background: '#FFFFFF',
+                    fontSize: '10.5px',
+                    color: '#374151',
+                  }}
+                >
+                  <option value="">Select an active department</option>
+                  {uploadableDepartments.map((department) => (
+                    <option key={department.id} value={department.code}>
+                      {department.name} ({department.code})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {/* Multi-File Upload Queue Review */}
+            <UploadQueueReview
+              queue={uploadQueue.queue}
+              isProcessing={uploadQueue.isProcessing}
+              activeFileId={uploadQueue.activeFileId}
+              isDestinationReady={hasUploadDestination}
+              onToggleSelect={uploadQueue.toggleSelect}
+              onSelectAll={uploadQueue.selectAll}
+              onDeselectAll={uploadQueue.deselectAll}
+              onRemoveItem={uploadQueue.removeItem}
+              onMoveUp={uploadQueue.moveUp}
+              onMoveDown={uploadQueue.moveDown}
+              onClearQueue={uploadQueue.clearQueue}
+              onStartIngestion={() => {
+                if (!uploadDepartmentCode) {
+                  showToast('error', 'Select an active department before uploading.')
+                  return
+                }
+                uploadQueue.startIngestion({
+                  departmentCode: uploadDepartmentCode,
+                  token,
+                  workspaceId: activeWorkspace?.id,
+                  onCompleted: () => {
+                    loadDocuments()
+                    showToast('success', 'Selected files were uploaded and indexed. Knowledge enrichment may continue in the background.')
+                  },
+                })
+              }}
+              onRetryItem={(id) => {
+                if (!uploadDepartmentCode) {
+                  showToast('error', 'Select an active department before retrying.')
+                  return
+                }
+                uploadQueue.retryItem(id, {
+                  departmentCode: uploadDepartmentCode,
+                  token,
+                  workspaceId: activeWorkspace?.id,
+                  onCompleted: () => loadDocuments(),
+                })
+              }}
+            />
+
+            {/* Slash Command Autocomplete Dropdown */}
+            <SlashCommandMenu
+              isOpen={isSlashMenuOpen}
+              commands={slashFilteredCommands}
+              selectedIndex={slashSelectedIndex}
+              onSelect={handleSelectSlashCommand}
+            />
+
+            {/* Active Command Input Guidance */}
+            <SlashCommandGuidance
+              activeCommand={slashActiveCommand}
+              argumentText={slashArgumentText}
+              onClear={() => setMessageInput('')}
+            />
+
             <textarea
+              ref={composerTextareaRef}
               value={messageInput}
               onChange={(e) => setMessageInput(e.target.value)}
               onKeyDown={(e) => {
+                const handled = handleSlashKeyDown(e)
+                if (handled) return
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()
                   handleSendMessage()
                 }
               }}
+              aria-expanded={isSlashMenuOpen}
+              aria-autocomplete="list"
+              aria-controls={isSlashMenuOpen ? 'slash-command-menu' : undefined}
               placeholder={
-                activeWorkspace
-                  ? `Send a message in ${activeWorkspace.name}…`
-                  : 'Ask a cross-department question across all departments…'
+                slashActiveCommand
+                  ? (slashActiveCommand.requiresArg && !slashArgumentText.trim()
+                      ? (slashActiveCommand.example ? `e.g. ${slashActiveCommand.example.replace(slashActiveCommand.command, '').trim()}` : `Enter argument for ${slashActiveCommand.command}…`)
+                      : 'Press Enter to execute command…')
+                  : (activeWorkspace
+                      ? `Send a message in ${activeWorkspace.name}… (type / for commands)`
+                      : 'Ask a cross-department question across all departments… (type / for commands)')
               }
               rows={1}
               style={{
@@ -2004,6 +2722,15 @@ export default function AnythingLLMApp({
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '2px' }}>
               {/* + Tools Button */}
               <div style={{ position: 'relative' }}>
+                {/* Hidden Multi-File Input */}
+                <input
+                  type="file"
+                  multiple
+                  ref={toolsFileInputRef}
+                  style={{ display: 'none' }}
+                  onChange={handleToolsFilesSelected}
+                />
+
                 <button
                   type="button"
                   onClick={() => setToolsOpen(!toolsOpen)}
@@ -2043,21 +2770,23 @@ export default function AnythingLLMApp({
                       zIndex: 20,
                     }}
                   >
-                    <div
+                    {/* Tools -> Upload Documents */}
+                    {canUpload && <div
                       onClick={() => {
                         setToolsOpen(false)
-                        setActiveWsTab('documents')
+                        toolsFileInputRef.current?.click()
                       }}
                       style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', padding: '5px 6px', borderRadius: '4px', cursor: 'pointer', color: '#374151' }}
                       onMouseEnter={(e) => (e.currentTarget.style.background = '#F3F4F6')}
                       onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
                     >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#64748B" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                        <polyline points="14 2 14 8 20 8" />
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="17 8 12 3 7 8" />
+                        <line x1="12" y1="3" x2="12" y2="15" />
                       </svg>
-                      <span>Search Documents</span>
-                    </div>
+                      <span>Upload Documents</span>
+                    </div>}
                     <div
                       onClick={() => {
                         setToolsOpen(false)
@@ -2132,6 +2861,7 @@ export default function AnythingLLMApp({
               </div>
             </div>
           </div>
+        </div>
         )}
       </main>
 
@@ -2327,6 +3057,411 @@ export default function AnythingLLMApp({
           isOwnerOrAdmin={currentUser?.role === 'ADMIN'}
           onClose={() => setMembersModalWs(null)}
           onToast={showToast}
+        />
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 5: SETTINGS & ACCOUNT MANAGEMENT                                    */}
+      {/* ========================================================================= */}
+      {showSettingsModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="settings-dialog-title"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.45)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 9100,
+            fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
+          }}
+          onClick={() => setShowSettingsModal(false)}
+        >
+          <div
+            style={{
+              background: '#FFFFFF',
+              borderRadius: '12px',
+              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1), 0 10px 10px -5px rgba(0,0,0,0.04)',
+              width: '90%',
+              maxWidth: '520px',
+              maxHeight: '85vh',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+              border: '1px solid #E5E7EB',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div
+              style={{
+                padding: '16px 20px',
+                borderBottom: '1px solid #E5E7EB',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                background: '#F8FAFC',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span id="settings-dialog-title" style={{ fontSize: '15px', fontWeight: 600, color: '#111827' }}>
+                  Settings
+                </span>
+                <span
+                  style={{
+                    fontSize: '10px',
+                    padding: '2px 7px',
+                    borderRadius: '10px',
+                    background: '#E0F2FE',
+                    color: '#0369A1',
+                    fontWeight: 600,
+                  }}
+                >
+                  {isAdmin ? 'ADMIN' : 'USER'}
+                </span>
+              </div>
+              <button
+                onClick={() => setShowSettingsModal(false)}
+                aria-label="Close settings"
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  fontSize: '18px',
+                  color: '#9CA3AF',
+                  cursor: 'pointer',
+                  padding: '2px 6px',
+                  lineHeight: 1,
+                }}
+              >
+                &times;
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div style={{ padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '18px' }}>
+              {/* 1. Account Info Section */}
+              <div style={{ background: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: '8px', padding: '12px 14px' }}>
+                <div style={{ fontSize: '11px', fontWeight: 600, color: '#6B7280', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '8px' }}>
+                  Account Profile
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '5px', fontSize: '12px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#6B7280' }}>Email:</span>
+                    <span style={{ fontWeight: 500, color: '#111827' }}>{currentUser?.email || 'N/A'}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#6B7280' }}>Role:</span>
+                    <span style={{ fontWeight: 600, color: isAdmin ? '#2563EB' : '#111827' }}>
+                      {currentUser?.role || 'USER'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* 2. Team & Permissions Actions */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <div style={{ fontSize: '11px', fontWeight: 600, color: '#6B7280', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                  Team & Permissions
+                </div>
+
+                {/* Request Access Action */}
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '12px 14px',
+                    borderRadius: '8px',
+                    border: '1px solid #E5E7EB',
+                    background: '#FFFFFF',
+                  }}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', paddingRight: '12px' }}>
+                    <span style={{ fontSize: '12.5px', fontWeight: 600, color: '#1F2937' }}>Request Department Access</span>
+                    <span style={{ fontSize: '11px', color: '#6B7280' }}>
+                      Request elevated permissions (View, Upload, Edit, Delete) for departments.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowSettingsModal(false)
+                      setShowAccessReqModal(true)
+                    }}
+                    style={{
+                      padding: '6px 12px',
+                      borderRadius: '6px',
+                      background: '#1E293B',
+                      color: '#FFFFFF',
+                      border: 'none',
+                      fontSize: '11.5px',
+                      fontWeight: 500,
+                      cursor: 'pointer',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    Request Access
+                  </button>
+                </div>
+
+                {/* Workspace Members & Roles (Authorized) */}
+                {(isAdmin || activeWorkspace) && (
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '12px 14px',
+                      borderRadius: '8px',
+                      border: '1px solid #E5E7EB',
+                      background: '#FFFFFF',
+                    }}
+                  >
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', paddingRight: '12px' }}>
+                      <span style={{ fontSize: '12.5px', fontWeight: 600, color: '#1F2937' }}>
+                        Members & Roles
+                      </span>
+                      <span style={{ fontSize: '11px', color: '#6B7280' }}>
+                        {activeWorkspace
+                          ? `Manage team members and assigned roles in ${activeWorkspace.name}.`
+                          : 'Manage workspace members and permissions across workspaces.'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const targetWs = activeWorkspace || workspaces[0]
+                        if (targetWs) {
+                          setShowSettingsModal(false)
+                          setMembersModalWs(targetWs)
+                        } else {
+                          showToast('error', 'No workspace available to manage members.')
+                        }
+                      }}
+                      style={{
+                        padding: '6px 12px',
+                        borderRadius: '6px',
+                        background: '#EFF6FF',
+                        color: '#1D4ED8',
+                        border: '1px solid #BFDBFE',
+                        fontSize: '11.5px',
+                        fontWeight: 500,
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      Manage Members
+                    </button>
+                  </div>
+                )}
+
+                {/* Workspace Provider Settings (Admin Only) */}
+                {isAdmin && (
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '12px 14px',
+                      borderRadius: '8px',
+                      border: '1px solid #E5E7EB',
+                      background: '#FFFFFF',
+                    }}
+                  >
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', paddingRight: '12px' }}>
+                      <span style={{ fontSize: '12.5px', fontWeight: 600, color: '#1F2937' }}>
+                        Infrastructure Providers
+                      </span>
+                      <span style={{ fontSize: '11px', color: '#6B7280' }}>
+                        {activeWorkspace
+                          ? `Configure LLM, embedding and reader providers for ${activeWorkspace.name}.`
+                          : 'Configure infrastructure provider profiles for workspaces.'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const targetWs = activeWorkspace || workspaces[0]
+                        if (targetWs) {
+                          setShowSettingsModal(false)
+                          setSettingsModalWs(targetWs)
+                        } else {
+                          showToast('error', 'Select a workspace first to configure its providers.')
+                        }
+                      }}
+                      style={{
+                        padding: '6px 12px',
+                        borderRadius: '6px',
+                        background: '#F8FAFC',
+                        color: '#334155',
+                        border: '1px solid #CBD5E1',
+                        fontSize: '11.5px',
+                        fontWeight: 500,
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      Providers
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div
+              style={{
+                padding: '12px 20px',
+                borderTop: '1px solid #E5E7EB',
+                background: '#F9FAFB',
+                display: 'flex',
+                justifyContent: 'flex-end',
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => setShowSettingsModal(false)}
+                style={{
+                  padding: '6px 14px',
+                  borderRadius: '6px',
+                  background: '#FFFFFF',
+                  border: '1px solid #D1D5DB',
+                  color: '#374151',
+                  fontSize: '11.5px',
+                  cursor: 'pointer',
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 6: LOGOUT CONFIRMATION DIALOG                                       */}
+      {/* ========================================================================= */}
+      {showLogoutConfirm && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="logout-dialog-title"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.45)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 9200,
+            fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
+          }}
+          onClick={() => {
+            if (!isLoggingOut) setShowLogoutConfirm(false)
+          }}
+        >
+          <div
+            style={{
+              background: '#FFFFFF',
+              borderRadius: '12px',
+              boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1)',
+              width: '90%',
+              maxWidth: '380px',
+              padding: '22px 24px',
+              boxSizing: 'border-box',
+              border: '1px solid #E5E7EB',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '12px',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <div
+                style={{
+                  width: '36px',
+                  height: '36px',
+                  borderRadius: '50%',
+                  background: '#FEE2E2',
+                  color: '#DC2626',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '16px',
+                  flexShrink: 0,
+                }}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                  <polyline points="16 17 21 12 16 7" />
+                  <line x1="21" y1="12" x2="9" y2="12" />
+                </svg>
+              </div>
+              <div>
+                <h3 id="logout-dialog-title" style={{ margin: 0, fontSize: '15px', fontWeight: 600, color: '#111827' }}>
+                  Log out?
+                </h3>
+                <p style={{ margin: '3px 0 0 0', fontSize: '12.5px', color: '#6B7280', lineHeight: 1.4 }}>
+                  Are you sure you want to log out of your account?
+                </p>
+              </div>
+            </div>
+
+            {currentUser?.email && (
+              <div style={{ fontSize: '11px', color: '#6B7280', background: '#F9FAFB', padding: '6px 10px', borderRadius: '6px' }}>
+                Signed in as: <strong style={{ color: '#374151' }}>{currentUser.email}</strong>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '6px' }}>
+              <button
+                type="button"
+                disabled={isLoggingOut}
+                onClick={() => setShowLogoutConfirm(false)}
+                style={{
+                  padding: '7px 14px',
+                  borderRadius: '6px',
+                  background: '#FFFFFF',
+                  border: '1px solid #D1D5DB',
+                  color: '#374151',
+                  fontSize: '12px',
+                  fontWeight: 500,
+                  cursor: isLoggingOut ? 'not-allowed' : 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isLoggingOut}
+                onClick={handleConfirmLogout}
+                style={{
+                  padding: '7px 16px',
+                  borderRadius: '6px',
+                  background: '#DC2626',
+                  border: 'none',
+                  color: '#FFFFFF',
+                  fontSize: '12px',
+                  fontWeight: 500,
+                  cursor: isLoggingOut ? 'not-allowed' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                }}
+              >
+                {isLoggingOut ? 'Logging out…' : 'Log out'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {selectedMetrics && (
+        <ExecutionMetricsModal
+          metrics={selectedMetrics}
+          onClose={() => setSelectedMetrics(null)}
         />
       )}
     </div>

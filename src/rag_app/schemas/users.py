@@ -152,6 +152,7 @@ class DocumentDepartmentUpdate(BaseModel):
 class DocumentAdminResponse(BaseModel):
     id: UUID
     file_name: str
+    original_file_name: Optional[str] = None
     department_id: Optional[UUID] = None
     department_code: Optional[str] = None
     department_name: Optional[str] = None
@@ -168,6 +169,7 @@ class DocumentAdminResponse(BaseModel):
 class DocumentResponse(BaseModel):
     id: UUID
     file_name: str
+    original_file_name: Optional[str] = None
     department_id: Optional[UUID] = None
     department_code: Optional[str] = None
     department_name: Optional[str] = None

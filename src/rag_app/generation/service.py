@@ -172,6 +172,7 @@ class GenerationService:
         llm: LLMProvider | None = None,
         provider_overrides: dict[str, str] | None = None,
         sufficiency_evaluation: Any | None = None,
+        personal_memories: Any | None = None,
     ) -> GenerateResponse:
         
         if is_greeting(query):
@@ -221,6 +222,7 @@ class GenerationService:
                 chunks=chunks,
                 conversation_history=conversation_history,
                 workspace_thread_context=workspace_thread_context,
+                personal_memories=personal_memories,
             )
 
             # Resolve active LLM provider for the given Workspace (supporting per-request experiment overrides)

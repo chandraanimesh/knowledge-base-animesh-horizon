@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "production-rag-local": {
+      "url": "http://localhost:8000/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer YOUR_LOCAL_TOKEN_HERE"
+      }
+    }
+  }
+}

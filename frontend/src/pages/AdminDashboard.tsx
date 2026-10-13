@@ -24,6 +24,7 @@ import {
 } from '../api/chat'
 import { documentApi, DocumentListItem, DocumentAccessListResponse, DocUserAccessItem } from '../api/documents'
 import AnythingLLMApp from '../components/AnythingLLMApp'
+import CompanyNotesView from '../components/CompanyNotesView'
 
 /* ------------------------------------------------------------------ */
 /*  Types & Constants                                                  */
@@ -812,6 +813,16 @@ export default function AdminDashboard({
           />
         )}
 
+        {/* VIEW: Company Notes & Knowledge Review */}
+        {activeView === 'kb' && (
+          <CompanyNotesView
+            token={token}
+            userRole="ADMIN"
+            userName={userName}
+            onToast={showToast}
+          />
+        )}
+
         {activeView === 'sources' && (
           <div style={styles.listContainer}>
             {/* Header bar */}
@@ -887,7 +898,7 @@ export default function AdminDashboard({
                           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                             <span style={{ fontSize: '16px' }}>📄</span>
                             <div>
-                              <div style={{ fontWeight: 600, color: 'var(--color-ink)' }}>{doc.file_name}</div>
+                              <div style={{ fontWeight: 600, color: 'var(--color-ink)' }}>{doc.original_file_name || doc.file_name}</div>
                               <div style={{ fontSize: '11px', color: 'var(--color-ink-muted)', fontFamily: 'var(--font-mono)' }}>
                                 {doc.mime_type || 'Document'}
                               </div>
@@ -2310,7 +2321,7 @@ export default function AdminDashboard({
                 <span style={{ fontSize: '20px' }}>📄</span>
                 <div>
                   <h2 style={{ margin: 0, fontFamily: 'var(--font-serif)', fontSize: '18px' }}>
-                    {previewDoc.file_name}
+                    {previewDoc.original_file_name || previewDoc.file_name}
                   </h2>
                   <div style={{ fontSize: '12px', color: 'var(--color-ink-muted)', marginTop: '2px' }}>
                     Department: <strong>{previewDoc.department_name || previewDoc.department_code || 'Unassigned'}</strong> · Uploaded by:{' '}
@@ -2402,7 +2413,7 @@ export default function AdminDashboard({
                 <span style={{ fontSize: '22px' }}>🔒</span>
                 <div>
                   <h2 style={{ margin: 0, fontFamily: 'var(--font-serif)', fontSize: '18px' }}>
-                    Document Access: {manageAccessDoc.file_name}
+                    Document Access: {manageAccessDoc.original_file_name || manageAccessDoc.file_name}
                   </h2>
                   <div style={{ fontSize: '12px', color: 'var(--color-ink-muted)', marginTop: '2px' }}>
                     Department: <strong>{manageAccessDoc.department_name || manageAccessDoc.department_code}</strong> · Manage specific user permissions

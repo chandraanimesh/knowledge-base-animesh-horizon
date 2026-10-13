@@ -32,6 +32,7 @@ class MemoryRetrievalService:
         cls,
         session: AsyncSession,
         user_id: uuid.UUID,
+        workspace_id: Optional[uuid.UUID] = None,
         query: Optional[str] = None,
         memory_type: Optional[Union[MemoryType, str]] = None,
         limit_static: int = 20,
@@ -40,21 +41,34 @@ class MemoryRetrievalService:
         similarity_threshold: Optional[float] = None,
         reference_time: Optional[datetime] = None,
         embedding_provider=None,
+        include_historical: bool = False,
     ) -> MemoryRetrievalResponse:
         """
         Retrieves active, non-expired memories for a single user, separated into:
         - static_memories: durable persona / preference facts
         - dynamic_memories: transient context / active tasks
         - relevant_memories: semantically ranked user memories matching query
+        - historical_memories: previously superseded facts for historical queries
+
+        Dual-scope behavior:
+        - If workspace_id is provided, retrieves memories matching that workspace OR global memories (workspace_id IS NULL).
+        - If workspace_id is None (e.g. Global Chat), retrieves only global memories (workspace_id IS NULL).
         """
         if not user_id:
             raise ValueError("user_id is required for memory retrieval")
 
         now = reference_time or datetime.now(timezone.utc)
 
-        # Base filter: strict user isolation, ACTIVE status only, valid time window
+        workspace_filter = (
+            or_(MemoryItem.workspace_id == workspace_id, MemoryItem.workspace_id.is_(None))
+            if workspace_id is not None
+            else MemoryItem.workspace_id.is_(None)
+        )
+
+        # Base filter: strict user and workspace isolation, ACTIVE status only, valid time window, storage retention
         base_filters = [
             MemoryItem.user_id == user_id,
+            workspace_filter,
             MemoryItem.status == MemoryStatus.ACTIVE.value,
             or_(
                 MemoryItem.valid_until.is_(None),
@@ -63,6 +77,10 @@ class MemoryRetrievalService:
             or_(
                 MemoryItem.valid_from.is_(None),
                 MemoryItem.valid_from <= now,
+            ),
+            or_(
+                MemoryItem.retention_expires_at.is_(None),
+                MemoryItem.retention_expires_at > now,
             ),
         ]
 
@@ -163,17 +181,44 @@ class MemoryRetrievalService:
                     extra={
                         "event": "semantic_memory_retrieval_failed",
                         "user_id": str(user_id),
+                        "workspace_id": str(workspace_id),
                         "query": query_clean,
                         "error": str(exc),
                     },
                 )
 
+        # 4. Retrieve historical superseded memories if query is historical
+        historical_records: list[MemoryRecord] = []
+        is_historical = include_historical or (
+            query is not None
+            and any(kw in query.lower() for kw in ["previously", "earlier", "prior", "before", "past", "historical", "what was", "what did i say", "formerly"])
+        )
+        if is_historical:
+            hist_filters = [
+                MemoryItem.user_id == user_id,
+                workspace_filter,
+                MemoryItem.status == MemoryStatus.SUPERSEDED.value,
+            ]
+            hist_stmt = (
+                select(MemoryItem)
+                .where(*hist_filters)
+                .order_by(
+                    desc(MemoryItem.created_at),
+                    asc(MemoryItem.id),
+                )
+                .limit(limit_relevant)
+            )
+            hist_results = (await session.execute(hist_stmt)).scalars().all()
+            historical_records = [MemoryRecord.model_validate(m) for m in hist_results]
+
         return MemoryRetrievalResponse(
             user_id=user_id,
+            workspace_id=workspace_id,
             static_memories=static_records,
             dynamic_memories=dynamic_records,
             relevant_memories=relevant_records,
-            total_count=len(static_records) + len(dynamic_records) + len(relevant_records),
+            historical_memories=historical_records,
+            total_count=len(static_records) + len(dynamic_records) + len(relevant_records) + len(historical_records),
         )
 
     @classmethod
@@ -181,6 +226,7 @@ class MemoryRetrievalService:
         cls,
         session: AsyncSession,
         user_id: uuid.UUID,
+        workspace_id: Optional[uuid.UUID] = None,
         limit: int = 50,
         reference_time: Optional[datetime] = None,
     ) -> list[MemoryRecord]:
@@ -188,6 +234,7 @@ class MemoryRetrievalService:
         resp = await cls.retrieve(
             session=session,
             user_id=user_id,
+            workspace_id=workspace_id,
             memory_type=MemoryType.STATIC,
             limit_static=limit,
             reference_time=reference_time,
@@ -199,6 +246,7 @@ class MemoryRetrievalService:
         cls,
         session: AsyncSession,
         user_id: uuid.UUID,
+        workspace_id: Optional[uuid.UUID] = None,
         query: Optional[str] = None,
         limit: int = 20,
         reference_time: Optional[datetime] = None,
@@ -207,6 +255,7 @@ class MemoryRetrievalService:
         resp = await cls.retrieve(
             session=session,
             user_id=user_id,
+            workspace_id=workspace_id,
             query=query,
             memory_type=MemoryType.DYNAMIC,
             limit_dynamic=limit,
@@ -220,6 +269,7 @@ class MemoryRetrievalService:
         session: AsyncSession,
         user_id: uuid.UUID,
         query: str,
+        workspace_id: Optional[uuid.UUID] = None,
         limit: int = 10,
         similarity_threshold: Optional[float] = None,
         reference_time: Optional[datetime] = None,
@@ -229,6 +279,7 @@ class MemoryRetrievalService:
         resp = await cls.retrieve(
             session=session,
             user_id=user_id,
+            workspace_id=workspace_id,
             query=query,
             limit_relevant=limit,
             similarity_threshold=similarity_threshold,

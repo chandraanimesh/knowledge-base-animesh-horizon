@@ -222,11 +222,46 @@ async def retrieve_rag(
         workspace_id=state.get("workspace_id"),
     )
 
+    results = list(response.results)
+    strategy_trace = dict(response.strategy_trace) if response.strategy_trace else {}
+    chunk_provenance = dict(response.chunk_provenance) if response.chunk_provenance else {}
+    chunk_hierarchy = dict(response.chunk_hierarchy) if response.chunk_hierarchy else {}
+
+    # Stage D: Integrate approved shared knowledge into Global Chat only
+    if state.get("workspace_id") is None:
+        db_session = config.get("configurable", {}).get("db_session")
+        if db_session:
+            try:
+                from rag_app.knowledge.candidate_service import KnowledgeCandidateService
+                kn_service = KnowledgeCandidateService(db_session)
+                shared_chunks = await kn_service.retrieve_shared_knowledge_as_chunks(
+                    query=state["query"],
+                    allowed_departments=state.get("allowed_departments"),
+                    limit=5,
+                )
+                if shared_chunks:
+                    for sc in shared_chunks:
+                        results.append(sc)
+                        if sc.chunk_id:
+                            chunk_provenance[sc.chunk_id] = ChunkProvenance(
+                                chunk_id=sc.chunk_id,
+                                strategies=["SHARED_KNOWLEDGE"],
+                                knowledge_item_id=sc.chunk_id.replace("shared_kn_", ""),
+                                confidence=sc.hybrid_score,
+                            )
+                    strategy_trace["shared_knowledge"] = len(shared_chunks)
+            except Exception as e:
+                logger.warning(
+                    f"Approved shared knowledge retrieval failed: {e}",
+                    extra={"event": "shared_knowledge_retrieval_exception", "error": str(e)},
+                    exc_info=True,
+                )
+
     return {
-        "retrieved_chunks": response.results,
-        "strategy_trace": response.strategy_trace,
-        "chunk_provenance": response.chunk_provenance,
-        "chunk_hierarchy": response.chunk_hierarchy,
+        "retrieved_chunks": results,
+        "strategy_trace": strategy_trace,
+        "chunk_provenance": chunk_provenance,
+        "chunk_hierarchy": chunk_hierarchy,
     }
 
 
@@ -809,7 +844,7 @@ async def generate_final_answer(
     # PATH A — INTERNAL RAG WAS SUFFICIENT
     # --------------------------------------------------------
 
-    if state.get("is_sufficient"):
+    if state.get("is_sufficient") or state.get("sufficiency_status") in ("sufficient", "partial"):
 
         raw_chunks = state.get(
             "retrieved_chunks",

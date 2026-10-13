@@ -6,6 +6,11 @@ from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, ForeignKeyCo
 from sqlalchemy.dialects.postgresql import UUID,JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
+from rag_app.core.config import get_settings
+
+settings = get_settings()
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -215,7 +220,7 @@ class DocumentChunk(Base):
     )
     
     embedding: Mapped[list[float]] = mapped_column(
-        Vector(384),
+        Vector(settings.embedding_dim),
         nullable=False
         )
     page_number: Mapped[int | None] = mapped_column(
@@ -946,6 +951,58 @@ class KnowledgeItem(Base):
     confidence: Mapped[float | None] = mapped_column(
         nullable=True
     )
+    visibility: Mapped[str] = mapped_column(
+        String(20),
+        CheckConstraint(
+            "visibility IN ('PRIVATE', 'WORKSPACE', 'SHARED')",
+            name="ck_knowledgeitem_visibility",
+        ),
+        default="WORKSPACE",
+        server_default="WORKSPACE",
+        nullable=False,
+    )
+    approval_status: Mapped[str] = mapped_column(
+        String(20),
+        CheckConstraint(
+            "approval_status IN ('DRAFT', 'PENDING', 'APPROVED', 'REJECTED')",
+            name="ck_knowledgeitem_approval_status",
+        ),
+        default="DRAFT",
+        server_default="DRAFT",
+        nullable=False,
+    )
+    source_type: Mapped[str] = mapped_column(
+        String(20),
+        CheckConstraint(
+            "source_type IN ('DOCUMENT', 'RESEARCH', 'CONVERSATION')",
+            name="ck_knowledgeitem_source_type",
+        ),
+        default="DOCUMENT",
+        server_default="DOCUMENT",
+        nullable=False,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    author_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    approved_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now()
@@ -955,6 +1012,11 @@ class KnowledgeItem(Base):
         server_default=func.now(),
         onupdate=func.now()
     )
+
+    workspace: Mapped["Workspace | None"] = relationship(foreign_keys=[workspace_id])
+    department: Mapped["Department | None"] = relationship(foreign_keys=[department_id])
+    author: Mapped["User | None"] = relationship(foreign_keys=[author_id])
+    approved_by: Mapped["User | None"] = relationship(foreign_keys=[approved_by_id])
 
     entities: Mapped[list["KnowledgeEntity"]] = relationship(
         back_populates="knowledge_item",
@@ -978,6 +1040,19 @@ class KnowledgeItem(Base):
             "department_id",
             unique=True,
             postgresql_nulls_not_distinct=True,
+        ),
+        Index(
+            "ix_knowledge_items_visibility_approval",
+            "visibility",
+            "approval_status",
+        ),
+        CheckConstraint(
+            "(approval_status != 'APPROVED') OR (approved_by_id IS NOT NULL AND approved_at IS NOT NULL)",
+            name="ck_knowledgeitem_approval_consistency",
+        ),
+        CheckConstraint(
+            "(visibility != 'SHARED') OR (approval_status = 'APPROVED')",
+            name="ck_knowledgeitem_shared_requires_approved",
         ),
     )
 
@@ -1105,6 +1180,18 @@ class KnowledgeEvidence(Base):
         nullable=True,
         index=True
     )
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    chat_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chat_messages.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     extraction_method: Mapped[str | None] = mapped_column(
         String,
         nullable=True
@@ -1114,6 +1201,38 @@ class KnowledgeEvidence(Base):
         ForeignKey("research_runs.id", ondelete="SET NULL"),
         nullable=True,
         index=True
+    )
+    # Website source fields (non-destructive extension)
+    source_url: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+        index=True,
+    )
+    source_title: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+    )
+    user_excerpt: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    verification_status: Mapped[str | None] = mapped_column(
+        String(30),
+        CheckConstraint(
+            "verification_status IS NULL OR verification_status IN ('NOT_VERIFIED', 'VERIFIED', 'FAILED')",
+            name="ck_knowledgeevidence_verification_status",
+        ),
+        default="NOT_VERIFIED",
+        server_default="NOT_VERIFIED",
+        nullable=True,
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    content_hash: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
     )
     confidence: Mapped[float | None] = mapped_column(
         nullable=True
@@ -1128,20 +1247,139 @@ class KnowledgeEvidence(Base):
     )
     document_chunk: Mapped["DocumentChunk"] = relationship()
     research_evidence: Mapped["ResearchEvidence"] = relationship()
+    conversation: Mapped["Conversation | None"] = relationship(foreign_keys=[conversation_id])
+    chat_message: Mapped["ChatMessage | None"] = relationship(foreign_keys=[chat_message_id])
 
     __table_args__ = (
         CheckConstraint(
-            "(document_chunk_id IS NOT NULL AND research_evidence_id IS NULL) OR "
-            "(document_chunk_id IS NULL AND research_evidence_id IS NOT NULL)",
-            name="ck_knowledgeevidence_single_source"
+            "(document_chunk_id IS NOT NULL AND research_evidence_id IS NULL AND conversation_id IS NULL AND chat_message_id IS NULL AND source_url IS NULL) OR "
+            "(document_chunk_id IS NULL AND research_evidence_id IS NOT NULL AND conversation_id IS NULL AND chat_message_id IS NULL AND source_url IS NULL) OR "
+            "(document_chunk_id IS NULL AND research_evidence_id IS NULL AND conversation_id IS NOT NULL AND source_url IS NULL) OR "
+            "(document_chunk_id IS NULL AND research_evidence_id IS NULL AND conversation_id IS NULL AND chat_message_id IS NULL AND source_url IS NOT NULL)",
+            name="ck_knowledgeevidence_single_source",
         ),
         UniqueConstraint(
             "knowledge_item_id",
             "document_chunk_id",
             "research_evidence_id",
+            "conversation_id",
+            "chat_message_id",
+            "source_url",
             name="uq_knowledge_evidence_source",
             postgresql_nulls_not_distinct=True,
         ),
+    )
+
+
+class MemoryProcessingJob(Base):
+    """
+    Durable memory evaluation job / outbox record.
+    Captures user turn snapshots before structured interpretation and supports
+    deterministic candidate execution, LLM fallbacks, and observable retries.
+    """
+    __tablename__ = "memory_processing_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    source_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_text_snapshot: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    trigger_kind: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="rule_candidate",
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        CheckConstraint(
+            "status IN ('PENDING', 'PROCESSING', 'SUCCEEDED', 'RETRY_PENDING', 'DEAD_LETTER', 'SKIPPED_NOT_MEMORABLE')",
+            name="ck_memory_processing_job_status",
+        ),
+        default="PENDING",
+        nullable=False,
+        index=True,
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        default=3,
+        nullable=False,
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    last_error_code: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    locked_by: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    owner: Mapped["User"] = relationship(foreign_keys=[owner_user_id])
+    workspace: Mapped["Workspace | None"] = relationship(foreign_keys=[workspace_id])
+
+    __table_args__ = (
+        Index("ix_memory_processing_jobs_status_created", "status", "created_at"),
+        Index("ix_memory_processing_jobs_user_status", "owner_user_id", "status"),
+        Index("ix_memory_processing_jobs_next_attempt", "status", "next_attempt_at"),
     )
 
 
@@ -1157,6 +1395,12 @@ class MemoryItem(Base):
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="RESTRICT", name="fk_memory_items_workspace_id_workspaces"),
+        nullable=True,
         index=True,
     )
     canonical_key: Mapped[str] = mapped_column(
@@ -1187,7 +1431,7 @@ class MemoryItem(Base):
         nullable=False,
     )
     embedding: Mapped[list[float] | None] = mapped_column(
-        Vector(384),
+        Vector(settings.embedding_dim),
         nullable=True,
     )
     structured_data: Mapped[dict | None] = mapped_column(
@@ -1205,6 +1449,17 @@ class MemoryItem(Base):
     valid_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+    retention_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    source_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("memory_processing_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -1247,22 +1502,33 @@ class MemoryItem(Base):
     )
 
     user: Mapped["User"] = relationship(foreign_keys=[user_id])
+    workspace: Mapped["Workspace | None"] = relationship(foreign_keys=[workspace_id])
     superseded_by: Mapped["MemoryItem | None"] = relationship(
         remote_side=[id],
         foreign_keys=[superseded_by_id],
     )
+    source_job: Mapped["MemoryProcessingJob | None"] = relationship(foreign_keys=[source_job_id])
 
     __table_args__ = (
         Index(
-            "ix_memory_items_user_canonical_key_active",
+            "ix_memory_items_user_workspace_canonical_key_active",
+            "user_id",
+            "workspace_id",
+            "canonical_key",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE' AND workspace_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_memory_items_user_global_canonical_key_active",
             "user_id",
             "canonical_key",
             unique=True,
-            postgresql_where=text("status = 'ACTIVE'"),
+            postgresql_where=text("status = 'ACTIVE' AND workspace_id IS NULL"),
         ),
         Index(
-            "ix_memory_items_user_status",
+            "ix_memory_items_user_workspace_status",
             "user_id",
+            "workspace_id",
             "status",
         ),
     )
@@ -1370,6 +1636,206 @@ class ChatMessage(Base):
 
     __table_args__ = (
         Index("ix_chat_messages_conv_created", "conversation_id", "created_at"),
+    )
+
+
+class TaskItem(Base):
+    """
+    Structured Follow-up Tasks, Commitments, and Events.
+    Maintains strict separation from personal memory (MemoryItem) and external CRM state.
+    Carries explicit owner, due date, timezone policy, status, company/contact associations,
+    and provenance tracking.
+    """
+    __tablename__ = "task_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(20),
+        CheckConstraint(
+            "status IN ('OPEN', 'COMPLETED', 'CANCELLED')",
+            name="ck_task_status",
+        ),
+        default="OPEN",
+        nullable=False,
+        index=True,
+    )
+    due_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    timezone: Mapped[str] = mapped_column(
+        String(64),
+        default="UTC",
+        nullable=False,
+    )
+    company_name: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+    )
+    contact_name: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    provenance_type: Mapped[str] = mapped_column(
+        String(32),
+        CheckConstraint(
+            "provenance_type IN ('EXPLICIT_USER_ACTION', 'EXTRACTED_FROM_INTERACTION', 'EXTRACTED_FROM_DOCUMENT')",
+            name="ck_task_provenance_type",
+        ),
+        default="EXPLICIT_USER_ACTION",
+        nullable=False,
+    )
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chat_messages.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    document_chunk_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_chunks.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    attributes: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    user: Mapped["User"] = relationship(foreign_keys=[user_id])
+    workspace: Mapped["Workspace | None"] = relationship(foreign_keys=[workspace_id])
+    department: Mapped["Department | None"] = relationship(foreign_keys=[department_id])
+
+    __table_args__ = (
+        Index("ix_task_items_user_status_due", "user_id", "status", "due_date"),
+        Index("ix_task_items_user_company", "user_id", "company_name"),
+    )
+
+
+class KnowledgeExtractionJob(Base):
+    """
+    Durable PostgreSQL-backed queue record for document knowledge extraction.
+    Ensures background jobs survive application server restarts, support safe concurrent
+    claiming via FOR UPDATE SKIP LOCKED, automatic abandoned-job recovery, and retries.
+    """
+    __tablename__ = "knowledge_extraction_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED')",
+            name="ck_extraction_job_status",
+        ),
+        default="PENDING",
+        nullable=False,
+        index=True,
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        default=3,
+        nullable=False,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    locked_by: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    document: Mapped["Document"] = relationship(foreign_keys=[document_id])
+
+    __table_args__ = (
+        Index("ix_extraction_jobs_status_created", "status", "created_at"),
+        Index("ix_extraction_jobs_locked_at", "locked_at"),
     )
 
 

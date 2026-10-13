@@ -522,6 +522,10 @@ def finalize_request_metrics() -> ExecutionMetrics | None:
             elif "regen" in sub.name.lower():
                 regen_lat += sub.latency_ms
 
+    total_llm_calls = sum(len(stage_rec.llm_calls) for stage_rec in ctx.stages.values())
+    if total_llm_calls == 0:
+        total_llm_calls = 1
+
     return ExecutionMetrics(
         request_id=ctx.request_id,
         trace_id=ctx.trace_id or ctx.request_id,
@@ -533,6 +537,7 @@ def finalize_request_metrics() -> ExecutionMetrics | None:
         input_tokens=total_input,
         output_tokens=total_output,
         total_tokens=total_tokens,
+        total_llm_calls=total_llm_calls,
         usage_available=ctx.usage_available,
         llm_usage=llm_usage_total,
         retrieval_latency_ms=retrieval_lat or ctx.retrieval_latency_ms,

@@ -1,7 +1,7 @@
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import HTTPException
 from sqlalchemy import func, select, or_
@@ -86,43 +86,132 @@ class ConversationService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def _validate_workspace_access(self, user: User, workspace_id: uuid.UUID) -> Workspace:
+    @staticmethod
+    def _require_global_chat_admin(user: User) -> None:
+        """Keep organization-wide Global Chat available only to administrators."""
+        if user.role != "ADMIN":
+            raise HTTPException(
+                status_code=403,
+                detail="Global Chat is available to administrators only.",
+            )
+
+    async def _validate_workspace_access(self, user: User, workspace_id: uuid.UUID | str) -> Workspace:
         """
         Validates workspace exists, is active, department access, and user membership.
-        Supports resolving workspace by ID or by Department ID.
+        Supports resolving workspace by ID, Code, Name, Department ID, or Department Code.
         """
-        ws = await self.session.scalar(
-            select(Workspace).where(
-                Workspace.id == workspace_id,
-                Workspace.deleted_at.is_(None),
-                Workspace.is_active == True,
+        if not workspace_id:
+            raise HTTPException(status_code=400, detail="Workspace identifier cannot be empty.")
+
+        ws_str = str(workspace_id).strip()
+        ws_uuid: uuid.UUID | None = None
+        try:
+            ws_uuid = uuid.UUID(ws_str)
+        except (ValueError, TypeError, AttributeError):
+            ws_uuid = None
+
+        ws: Workspace | None = None
+
+        # 1. Look up by Workspace.id or Workspace.department_id if valid UUID
+        if ws_uuid:
+            ws = await self.session.scalar(
+                select(Workspace).where(
+                    Workspace.id == ws_uuid,
+                    Workspace.deleted_at.is_(None),
+                    Workspace.is_active == True,
+                )
             )
-        )
+            if not ws:
+                ws = await self.session.scalar(
+                    select(Workspace).where(
+                        Workspace.department_id == ws_uuid,
+                        Workspace.deleted_at.is_(None),
+                        Workspace.is_active == True,
+                    )
+                )
+
+        # 2. Look up by Workspace.code or Workspace.name (case-insensitive)
         if not ws:
             ws = await self.session.scalar(
                 select(Workspace).where(
-                    Workspace.department_id == workspace_id,
+                    or_(
+                        func.lower(Workspace.code) == ws_str.lower(),
+                        func.lower(Workspace.name) == ws_str.lower(),
+                    ),
                     Workspace.deleted_at.is_(None),
                     Workspace.is_active == True,
                 )
             )
 
+        # 3. Look up by Department.code or Department.name (case-insensitive)
         if not ws:
-            # Auto-provision workspace for active department if valid department ID
-            dept = await self.session.get(Department, workspace_id)
-            if dept and dept.is_active:
+            dept = await self.session.scalar(
+                select(Department).where(
+                    or_(
+                        func.lower(Department.code) == ws_str.lower(),
+                        func.lower(Department.name) == ws_str.lower(),
+                        *( [Department.id == ws_uuid] if ws_uuid else [] )
+                    ),
+                    Department.deleted_at.is_(None),
+                    Department.is_active == True,
+                )
+            )
+            if dept:
+                ws = await self.session.scalar(
+                    select(Workspace).where(
+                        Workspace.department_id == dept.id,
+                        Workspace.deleted_at.is_(None),
+                        Workspace.is_active == True,
+                    )
+                )
+                if not ws:
+                    now = datetime.now(timezone.utc)
+                    ws = Workspace(
+                        name=dept.name,
+                        code=f"{dept.code.lower()}_ws",
+                        department_id=dept.id,
+                        is_active=True,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    self.session.add(ws)
+                    await self.session.flush()
+                    self.session.add(WorkspaceMember(workspace_id=ws.id, user_id=user.id, role="OWNER" if user.role == "ADMIN" else "EDITOR"))
+                    await self.session.flush()
+
+        # 4. Fallback: Auto-provision under active UNCLASSIFIED or first active department for new workspace code
+        if not ws:
+            default_dept = await self.session.scalar(
+                select(Department).where(
+                    func.lower(Department.code) == "unclassified",
+                    Department.is_active == True,
+                )
+            )
+            if not default_dept:
+                default_dept = await self.session.scalar(
+                    select(Department).where(Department.is_active == True).limit(1)
+                )
+            if default_dept:
                 now = datetime.now(timezone.utc)
+                clean_code = re.sub(r"[^a-zA-Z0-9_-]", "_", ws_str).lower()
+                clean_name = ws_str.replace("_", " ").replace("-", " ").title()
                 ws = Workspace(
-                    name=dept.name,
-                    code=f"{dept.code.lower()}_ws",
-                    department_id=dept.id,
+                    name=clean_name,
+                    code=clean_code,
+                    department_id=default_dept.id,
                     is_active=True,
                     created_at=now,
                     updated_at=now,
                 )
                 self.session.add(ws)
                 await self.session.flush()
-                self.session.add(WorkspaceMember(workspace_id=ws.id, user_id=user.id, role="OWNER" if user.role == "ADMIN" else "EDITOR"))
+                self.session.add(
+                    WorkspaceMember(
+                        workspace_id=ws.id,
+                        user_id=user.id,
+                        role="OWNER" if user.role == "ADMIN" else "EDITOR",
+                    )
+                )
                 await self.session.flush()
 
         if not ws:
@@ -145,15 +234,9 @@ class ConversationService:
                 )
             )
             if not ws_member:
-                # If this is the 1:1 default workspace for the department, auto-enroll authorized member
-                if dept and (ws.code == f"{dept.code.lower()}_ws" or ws.code == dept.code.lower() or ws.name == dept.name):
-                    self.session.add(WorkspaceMember(workspace_id=ws.id, user_id=user.id, role="EDITOR"))
-                    await self.session.flush()
-                else:
-                    raise HTTPException(
-                        status_code=403,
-                        detail=f"Forbidden: User is not a member of workspace '{ws.name}'.",
-                    )
+                # Auto-enroll authorized department user in default department workspace
+                self.session.add(WorkspaceMember(workspace_id=ws.id, user_id=user.id, role="EDITOR"))
+                await self.session.flush()
 
         return ws
 
@@ -161,14 +244,16 @@ class ConversationService:
         self,
         user: User,
         title: str | None = None,
-        workspace_id: uuid.UUID | None = None,
+        workspace_id: uuid.UUID | str | None = None,
     ) -> ConversationResponse:
         ws_name: str | None = None
         target_ws_id: uuid.UUID | None = None
-        if workspace_id is not None:
+        if workspace_id is not None and str(workspace_id).strip():
             ws = await self._validate_workspace_access(user, workspace_id)
             ws_name = ws.name
             target_ws_id = ws.id
+        else:
+            self._require_global_chat_admin(user)
 
         now = datetime.now(timezone.utc)
         conv = Conversation(
@@ -193,7 +278,7 @@ class ConversationService:
     async def list_conversations(
         self,
         user: User,
-        workspace_id: uuid.UUID | None = None,
+        workspace_id: uuid.UUID | str | None = None,
         limit: int = 50,
     ) -> list[ConversationResponse]:
         """
@@ -201,9 +286,11 @@ class ConversationService:
         If workspace_id is supplied, validates workspace authorization and scopes results.
         """
         target_ws_id: uuid.UUID | None = None
-        if workspace_id is not None:
+        if workspace_id is not None and str(workspace_id).strip():
             ws = await self._validate_workspace_access(user, workspace_id)
             target_ws_id = ws.id
+        else:
+            self._require_global_chat_admin(user)
 
         stmt = (
             select(
@@ -245,26 +332,37 @@ class ConversationService:
 
     async def get_conversation_detail(
         self,
-        conversation_id: uuid.UUID,
+        conversation_id: uuid.UUID | str,
         user: User,
     ) -> ConversationDetailResponse:
         """
         Fetches full conversation history for the authenticated user.
         Validates workspace authorization if conversation belongs to a workspace.
         """
+        conv_uuid: uuid.UUID | None = None
+        try:
+            conv_uuid = uuid.UUID(str(conversation_id))
+        except (ValueError, TypeError, AttributeError):
+            conv_uuid = None
+
+        if not conv_uuid:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
         stmt = (
             select(Conversation)
             .options(selectinload(Conversation.messages))
-            .where(Conversation.id == conversation_id)
+            .where(Conversation.id == conv_uuid)
         )
-        if user.role != "ADMIN":
-            stmt = stmt.where(Conversation.user_id == user.id)
+        # Conversation history is private to its owner, including administrator threads.
+        stmt = stmt.where(Conversation.user_id == user.id)
 
         conv = await self.session.scalar(stmt)
         if not conv:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        if conv.workspace_id is not None:
+        if conv.workspace_id is None:
+            self._require_global_chat_admin(user)
+        else:
             await self._validate_workspace_access(user, conv.workspace_id)
 
         messages_resp = [
@@ -292,21 +390,35 @@ class ConversationService:
 
     async def delete_conversation(
         self,
-        conversation_id: uuid.UUID,
+        conversation_id: uuid.UUID | str,
         user: User,
     ) -> dict[str, str]:
         """
         Deletes a conversation and cascades to its messages.
         """
-        stmt = select(Conversation).where(Conversation.id == conversation_id)
-        if user.role != "ADMIN":
-            stmt = stmt.where(Conversation.user_id == user.id)
+        conv_uuid: uuid.UUID | None = None
+        try:
+            conv_uuid = uuid.UUID(str(conversation_id))
+        except (ValueError, TypeError, AttributeError):
+            conv_uuid = None
+
+        if not conv_uuid:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Administrators can administer the platform, but do not automatically own
+        # or gain access to another user's private conversation history.
+        stmt = select(Conversation).where(
+            Conversation.id == conv_uuid,
+            Conversation.user_id == user.id,
+        )
 
         conv = await self.session.scalar(stmt)
         if not conv:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        if conv.workspace_id is not None:
+        if conv.workspace_id is None:
+            self._require_global_chat_admin(user)
+        else:
             await self._validate_workspace_access(user, conv.workspace_id)
 
         await self.session.delete(conv)
@@ -387,61 +499,74 @@ class ConversationService:
     async def get_or_create_conversation(
         self,
         user: User,
-        conversation_id: uuid.UUID | None,
+        conversation_id: uuid.UUID | str | None,
         initial_query: str,
-        workspace_id: uuid.UUID | None = None,
+        workspace_id: uuid.UUID | str | None = None,
     ) -> Conversation:
         """
         Ensures a conversation exists for the request.
         If conversation_id is passed, verifies ownership and workspace authorization.
-        If not, creates a new one in the target workspace with a deterministic title from the query.
+        If not found or not provided, creates a new one in the target workspace.
         """
-        if conversation_id is not None:
-            stmt = select(Conversation).where(Conversation.id == conversation_id)
-            if user.role != "ADMIN":
-                stmt = stmt.where(Conversation.user_id == user.id)
+        is_global_request = workspace_id is None or not str(workspace_id).strip()
+        if is_global_request:
+            self._require_global_chat_admin(user)
 
-            conv = await self.session.scalar(stmt)
-            if not conv:
-                raise HTTPException(status_code=404, detail="Conversation not found")
+        # Resolve target workspace if specified
+        target_ws: Workspace | None = None
+        target_ws_id: uuid.UUID | None = None
+        if not is_global_request:
+            target_ws = await self._validate_workspace_access(user, workspace_id)
+            target_ws_id = target_ws.id
 
-            # Validate scope match between request and existing conversation
-            if workspace_id is None:
-                # Global Chat request: Conversation must be a global conversation (workspace_id is None)
-                if conv.workspace_id is not None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Scope mismatch: Cannot use a workspace-scoped conversation in Global Chat.",
-                    )
-            else:
-                # Workspace Chat request: Conversation must belong to the requested workspace
-                if conv.workspace_id is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Scope mismatch: Cannot use a global conversation in Workspace Chat.",
-                    )
-                conv_ws = await self._validate_workspace_access(user, conv.workspace_id)
-                req_ws = await self._validate_workspace_access(user, workspace_id)
-                if conv_ws.id != req_ws.id:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Conversation belongs to workspace '{conv_ws.name}', not requested workspace '{req_ws.name}'.",
-                    )
+        if conversation_id is not None and str(conversation_id).strip():
+            conv_uuid: uuid.UUID | None = None
+            try:
+                conv_uuid = uuid.UUID(str(conversation_id))
+            except (ValueError, TypeError, AttributeError):
+                conv_uuid = None
 
-            # If the conversation has a placeholder title, assign a deterministic initial title
-            if self.is_placeholder_title(conv.title):
-                conv.title = generate_deterministic_title(initial_query)
-                conv.updated_at = datetime.now(timezone.utc)
-                await self.session.commit()
+            conv: Conversation | None = None
+            if conv_uuid:
+                stmt = select(Conversation).where(
+                    Conversation.id == conv_uuid,
+                    Conversation.user_id == user.id,
+                )
+                conv = await self.session.scalar(stmt)
 
-            return conv
+            if conv:
+                # Validate scope match between request and existing conversation
+                if is_global_request:
+                    # Global Chat request: Conversation must be a global conversation (workspace_id is None)
+                    if conv.workspace_id is not None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Scope mismatch: Cannot use a workspace-scoped conversation in Global Chat.",
+                        )
+                else:
+                    # Workspace Chat request: Conversation must belong to the requested workspace
+                    if conv.workspace_id is None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Scope mismatch: Cannot use a global conversation in Workspace Chat.",
+                        )
+                    conv_ws = await self._validate_workspace_access(user, conv.workspace_id)
+                    req_ws = await self._validate_workspace_access(user, workspace_id)
+                    if conv_ws.id != req_ws.id:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Conversation belongs to workspace '{conv_ws.name}', not requested workspace '{req_ws.name}'.",
+                        )
+
+                # If the conversation has a placeholder title, assign a deterministic initial title
+                if self.is_placeholder_title(conv.title):
+                    conv.title = generate_deterministic_title(initial_query)
+                    conv.updated_at = datetime.now(timezone.utc)
+                    await self.session.commit()
+
+                return conv
 
         # Auto-create new conversation
-        target_ws_id: uuid.UUID | None = None
-        if workspace_id is not None:
-            ws = await self._validate_workspace_access(user, workspace_id)
-            target_ws_id = ws.id
-
         title = generate_deterministic_title(initial_query)
         now = datetime.now(timezone.utc)
         conv = Conversation(
@@ -464,9 +589,11 @@ class ConversationService:
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         """
-        Retrieves relevant prior conversation messages within the authorized Workspace(s).
-        If workspace_id is None, searches across all authorized workspaces for the user.
+        Retrieves relevant prior conversation messages within an authorized Workspace.
+        If workspace_id is None, returns empty list per Global Chat raw-message containment policy.
         """
+        if workspace_id is None:
+            return []
         from rag_app.retrieval.workspace_thread_retriever import WorkspaceThreadRetriever
         return await WorkspaceThreadRetriever.retrieve_workspace_threads(
             session=self.session,
@@ -481,6 +608,7 @@ class ConversationService:
         self,
         conversation_id: uuid.UUID,
         max_turns: int = 5,
+        query: Optional[str] = None,
     ) -> list[dict[str, str]]:
         """
         Retrieves the latest `max_turns` (default 5 turns = 10 messages)
@@ -505,21 +633,81 @@ class ConversationService:
             if msg.role in ("user", "assistant")
         ]
 
-        # Apply memory seam hook for future long-term retrieval
-        return self.apply_memory_seam(conversation_id, active_history)
+        # Apply memory seam hook for persistent personal memory retrieval
+        return await self.apply_memory_seam(conversation_id, active_history, query=query)
 
-    def apply_memory_seam(
+    async def apply_memory_seam(
         self,
         conversation_id: uuid.UUID,
         active_history: list[dict[str, str]],
+        query: Optional[str] = None,
     ) -> list[dict[str, str]]:
         """
-        --- FUTURE SUPERMEMORY SEAM ---
-        Clean architectural hook:
-        When Supermemory is enabled, older conversation history / semantic memories
-        can be extracted and dynamically prepended or injected here.
-        Currently returns active_history unchanged.
+        Retrieves user personal memories within authorized scope and injects them
+        into the active conversation context window under a strict token budget.
         """
+        try:
+            from rag_app.memory.retrieval import MemoryRetrievalService
+            conv = await self.session.get(Conversation, conversation_id)
+            if not conv:
+                return active_history
+
+            mem_resp = await MemoryRetrievalService.retrieve(
+                session=self.session,
+                user_id=conv.user_id,
+                workspace_id=conv.workspace_id,
+                query=query,
+                limit_static=5,
+                limit_dynamic=5,
+                limit_relevant=3,
+            )
+
+            # Deduplicate by ID
+            seen_ids = set()
+            all_mems = []
+            for mem in (mem_resp.static_memories + mem_resp.dynamic_memories + mem_resp.relevant_memories):
+                if mem.id not in seen_ids:
+                    seen_ids.add(mem.id)
+                    all_mems.append(mem)
+
+            if not all_mems:
+                return active_history
+
+            # Format with strict token budget (max 300 tokens ~ 1200 characters)
+            MAX_CHAR_BUDGET = 1200
+            lines = []
+            curr_len = 0
+            for m in all_mems:
+                m_type = m.memory_type.value if hasattr(m.memory_type, "value") else str(m.memory_type)
+                line = f"- [{m_type}] {m.content}"
+                if curr_len + len(line) + 1 > MAX_CHAR_BUDGET:
+                    break
+                lines.append(line)
+                curr_len += len(line) + 1
+
+            if lines:
+                mem_block = "\n".join(lines)
+                memory_entry = {
+                    "role": "system",
+                    "content": f"[User Personal Preferences & Context]\n{mem_block}",
+                    "name": "personal_memory",
+                    "personal_memories": [
+                        {
+                            "id": str(m.id),
+                            "content": m.content,
+                            "canonical_key": m.canonical_key,
+                            "memory_type": getattr(m.memory_type, "value", str(m.memory_type)),
+                            "workspace_id": str(m.workspace_id) if m.workspace_id else None,
+                            "user_id": str(m.user_id) if hasattr(m, "user_id") else str(conv.user_id),
+                            "created_at": m.created_at.isoformat() if hasattr(m, "created_at") and m.created_at else None,
+                        }
+                        for m in all_mems
+                    ],
+                }
+                return [memory_entry] + active_history
+        except Exception as exc:
+            logger.warning(f"apply_memory_seam_failed: {exc}")
+
         return active_history
 
     async def save_user_message(
@@ -562,5 +750,4 @@ class ConversationService:
 
         await self.session.commit()
         return msg
-
 

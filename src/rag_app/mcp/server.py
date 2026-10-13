@@ -1026,7 +1026,7 @@ def get_mcp_server() -> FastMCP:
     return mcp
 
 
-def get_mcp_asgi_app(transport: str = "streamable-http"):
+def get_mcp_asgi_app(transport: str = "sse"):
     """Return the ASGI application for Streamable HTTP or SSE mounting."""
     return mcp.http_app(transport=transport)
 

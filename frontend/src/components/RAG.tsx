@@ -20,6 +20,13 @@ import WorkspaceProviderSettingsModal from './WorkspaceProviderSettingsModal'
 import { NavItem } from './Sidebar'
 import { VisualizationRenderer, VisualizationSpec } from './visualizations'
 import { MarkdownRenderer } from './MarkdownRenderer'
+import {
+  SlashCommandMenu,
+  SlashCommandGuidance,
+  useSlashCommands,
+  getCommandProgressMessage,
+  formatCommandResponse,
+} from './SlashCommandAutocomplete'
 
 type Role = 'user' | 'assistant'
 interface Source { title: string; excerpt: string; }
@@ -290,7 +297,7 @@ const THINKING_STEPS = [
   { label: 'Answer is about to come', icon: '◎' },
 ]
 
-function TypingIndicator() {
+function TypingIndicator({ customLabel }: { customLabel?: string }) {
   const [step, setStep] = useState(0)
   const [visible, setVisible] = useState(true)
 
@@ -303,12 +310,13 @@ function TypingIndicator() {
   }, [])
 
   const current = THINKING_STEPS[step]
+  const displayLabel = customLabel || current.label
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px', opacity: visible ? 1 : 0, transition: 'opacity 0.2s ease' }}>
         <span style={{ fontFamily: 'var(--font-mono)', fontSize: '15px', color: 'var(--color-teal)', animation: 'spin 1.8s linear infinite', display: 'inline-block' }}>{current.icon}</span>
-        <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--color-teal)', letterSpacing: '0.04em' }}>{current.label}</span>
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--color-teal)', letterSpacing: '0.04em' }}>{displayLabel}</span>
       </div>
       <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
         {THINKING_STEPS.map((_, i) => (
@@ -355,7 +363,7 @@ function AssistantMessage({ msg, onVisualize }: { msg: Message; onVisualize?: (m
             </button>
           )}
         </div>
-        {msg.isTyping ? <TypingIndicator /> : (
+        {msg.isTyping ? <TypingIndicator customLabel={msg.text || undefined} /> : (
           <>
             <MarkdownRenderer
               content={msg.text}
@@ -469,6 +477,23 @@ export default function RAG({
   const idRef = useRef(1)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const justCreatedConvIdRef = useRef<string | null>(null)
+
+  const {
+    isOpen: isSlashMenuOpen,
+    selectedIndex: slashSelectedIndex,
+    filteredCommands: slashFilteredCommands,
+    activeCommand: slashActiveCommand,
+    argumentText: slashArgumentText,
+    selectCommand: handleSelectSlashCommand,
+    handleKeyDown: handleSlashKeyDown,
+  } = useSlashCommands({
+    text: input,
+    setText: (newVal) => {
+      setInput(newVal)
+      setTimeout(autoResize, 0)
+    },
+    textareaRef,
+  })
 
   // Workspaces state
   const [allWorkspaces, setAllWorkspaces] = useState<WorkspaceItem[]>(workspaces)
@@ -671,8 +696,10 @@ export default function RAG({
 
   async function send(text: string) {
     if (!text.trim() || isLoading || uploading || !token) return
-    const userMsg: Message = { id: `user-${idRef.current++}`, role: 'user', text: text.trim() }
-    const typingMsg: Message = { id: `typing-${idRef.current++}`, role: 'assistant', text: '', isTyping: true }
+    const trimmed = text.trim()
+    const userMsg: Message = { id: `user-${idRef.current++}`, role: 'user', text: trimmed }
+    const progressLabel = trimmed.startsWith('/') ? getCommandProgressMessage(trimmed) : ''
+    const typingMsg: Message = { id: `typing-${idRef.current++}`, role: 'assistant', text: progressLabel, isTyping: true }
     setMessages((m) => [...m, userMsg, typingMsg])
     setInput('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
@@ -702,7 +729,6 @@ export default function RAG({
         }
       }
 
-      const trimmed = text.trim()
       const isTypingVisualize = trimmed.toLowerCase() === 'visualize this' || trimmed.toLowerCase() === 'visulaize this'
       const lastAsst = [...messages].reverse().find((m) => m.role === 'assistant' && !m.isTyping)
       const targetMsgId = isTypingVisualize && lastAsst ? String(lastAsst.id) : undefined
@@ -735,10 +761,11 @@ export default function RAG({
         setSourcesChunks(res.retrieved_chunks)
       }
 
+      const formattedAnswer = formatCommandResponse(trimmed, res.answer || '')
       setMessages((m) =>
         m.map((msg) =>
           msg.id === typingMsg.id
-            ? { ...msg, id: res.message_id || msg.id, text: res.answer, visualization: res.visualization, sources: mappedSources, metrics: res.execution_metrics, isTyping: false }
+            ? { ...msg, id: res.message_id || msg.id, text: formattedAnswer, visualization: res.visualization, sources: mappedSources, metrics: res.execution_metrics, isTyping: false }
             : msg
         )
       )
@@ -804,6 +831,8 @@ export default function RAG({
   }
 
   function handleKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    const handled = handleSlashKeyDown(e)
+    if (handled) return
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       send(input)
@@ -1265,8 +1294,19 @@ export default function RAG({
               {uploadStatus}
             </div>
           )}
+          {/* Active Command Input Guidance */}
+          <SlashCommandGuidance
+            activeCommand={slashActiveCommand}
+            argumentText={slashArgumentText}
+            onClear={() => {
+              setInput('')
+              setTimeout(autoResize, 0)
+            }}
+          />
+
           <div
             style={{
+              position: 'relative',
               display: 'flex',
               alignItems: 'flex-end',
               gap: '12px',
@@ -1281,6 +1321,14 @@ export default function RAG({
             }}
             onBlurCapture={(e) => (e.currentTarget.style.borderColor = 'var(--color-border)')}
           >
+            {/* Slash Command Autocomplete Dropdown */}
+            <SlashCommandMenu
+              isOpen={isSlashMenuOpen}
+              commands={slashFilteredCommands}
+              selectedIndex={slashSelectedIndex}
+              onSelect={handleSelectSlashCommand}
+            />
+
             <textarea
               ref={textareaRef}
               value={input}
@@ -1289,7 +1337,16 @@ export default function RAG({
                 autoResize()
               }}
               onKeyDown={handleKey}
-              placeholder={uploading ? 'Document is being processed...' : `Ask ${currentWorkspace ? currentWorkspace.name : 'Doot'}…`}
+              aria-expanded={isSlashMenuOpen}
+              aria-autocomplete="list"
+              aria-controls={isSlashMenuOpen ? 'slash-command-menu' : undefined}
+              placeholder={
+                slashActiveCommand
+                  ? (slashActiveCommand.requiresArg && !slashArgumentText.trim()
+                      ? (slashActiveCommand.example ? `e.g. ${slashActiveCommand.example.replace(slashActiveCommand.command, '').trim()}` : `Enter argument for ${slashActiveCommand.command}…`)
+                      : 'Press Enter to execute command…')
+                  : (uploading ? 'Document is being processed...' : `Ask ${currentWorkspace ? currentWorkspace.name : 'Doot'}… (type / for commands)`)
+              }
               disabled={isInputDisabled}
               rows={1}
               style={{

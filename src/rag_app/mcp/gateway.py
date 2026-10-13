@@ -86,14 +86,34 @@ class MCPGateway:
         try:
             # 3. Resolve Request Context (Identity + Scopes)
             context: Optional[MCPRequestContext] = None
-            if tool_name == "run_diagnostics" and not auth_token:
+            resolved_token = auth_token
+            if not resolved_token:
+                try:
+                    from fastmcp.server.dependencies import get_http_request
+                    http_req = get_http_request()
+                    if http_req and "authorization" in http_req.headers:
+                        resolved_token = http_req.headers["authorization"]
+                    elif http_req and getattr(settings, "env", "dev") == "dev":
+                        # External HTTP client (e.g. ChatGPT 'No authentication') in local dev mode
+                        from rag_app.db.models import User
+                        from rag_app.security.authentication import create_access_token
+                        from sqlalchemy import select
+                        dev_admin = await db_session.scalar(
+                            select(User).where(User.role == "ADMIN", User.is_active == True).limit(1)
+                        )
+                        if dev_admin:
+                            resolved_token = f"Bearer {create_access_token(subject=str(dev_admin.id))}"
+                except Exception:
+                    pass
+
+            if tool_name == "run_diagnostics" and not resolved_token:
                 # Diagnostics allows non-authenticated health probes
                 pass
             else:
                 try:
                     context = await resolve_mcp_request_context(
                         session=db_session,
-                        auth_token=auth_token,
+                        auth_token=resolved_token,
                         request_id=req_id,
                     )
                 except MCPAuthenticationError as auth_err:
@@ -142,7 +162,7 @@ class MCPGateway:
             if "user" in sig.parameters and "user" not in call_kwargs and context:
                 call_kwargs["user"] = context.user
             if "auth_token" in sig.parameters and "auth_token" not in call_kwargs:
-                call_kwargs["auth_token"] = auth_token
+                call_kwargs["auth_token"] = resolved_token
 
             # Filter out any kwargs not accepted by handler
             if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):

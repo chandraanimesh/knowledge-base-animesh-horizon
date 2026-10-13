@@ -21,7 +21,7 @@ DbSession = Annotated[AsyncSession, Depends(get_db_session)]
 async def list_conversations(
     session: DbSession,
     user: User = Depends(get_current_user),
-    workspace_id: uuid.UUID | None = Query(default=None),
+    workspace_id: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=100),
 ) -> list[ConversationResponse]:
     """
@@ -37,7 +37,7 @@ async def create_conversation(
     session: DbSession,
     user: User = Depends(get_current_user),
     title: str | None = None,
-    workspace_id: uuid.UUID | None = Query(default=None),
+    workspace_id: str | None = Query(default=None),
 ) -> ConversationResponse:
     """
     Create a new empty conversation for the current user in the given workspace.
@@ -49,7 +49,7 @@ async def create_conversation(
 
 @router.get("/{conversation_id}", response_model=ConversationDetailResponse)
 async def get_conversation(
-    conversation_id: uuid.UUID,
+    conversation_id: str,
     session: DbSession,
     user: User = Depends(get_current_user),
 ) -> ConversationDetailResponse:
@@ -62,7 +62,7 @@ async def get_conversation(
 
 @router.delete("/{conversation_id}")
 async def delete_conversation(
-    conversation_id: uuid.UUID,
+    conversation_id: str,
     session: DbSession,
     user: User = Depends(get_current_user),
 ) -> dict[str, str]:
