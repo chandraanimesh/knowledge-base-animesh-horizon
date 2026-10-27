@@ -68,6 +68,12 @@ class CRMCompanyState:
     retrieval_timestamp: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    people_error: Optional[str] = None
+    opportunities_error: Optional[str] = None
+    people_truncated: bool = False
+    opportunities_truncated: bool = False
+    is_ambiguous: bool = False
+    ambiguous_candidates: list[str] = field(default_factory=list)
 
     @property
     def has_crm_records(self) -> bool:

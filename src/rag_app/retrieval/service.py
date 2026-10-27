@@ -163,10 +163,38 @@ class RetrievalService:
         workspace_id: uuid.UUID | None = None,
     ) -> RetrievalResponse:
 
-        top_k = (
-            top_k
-            or settings.default_top_k
-        )
+        ws_cfg: dict = {}
+        if workspace_id and self.session:
+            from rag_app.db.models import WorkspaceProviderProfile
+            ws_prof = await self.session.scalar(
+                select(WorkspaceProviderProfile).where(
+                    WorkspaceProviderProfile.workspace_id == workspace_id,
+                    WorkspaceProviderProfile.is_active.is_(True),
+                )
+            )
+            if ws_prof and ws_prof.configuration:
+                ws_cfg = ws_prof.configuration
+
+        # Resolve top_k: if caller did not explicitly provide top_k, check workspace configuration override
+        if top_k is None and "top_k" in ws_cfg:
+            try:
+                top_k = int(ws_cfg["top_k"])
+            except (ValueError, TypeError):
+                top_k = settings.default_top_k
+        else:
+            top_k = top_k or settings.default_top_k
+
+        if ws_cfg.get("reranker_enabled") is False:
+            rerank = False
+
+        vector_enabled = ws_cfg.get("vector_search_enabled", True)
+        fts_enabled = ws_cfg.get("fts_enabled", True)
+        reranker_top_k = ws_cfg.get("reranker_top_k")
+        if reranker_top_k is not None:
+            try:
+                reranker_top_k = int(reranker_top_k)
+            except (ValueError, TypeError):
+                reranker_top_k = None
 
         processed_query = (
             self._preprocess_query(query)
@@ -435,6 +463,7 @@ class RetrievalService:
                         strategy_trace=strategy_candidate_counts,
                         chunk_provenance=filtered_prov,
                         chunk_hierarchy=chunk_hierarchy,
+                        query_plan=query_plan,
                     )
 
             elif strategy == RetrievalStrategy.SEMANTIC:
@@ -449,47 +478,51 @@ class RetrievalService:
                     )
                 )
 
-                _vec_start = time.perf_counter()
-                vector_rows = (
-                    await self._vector_search(
-                        query_embedding=query_embedding,
-                        candidate_k=settings.retrieval_candidate_k,
-                        filters=(
-                            query_plan.filters
-                            if retrieval_mode == RetrievalMode.HYBRID
-                            else None
-                        ),
-                        allowed_departments=allowed_departments,
-                        allowed_documents=allowed_documents,
-                        workspace_id=workspace_id,
+                vector_rows = []
+                if vector_enabled:
+                    _vec_start = time.perf_counter()
+                    vector_rows = (
+                        await self._vector_search(
+                            query_embedding=query_embedding,
+                            candidate_k=settings.retrieval_candidate_k,
+                            filters=(
+                                query_plan.filters
+                                if retrieval_mode == RetrievalMode.HYBRID
+                                else None
+                            ),
+                            allowed_departments=allowed_departments,
+                            allowed_documents=allowed_documents,
+                            workspace_id=workspace_id,
+                        )
                     )
-                )
-                record_sub_stage(
-                    "retrieval",
-                    "vector_search",
-                    (time.perf_counter() - _vec_start) * 1000,
-                )
+                    record_sub_stage(
+                        "retrieval",
+                        "vector_search",
+                        (time.perf_counter() - _vec_start) * 1000,
+                    )
 
-                _kw_start = time.perf_counter()
-                keyword_rows = (
-                    await self._keyword_search(
-                        query=retrieval_query,
-                        candidate_k=settings.retrieval_candidate_k,
-                        filters=(
-                            query_plan.filters
-                            if retrieval_mode == RetrievalMode.HYBRID
-                            else None
-                        ),
-                        allowed_departments=allowed_departments,
-                        allowed_documents=allowed_documents,
-                        workspace_id=workspace_id,
+                keyword_rows = []
+                if fts_enabled:
+                    _kw_start = time.perf_counter()
+                    keyword_rows = (
+                        await self._keyword_search(
+                            query=retrieval_query,
+                            candidate_k=settings.retrieval_candidate_k,
+                            filters=(
+                                query_plan.filters
+                                if retrieval_mode == RetrievalMode.HYBRID
+                                else None
+                            ),
+                            allowed_departments=allowed_departments,
+                            allowed_documents=allowed_documents,
+                            workspace_id=workspace_id,
+                        )
                     )
-                )
-                record_sub_stage(
-                    "retrieval",
-                    "keyword_search",
-                    (time.perf_counter() - _kw_start) * 1000,
-                )
+                    record_sub_stage(
+                        "retrieval",
+                        "keyword_search",
+                        (time.perf_counter() - _kw_start) * 1000,
+                    )
                 for chunk, doc, score in vector_rows:
                     chunk_id_str = str(chunk.id)
                     c_time = _format_timestamp(getattr(chunk, "created_at", None))
@@ -618,6 +651,7 @@ class RetrievalService:
                 strategy_trace=strategy_candidate_counts,
                 chunk_provenance=filtered_prov,
                 chunk_hierarchy=chunk_hierarchy,
+                query_plan=query_plan,
             )
 
         # =========================================================
@@ -836,7 +870,8 @@ class RetrievalService:
                 diversity_excluded.append(candidate)
                 continue
 
-            if len(selected) < top_k:
+            target_k = reranker_top_k if (reranker_executed and reranker_top_k is not None) else top_k
+            if len(selected) < target_k:
                 seen_texts.add(normalized_text)
                 document_counts[document_id] = (
                     document_counts.get(document_id, 0) + 1
@@ -1077,6 +1112,7 @@ class RetrievalService:
             strategy_trace=strategy_candidate_counts,
             chunk_provenance=filtered_prov,
             chunk_hierarchy=chunk_hierarchy,
+            query_plan=query_plan,
         )
 
     # =============================================================
@@ -1202,6 +1238,8 @@ class RetrievalService:
 
         if workspace_id is not None:
             statement = statement.where(Document.workspace_id == workspace_id)
+        else:
+            statement = statement.where(Document.workspace_id.is_(None))
 
         statement = (
             statement
@@ -1312,6 +1350,8 @@ class RetrievalService:
 
         if workspace_id is not None:
             statement = statement.where(Document.workspace_id == workspace_id)
+        else:
+            statement = statement.where(Document.workspace_id.is_(None))
 
 
         exec_rows = await self.session.execute(statement)
@@ -1428,6 +1468,8 @@ class RetrievalService:
 
         if workspace_id is not None:
             sec_stmt = sec_stmt.where(Document.workspace_id == workspace_id)
+        else:
+            sec_stmt = sec_stmt.where(Document.workspace_id.is_(None))
 
         sec_stmt = (
             sec_stmt
@@ -1505,6 +1547,8 @@ class RetrievalService:
                         fb_stmt = fb_stmt.where(or_(*doc_conds))
                 if workspace_id is not None:
                     fb_stmt = fb_stmt.where(Document.workspace_id == workspace_id)
+                else:
+                    fb_stmt = fb_stmt.where(Document.workspace_id.is_(None))
 
                 fb_stmt = (
                     fb_stmt
@@ -1572,6 +1616,8 @@ class RetrievalService:
                     child_stmt = child_stmt.where(or_(*doc_conds))
             if workspace_id is not None:
                 child_stmt = child_stmt.where(Document.workspace_id == workspace_id)
+            else:
+                child_stmt = child_stmt.where(Document.workspace_id.is_(None))
             try:
                 exec_child = await self.session.execute(child_stmt)
                 child_rows = exec_child.all() if hasattr(exec_child, "all") else []
@@ -1613,6 +1659,8 @@ class RetrievalService:
                 chunk_stmt = chunk_stmt.where(or_(*doc_conds))
         if workspace_id is not None:
             chunk_stmt = chunk_stmt.where(Document.workspace_id == workspace_id)
+        else:
+            chunk_stmt = chunk_stmt.where(Document.workspace_id.is_(None))
         if filters:
             conditions = self._structured_conditions(filters)
             if conditions:
@@ -1793,6 +1841,8 @@ class RetrievalService:
 
         if workspace_id is not None:
             stmt = stmt.where(Document.workspace_id == workspace_id)
+        else:
+            stmt = stmt.where(Document.workspace_id.is_(None))
 
         stmt = stmt.order_by(
             KnowledgeItem.confidence.desc().nullslast(),
@@ -1934,6 +1984,8 @@ class RetrievalService:
 
             if workspace_id is not None:
                 stmt_2hop = stmt_2hop.where(Document.workspace_id == workspace_id)
+            else:
+                stmt_2hop = stmt_2hop.where(Document.workspace_id.is_(None))
 
             if rel_query.subject_entity:
                 stmt_2hop = stmt_2hop.where(Subj1.canonical_name.ilike(f"%{rel_query.subject_entity.strip()}%"))
@@ -2061,6 +2113,8 @@ class RetrievalService:
 
         if workspace_id is not None:
             stmt = stmt.where(Document.workspace_id == workspace_id)
+        else:
+            stmt = stmt.where(Document.workspace_id.is_(None))
 
         # Predicate filtering
         if rel_query.predicate:

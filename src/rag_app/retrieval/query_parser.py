@@ -6,6 +6,7 @@ from langsmith import traceable
 
 from rag_app.providers.base.llm import LLMProvider
 from rag_app.generation.llm_factory import get_llm
+from rag_app.schemas.artifacts import DownloadableArtifactFormat, OutputPreferences
 from rag_app.schemas.rag import (
     CompanyFilters,
     EvidenceNeed,
@@ -35,26 +36,14 @@ GREETING_PATTERNS = [
 def is_greeting(query: str) -> bool:
     """
     Deterministically detects simple conversational greetings.
-
-    These queries should not consume:
-    - query parser LLM tokens
-    - embeddings
-    - BM25 search
-    - vector search
-    - reranking
     """
     normalized = " ".join(query.strip().split())
-
     if not normalized:
         return False
+    return any(pattern.fullmatch(normalized) for pattern in GREETING_PATTERNS)
 
-    return any(
-        pattern.fullmatch(normalized)
-        for pattern in GREETING_PATTERNS
-    )
 
 HISTORY_PATTERNS = [
-    # Explicit past conversational turns between user and assistant
     re.compile(r"\b(?:what|which|how|why)\b.*\b(?:did\s+(?:i|we|you)\s+(?:ask|say|tell|mention|discuss|talk\s+about|decide)|(?:i|we|you)\s+(?:asked|said|told|mentioned|discussed|decided|talked\s+about))\b", re.IGNORECASE),
     re.compile(r"\b(?:what|which)\s+(?:was|were)\s+(?:my|your|our)\s+(?:previous|earlier|last|prior)\s+(?:question|message|turn|prompt|response|discussion|point)\b", re.IGNORECASE),
     re.compile(r"\b(?:what\s+did\s+(?:i|you|we)\s+(?:ask|say|tell|discuss|mention|talk\s+about|decide))\b", re.IGNORECASE),
@@ -63,42 +52,140 @@ HISTORY_PATTERNS = [
     re.compile(r"\b(?:which\s+of\s+(?:those|these|them)\s+did\s+we\s+(?:discuss|talk\s+about|mention))\b", re.IGNORECASE),
 ]
 
+
 def is_history_query(query: str) -> bool:
     """
     Deterministically detects conversation-history oriented queries.
-    Used to prevent the system from aggressively dropping conversational
-    queries before they can reach the LLM with the injected history.
     """
     normalized = " ".join(query.strip().split())
     if not normalized:
         return False
-        
-    # False positive catchers for common document-retrieval / temporal patterns
     if re.search(r"\b(?:before|after|in|during)\s+(?:19|20)\d{2}\b", normalized, re.IGNORECASE):
         return False
     if re.search(r"\b(?:before|after)\s+(?:launch|implementation|release|deployment|start|ready|completion|deadline|production)\b", normalized, re.IGNORECASE):
         return False
     if re.search(r"\b(?:last|previous|prior)\s+(?:quarter|year|month|week|fiscal|release|sprint|version|edition)\b", normalized, re.IGNORECASE):
         return False
-        
     for pattern in HISTORY_PATTERNS:
         if pattern.search(normalized):
             return True
-            
     return False
 
+
+def is_substantive_format_topic(query: str, format_name: str) -> bool:
+    """
+    Returns True if the format word (e.g. 'pdf', 'json', 'csv', 'docx') is used as a substantive topic
+    (e.g., 'policy on pdf', 'json schema validation') rather than an export/presentation instruction.
+    """
+    q_lower = query.lower()
+    # If the query contains an explicit export action verb linked to the format, it's not merely a policy topic
+    has_export_verb = bool(re.search(
+        r"\b(?:generate|export|download|create|make|bana|kar\s+do|karo|do)\b.*?\b" + format_name + r"\b|\b" + format_name + r"\b.*?\b(?:generate|export|download|create|bana|kar\s+do|karo|do)\b",
+        q_lower,
+    ))
+    if has_export_verb:
+        return False
+
+    topic_patterns = [
+        rf"\b(?:policy\s+(?:on|about|for)|rules?\s+(?:on|for)|guidelines?\s+(?:on|for)|standard\s+(?:on|for)|retention\s+of|about|understanding)\s+.*?\b{format_name}\b",
+        rf"\b{format_name}\s+(?:schema|retention|parser|validation|specification|format\s+rules|files?)\b",
+    ]
+    return any(bool(re.search(pat, q_lower)) for pat in topic_patterns)
+
+
+def parse_output_preferences(query: str, explicit: OutputPreferences | None = None) -> OutputPreferences:
+    """
+    Deterministically extracts multi-output preferences from the user query.
+    Precedence rule: If explicit API preferences are provided, explicit settings override inferred values.
+    """
+    if explicit is not None:
+        return explicit.model_copy()
+
+    q = (query or "").strip()
+    q_lower = q.lower()
+
+    include_chat_summary = True
+    include_inline_json = False
+    include_inline_table = False
+    include_chart = False
+    download_formats: list[DownloadableArtifactFormat] = []
+
+    # Check inline JSON
+    if not is_substantive_format_topic(q, "json"):
+        if re.search(r"\b(?:inline\s+json|(?:detailed\s+)?records?\s+(?:in\s+)?json|json\s+format|json\s+mein)\b", q_lower):
+            include_inline_json = True
+
+    # Check inline table
+    if re.search(r"\b(?:in|as)\s+(?:a\s+)?(?:markdown\s+)?table\b|\btable\b|\btabular\b|table\s+format|tabular\s+format|table\s+mein", q_lower):
+        include_inline_table = True
+
+    # Check chart
+    if re.search(r"\b(?:bar|line|pie|scatter|donut|area)\s+chart\b|\bchart\b|\bgraph\b|\bvisualize\b", q_lower):
+        include_chart = True
+
+    # Check downloadable PDF
+    if not is_substantive_format_topic(q, "pdf"):
+        if re.search(r"\bpdf\s+(?:report|file|export|download)\b|\b(?:generate|export|download|create|bana)\s+.*?\bpdf\b|\bpdf\s+bhi\b|\bek\s+pdf\b", q_lower):
+            if DownloadableArtifactFormat.PDF not in download_formats:
+                download_formats.append(DownloadableArtifactFormat.PDF)
+
+    # Check downloadable CSV
+    if not is_substantive_format_topic(q, "csv"):
+        if re.search(r"\bcsv\s+(?:report|file|export|download)\b|\b(?:generate|export|download|create|bana)\s+.*?\bcsv\b|\bcsv\s+mein\b|\bexport\s+(?:as\s+)?csv\b", q_lower):
+            if DownloadableArtifactFormat.CSV not in download_formats:
+                download_formats.append(DownloadableArtifactFormat.CSV)
+
+    # Check downloadable DOCX / Word
+    if not is_substantive_format_topic(q, "docx") and not is_substantive_format_topic(q, "word"):
+        if re.search(r"\b(?:docx|word\s+doc(?:ument)?)\s+(?:report|file|export|download|document|doc)\b|\b(?:generate|export|download|create|bana)\s+.*?\b(?:docx|word\s+doc(?:ument)?)\b", q_lower):
+            if DownloadableArtifactFormat.DOCX not in download_formats:
+                download_formats.append(DownloadableArtifactFormat.DOCX)
+
+    # Check downloadable JSON file
+    if not is_substantive_format_topic(q, "json"):
+        if re.search(
+            r"\b(?:download|export|generate|create|bana)\s+.*?\bjson\b"
+            r"|\b(?:download|export)\s+(?:as\s+)?json\b"
+            r"|\bjson\s+(?:report|file|export|download|document)\b"
+            r"|\bek\s+json\s+file\b",
+            q_lower,
+        ):
+            if DownloadableArtifactFormat.JSON not in download_formats:
+                download_formats.append(DownloadableArtifactFormat.JSON)
+
+    # Check all formats wildcard
+    if re.search(r"\b(?:all\s+(?:4\s+)?(?:downloadable\s+|file\s+)?formats|all\s+4\s+formats|all\s+formats|every\s+format)\b", q_lower):
+        for f in (DownloadableArtifactFormat.PDF, DownloadableArtifactFormat.CSV, DownloadableArtifactFormat.DOCX, DownloadableArtifactFormat.JSON):
+            if f not in download_formats:
+                download_formats.append(f)
+
+    return OutputPreferences(
+        include_chat_summary=include_chat_summary,
+        include_inline_json=include_inline_json,
+        include_inline_table=include_inline_table,
+        include_chart=include_chart,
+        download_formats=download_formats,
+    )
 
 
 def strip_presentation_instructions(query: str) -> str:
     """
     Strips presentation, formatting, visualization, and chart instructions
     from the query string so semantic retrieval targets factual content.
-    Generic and domain-agnostic.
+    Generic, domain-agnostic, and preserves substantive topic keywords.
     """
     if not query:
         return query
 
-    patterns = [
+    cleaned = query
+    export_patterns = [
+        r"(?:,\s*)?(?:aur\s+)?(?:ek\s+)?pdf\s+report\s+(?:bhi\s+)?(?:generate|bana|create|export)\s*(?:kar\s+do|karo|do)?",
+        r"(?:,\s*)?(?:mujhe\s+)?summary\s+(?:chat\s+mein(?:\s+do)?|in\s+(?:the\s+)?chat|mein\s+do)",
+        r"(?:,\s*)?(?:detailed\s+)?records?\s+(?:in\s+)?json\s+(?:mein(?:\s+do)?|format)?",
+        r"\b(?:generate|export|create|download|make)\s+(?:a\s+)?(?:pdf|csv|docx|word|json)?\s*(?:report|file|document|export)\b",
+        r"\b(?:in|as)\s+(?:a\s+)?(?:pdf|csv|docx|word)\s*(?:report|file|format)?\b",
+        r"\b(?:detailed\s+)?records\s+in\s+json\b",
+        r"\bsummary\s+in\s+chat\b",
         r"\b(?:show|render|visualize|display|draw|plot)\s+(?:this\s+)?(?:as\s+)?(?:a\s+)?(?:bar|line|pie|scatter|donut|area)?\s*(?:chart|graph|table|timeline)\b",
         r"\bas\s+(?:a\s+)?(?:bar|line|pie|scatter|donut|area)?\s*(?:chart|graph|table|timeline|markdown\s+table)\b",
         r"\bin\s+(?:a\s+)?(?:bar|line|pie|scatter|donut|area)?\s*(?:chart|graph|table|timeline|grid|markdown\s+table)\b",
@@ -106,15 +193,126 @@ def strip_presentation_instructions(query: str) -> str:
         r"\b(?:as|in)\s+(?:a\s+)?(?:markdown\s+)?table\b",
         r"\b(?:visualize|plot)\b",
     ]
-    cleaned = query
-    for pat in patterns:
-        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+    for pat in export_patterns:
+        match = re.search(pat, cleaned, flags=re.IGNORECASE)
+        if match:
+            matched_str = match.group(0).lower()
+            if ("pdf" in matched_str and is_substantive_format_topic(query, "pdf")) or \
+               ("json" in matched_str and is_substantive_format_topic(query, "json")):
+                continue
+            cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+
     cleaned = " ".join(cleaned.strip().split())
     # Clean up leading/trailing prepositions or articles or punctuation left over
     cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r"\s+(?:as|in|with|using|like)\s*$", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s+(?:as|in|with|using|like|aur|and)\s*$", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = cleaned.strip("?.,!;: ")
     return cleaned if cleaned else query
+
+
+def detect_web_search_intent(query: str) -> tuple[bool, str | None, bool]:
+    """
+    Deterministically evaluates whether web research is needed, why, and whether internal
+    retrieval is also needed.
+    Returns: (web_search_needed: bool, web_search_reason: str | None, internal_retrieval_needed: bool)
+    """
+    if not query:
+        return False, None, True
+
+    q_lower = query.lower().strip()
+
+    # 1. Explicit web-search requests
+    explicit_patterns = [
+        r"\b(?:search\s+(?:the\s+)?web|web\s+search|google|look\s+up\s+online|search\s+online|browse\s+the\s+web|find\s+on\s+(?:the\s+)?(?:web|internet))\b",
+        r"\b(?:search\s+internet|internet\s+search|check\s+online|find\s+online)\b",
+    ]
+    for pat in explicit_patterns:
+        if re.search(pat, q_lower):
+            has_internal_ref = bool(re.search(r"\b(?:our\s+docs?|internal|company|policy|our\s+files?|repo)\b", q_lower))
+            return True, "explicit_request", has_internal_ref
+
+    # 2. Freshness / current external information needed
+    freshness_patterns = [
+        r"\b(?:latest|current|recent|today(?:'s)?|news|breaking|trends?|updates?|live|as\s+of\s+today|as\s+of\s+now|this\s+week|this\s+month|right\s+now)\b",
+    ]
+    for pat in freshness_patterns:
+        if re.search(pat, q_lower):
+            return True, "freshness", True
+
+    return False, None, True
+
+
+# Regex to match leading web search trigger instructions
+WEB_TRIGGER_PREFIX_PATTERN = re.compile(
+    r"^(?:(?:can|could)\s+you\s+(?:please\s+)?|please\s+)?(?:search\s+(?:the\s+)?(?:web|internet)(?:\s+for)?|"
+    r"web\s+search(?:\s+for)?|"
+    r"google(?:\s+this)?(?:\s+for)?|"
+    r"look\s+up\s+online(?:\s+for)?|"
+    r"search\s+online(?:\s+for)?|"
+    r"browse\s+the\s+web(?:\s+for)?|"
+    r"find\s+on\s+(?:the\s+)?(?:web|internet)(?:\s+for)?|"
+    r"check\s+online(?:\s+for)?|"
+    r"find\s+online(?:\s+for)?)\s*[:.\-–—]*\s*",
+    re.IGNORECASE,
+)
+
+CONVERSATIONAL_PREFIX_PATTERN = re.compile(
+    r"^(?:(?:can|could)\s+you\s+(?:please\s+)?(?:tell\s+me|show\s+me|find|get|check|explain)|"
+    r"please\s+(?:tell\s+me|show\s+me|find|get|check|explain)|"
+    r"i\s+(?:want|need|would\s+like)\s+to\s+(?:know|find|see)|"
+    r"tell\s+me\s+(?:about)?)\s*[:.\-–—]*\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_search_triggers(query: str) -> str:
+    """Strips conversational prefixes and explicit search trigger phrases from the query."""
+    if not query:
+        return ""
+    q = query.strip()
+    prev = None
+    while q != prev:
+        prev = q
+        q = CONVERSATIONAL_PREFIX_PATTERN.sub("", q).strip()
+        q = WEB_TRIGGER_PREFIX_PATTERN.sub("", q).strip()
+    return q
+
+
+def format_web_search_query(query: str, query_plan: QueryPlan | None = None) -> tuple[str, str]:
+    """
+    Deterministically formats and cleans a query for external search engines while preserving
+    intent, entities, locations, numbers, and technical terms.
+
+    Returns:
+        (formatted_query: str, source: str)
+        where source is 'semantic_query', 'prefix_stripped', or 'raw_passthrough'.
+    """
+    if not query or not query.strip():
+        return "", "empty"
+
+    raw_query = query.strip()
+
+    # 1. If QueryPlan provides an enriched, substantive semantic_query distinct from raw
+    if query_plan and query_plan.semantic_query:
+        sq = strip_search_triggers(query_plan.semantic_query)
+        if sq and sq.lower() != raw_query.lower() and len(sq) >= 3:
+            return sq, "semantic_query"
+
+    # 2. Strip search trigger prefixes from raw query
+    stripped = strip_search_triggers(raw_query)
+    if stripped and stripped.lower() != raw_query.lower() and len(stripped) >= 3:
+        # Also strip leading conversational pleasantries if safe
+        conv_stripped = CONVERSATIONAL_PREFIX_PATTERN.sub("", stripped).strip()
+        final_query = conv_stripped if len(conv_stripped) >= 3 else stripped
+        return final_query, "prefix_stripped"
+
+    # 3. Conversational query without explicit trigger prefix
+    conv_stripped = CONVERSATIONAL_PREFIX_PATTERN.sub("", raw_query).strip()
+    if conv_stripped and conv_stripped.lower() != raw_query.lower() and len(conv_stripped) >= 3:
+        return conv_stripped, "prefix_stripped"
+
+    # 4. Direct / short queries pass through safely
+    return raw_query, "raw_passthrough"
 
 
 def extract_deterministic_intent(query: str) -> tuple[InformationNeed, PresentationNeed, EvidenceNeed, bool, str]:
@@ -632,6 +830,7 @@ class QueryParser:
                     "original_query": original_query,
                 },
             )
+            web_needed, web_reason, int_needed = detect_web_search_intent(original_query)
             plan = QueryPlan(
                 semantic_query=cleaned_semantic,
                 filters=CompanyFilters(),
@@ -641,6 +840,9 @@ class QueryParser:
                 evidence_need=det_ev,
                 conversation_required=det_conv,
                 reason=det_reason,
+                web_search_needed=web_needed,
+                web_search_reason=web_reason,
+                internal_retrieval_needed=int_needed,
             )
             plan.entity_search_term = extract_entity_search_term(plan)
             return plan
@@ -663,6 +865,13 @@ class QueryParser:
 
             plan.conversation_required = plan.information_need == InformationNeed.CONVERSATION or det_conv
             plan.reason = det_reason
+            plan.output_preferences = parse_output_preferences(original_query)
+
+            # Web search intent
+            web_needed, web_reason, int_needed = detect_web_search_intent(original_query)
+            plan.web_search_needed = web_needed
+            plan.web_search_reason = web_reason
+            plan.internal_retrieval_needed = int_needed
 
             # Enrich semantic_query with intent-derived terms
             plan.semantic_query = enrich_semantic_query(
@@ -681,6 +890,7 @@ class QueryParser:
                 },
             )
 
+            web_needed, web_reason, int_needed = detect_web_search_intent(original_query)
             plan = QueryPlan(
                 semantic_query=cleaned_semantic,
                 filters=CompanyFilters(),
@@ -690,6 +900,10 @@ class QueryParser:
                 evidence_need=det_ev,
                 conversation_required=det_conv,
                 reason=det_reason,
+                output_preferences=parse_output_preferences(original_query),
+                web_search_needed=web_needed,
+                web_search_reason=web_reason,
+                internal_retrieval_needed=int_needed,
             )
             plan.entity_search_term = extract_entity_search_term(plan)
             return plan

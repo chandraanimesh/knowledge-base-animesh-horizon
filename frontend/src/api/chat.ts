@@ -20,6 +20,40 @@ export interface GenerateRequest {
   provider_overrides?: Record<string, string> | null;
   action?: string | null;
   target_message_id?: string | null;
+  output_preferences?: OutputPreferences | null;
+  execution_mode?: 'fast_path' | 'adaptive_workflow' | null;
+  workflow_idempotency_key?: string | null;
+}
+
+export interface ArtifactMetadata {
+  id: string;
+  format: 'pdf' | 'csv' | 'docx' | 'json';
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  download_url: string;
+  created_at: string;
+  expires_at?: string | null;
+  is_expired?: boolean;
+  error?: string | null;
+}
+
+export interface OutputPreferences {
+  chat_summary?: boolean;
+  include_inline_json?: boolean;
+  include_inline_table?: boolean;
+  download_formats?: Array<'pdf' | 'csv' | 'docx' | 'json'>;
+}
+
+export interface CoverageReport {
+  retrieval_coverage: 'sampled_evidence' | 'exhaustive_census';
+  export_truncation: {
+    is_truncated: boolean;
+    total_extracted_rows: number;
+    exported_rows_count: number;
+    truncation_reason?: string | null;
+  };
+  disclaimer: string;
 }
 
 export interface TokenUsage {
@@ -118,15 +152,38 @@ export interface ExecutionMetrics {
 
 import { VisualizationSpec } from '../components/visualizations/types';
 
+export interface SourceItem {
+  type?: 'document' | 'web_research' | 'shared_knowledge' | 'thread' | 'personal_memory' | string;
+  chunk_id?: string;
+  document_id?: string;
+  department_id?: string;
+  file_name?: string;
+  chunk_index?: number;
+  page_number?: number | null;
+  title?: string;
+  excerpt?: string;
+  url?: string | null;
+  thread_id?: string;
+  thread_title?: string;
+  workspace_name?: string;
+  created_at?: string | null;
+  [key: string]: any;
+}
+
 export interface GenerateResponse {
   answer: string;
   visualization?: VisualizationSpec | null;
   citations: string[];
   retrieved_chunks: RetrievedChunk[];
+  sources?: SourceItem[] | null;
   execution_metrics?: ExecutionMetrics | null;
   conversation_id?: string | null;
   message_id?: string | null;
   conversation_title?: string | null;
+  artifacts?: ArtifactMetadata[];
+  coverage?: CoverageReport | null;
+  workflow_run_id?: string | null;
+  workflow_status?: string | null;
 }
 
 export interface ConversationItem {
@@ -145,9 +202,11 @@ export interface ChatMessageRecord {
   role: 'user' | 'assistant' | 'system';
   content: string;
   visualization?: VisualizationSpec | null;
-  sources?: Array<{ title: string; excerpt: string }> | null;
+  sources?: SourceItem[] | null;
   execution_metrics?: ExecutionMetrics | null;
   created_at: string;
+  artifacts?: ArtifactMetadata[];
+  coverage?: CoverageReport | null;
 }
 
 export interface ConversationDetail {

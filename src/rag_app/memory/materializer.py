@@ -72,7 +72,7 @@ def extract_memory_topic_key(text_val: str) -> str:
         return "user_identity:role"
 
     # 6. User location / residency
-    if any(k in norm for k in ["live in", "located in", "based in", "moving to", "relocated to"]):
+    if any(k in norm for k in ["live in", "located in", "based in", "moving to", "moved to", "relocated to"]):
         return "user_identity:location"
 
     # 7. Language / locale preference
@@ -118,10 +118,11 @@ class MemoryMaterializer:
         session: AsyncSession,
         candidate: MemoryCandidate,
         auto_embed: bool = True,
-    ) -> MemoryItem:
+    ) -> Optional[MemoryItem]:
         """
         Materialize a single MemoryCandidate into PostgreSQL idempotently with embedding.
         Supports both workspace-scoped (workspace_id is UUID) and global (workspace_id is None).
+        Rejects candidates originating before an archive/forget operation on the same canonical key.
         """
         if not candidate.user_id:
             raise ValueError("user_id is required to materialize memory")
@@ -147,6 +148,59 @@ class MemoryMaterializer:
             mem_type,
             candidate.content,
         )
+
+        # 0. Check tombstone: Has this canonical fact been archived/forgotten by the user?
+        # A delayed or retried job whose source event was created on or before the archive timestamp
+        # must NOT resurrect a forgotten memory.
+        from datetime import datetime, timezone
+        from rag_app.db.models import MemoryProcessingJob, ChatMessage
+
+        source_time = None
+        if candidate.source_job_id:
+            job_rec = await session.get(MemoryProcessingJob, candidate.source_job_id)
+            if job_rec:
+                source_time = job_rec.created_at
+        if source_time is None and candidate.message_id:
+            try:
+                msg_uuid = uuid.UUID(str(candidate.message_id))
+                msg_rec = await session.get(ChatMessage, msg_uuid)
+                if msg_rec:
+                    source_time = msg_rec.created_at
+            except Exception:
+                pass
+        if source_time is None:
+            source_time = candidate.valid_from or datetime.now(timezone.utc)
+
+        archived_stmt = (
+            select(MemoryItem)
+            .where(
+                MemoryItem.user_id == candidate.user_id,
+                MemoryItem.canonical_key == canonical_key,
+                MemoryItem.status == "ARCHIVED",
+            )
+        )
+        if candidate.workspace_id is not None:
+            archived_stmt = archived_stmt.where(
+                or_(MemoryItem.workspace_id == candidate.workspace_id, MemoryItem.workspace_id.is_(None))
+            )
+        else:
+            archived_stmt = archived_stmt.where(MemoryItem.workspace_id.is_(None))
+
+        archived_stmt = archived_stmt.order_by(MemoryItem.updated_at.desc()).limit(1)
+        archived_item = (await session.execute(archived_stmt)).scalars().first()
+
+        if archived_item and archived_item.updated_at and source_time <= archived_item.updated_at:
+            logger.info(
+                "skipped_forgotten_memory_materialization",
+                extra={
+                    "event": "skipped_forgotten_memory_materialization",
+                    "user_id": str(candidate.user_id),
+                    "canonical_key": canonical_key,
+                    "archived_at": str(archived_item.updated_at),
+                    "source_time": str(source_time),
+                },
+            )
+            return None
 
         embedding = candidate.embedding
         if embedding is None and auto_embed and candidate.content:
@@ -338,16 +392,28 @@ class MemoryMaterializer:
                 or_(MemoryItem.workspace_id == workspace_id, MemoryItem.workspace_id.is_(None))
             )
 
-        stmt = (
-            update(MemoryItem)
-            .where(*filters)
-            .values(
-                status="ARCHIVED",
-                updated_at=func.now(),
-            )
-        )
-        result = await session.execute(stmt)
-        return result.rowcount > 0
+        item = await session.scalar(select(MemoryItem).where(*filters))
+        if not item:
+            return False
+
+        from datetime import datetime, timezone
+        now_dt = datetime.now(timezone.utc)
+        item.status = "ARCHIVED"
+        item.updated_at = now_dt
+
+        # Invalidate any in-flight / queued source job so it doesn't do wasteful work
+        if item.source_job_id:
+            from rag_app.db.models import MemoryProcessingJob
+            job = await session.get(MemoryProcessingJob, item.source_job_id)
+            if job and job.status in ("PENDING", "RETRY_PENDING", "PROCESSING"):
+                job.status = "SKIPPED_NOT_MEMORABLE"
+                job.error_message = "Skipped: memory was forgotten by user"
+                job.locked_at = None
+                job.locked_by = None
+                job.updated_at = now_dt
+
+        await session.flush()
+        return True
 
     @staticmethod
     async def update_memory(
@@ -443,7 +509,7 @@ async def materialize_memory(
     session: AsyncSession,
     candidate: MemoryCandidate,
     auto_embed: bool = True,
-) -> MemoryItem:
+) -> Optional[MemoryItem]:
     """Convenience functional wrapper matching existing knowledge materializer pattern."""
     return await MemoryMaterializer.materialize_memory(
         session=session,

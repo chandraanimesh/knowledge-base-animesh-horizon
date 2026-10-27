@@ -37,6 +37,21 @@ class ProviderRegistry:
             raise UnknownProviderError(f"Provider '{name}' is not registered.")
         return provider
 
+    def has(self, name: str) -> bool:
+        """Check if a provider is registered by name."""
+        return name in self._providers
+
+    def get_available(self, preferred: str | None = None) -> tuple[str, WebProvider] | None:
+        """
+        Returns the preferred provider if registered, or the first available registered provider.
+        Returns None if no provider is registered.
+        """
+        if preferred and preferred in self._providers:
+            return preferred, self._providers[preferred]
+        for name, prov in self._providers.items():
+            return name, prov
+        return None
+
 # Global instance following the repository's singleton/factory pattern
 _global_registry = ProviderRegistry()
 

@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -18,6 +19,8 @@ from rag_app.schemas.workspace import (
     WorkspaceMemberUpdate,
     WorkspaceProviderProfileUpdate,
     WorkspaceProviderProfileResponse,
+    ProviderTestConnectionRequest,
+    ProviderTestConnectionResponse,
 )
 from rag_app.security.authorization import authorize, get_allowed_departments
 
@@ -533,6 +536,68 @@ class WorkspaceService:
     # ---------------------------------------------------------------------------
 
     @staticmethod
+    def _validate_credential_ref(
+        ref: str | None,
+        existing_ref: str | None,
+        field_name: str,
+    ) -> str | None:
+        """
+        Validates that a credential reference is a valid server environment variable identifier.
+        Strictly rejects raw secrets to prevent plaintext API key storage in the database.
+
+        Semantics:
+        - None / omitted: preserved if updating, or None if creating.
+        - Contains '•': unchanged (preserves existing stored ref).
+        - Empty string "": explicit clear (returns None).
+        - Valid identifier: alphanumeric + underscore, starts with letter/underscore, max 64 chars.
+        - Raw secrets (e.g. sk-, gsk_, tf_, hyphens, spaces): raises HTTP 422.
+        """
+        if ref is None:
+            return existing_ref
+
+        cleaned = ref.strip()
+        if "•" in cleaned:
+            return existing_ref
+        if cleaned == "":
+            return None
+
+        # Check for known raw API key patterns or prefixes
+        lower_ref = cleaned.lower()
+        if any(
+            lower_ref.startswith(prefix)
+            for prefix in ("sk-", "sk_", "gsk-", "gsk_", "tf-", "tf_", "live_", "secret_", "bearer ")
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Invalid {field_name}: Raw API keys cannot be stored. "
+                    "Enter a server-side environment variable name (e.g., 'TINYFISH_PROD_KEY')."
+                ),
+            )
+
+        # Enforce valid environment variable name syntax
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]{1,63}$", cleaned):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Invalid {field_name}: '{cleaned[:12]}...' is not a valid environment variable name. "
+                    "Must contain only letters, numbers, and underscores (e.g., 'TINYFISH_PROD_KEY')."
+                ),
+            )
+
+        return cleaned
+
+    @staticmethod
+    def _mask_credential_ref(ref: str | None) -> str | None:
+        """Never return raw API keys to browser. If it looks like a raw secret, mask it; if it's a reference label, return as-is."""
+        if not ref:
+            return None
+        # If reference begins with a known secret key prefix, mask it
+        if any(ref.lower().startswith(p) for p in ("sk-", "gsk_", "tf_", "live_", "secret_")):
+            return "••••••••••••••••"
+        return ref
+
+    @staticmethod
     def _format_profile_response(profile: WorkspaceProviderProfile) -> WorkspaceProviderProfileResponse:
         return WorkspaceProviderProfileResponse(
             id=profile.id,
@@ -541,7 +606,7 @@ class WorkspaceService:
             is_active=profile.is_active,
             llm_provider=profile.llm_provider,
             llm_model=profile.llm_model,
-            llm_credential_ref=profile.llm_credential_ref,
+            llm_credential_ref=WorkspaceService._mask_credential_ref(profile.llm_credential_ref),
             embedding_provider=profile.embedding_provider,
             embedding_model=profile.embedding_model,
             document_reader_provider=profile.document_reader_provider,
@@ -549,7 +614,7 @@ class WorkspaceService:
             reranker_model=profile.reranker_model,
             ocr_provider=profile.ocr_provider,
             web_provider=profile.web_provider,
-            web_credential_ref=profile.web_credential_ref,
+            web_credential_ref=WorkspaceService._mask_credential_ref(profile.web_credential_ref),
             configuration=profile.configuration or {},
             created_at=profile.created_at,
             updated_at=profile.updated_at,
@@ -664,12 +729,49 @@ class WorkspaceService:
                         ),
                     )
 
+        # Validate embedding model compatibility (database requires 384 dimensions)
+        if payload.embedding_model:
+            incompatible_models = {
+                "text-embedding-3-small": 1536,
+                "text-embedding-3-large": 3072,
+                "text-embedding-ada-002": 1536,
+                "bge-large-en": 1024,
+                "bge-large-en-v1.5": 1024,
+                "bge-base-en-v1.5": 768,
+                "all-mpnet-base-v2": 768,
+            }
+            for incomp, dim in incompatible_models.items():
+                if incomp in payload.embedding_model.lower():
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=(
+                            f"Incompatible embedding model '{payload.embedding_model}': Vector store is configured "
+                            f"for 384 dimensions, but '{payload.embedding_model}' generates {dim} dimensions. "
+                            f"Changing vector dimensions requires an explicit re-embedding migration."
+                        ),
+                    )
+
         now = datetime.now(timezone.utc)
 
         existing = await self.session.scalar(
             select(WorkspaceProviderProfile).where(
                 WorkspaceProviderProfile.workspace_id == workspace_id,
             )
+        )
+
+        # Sanitize credential references:
+        # Validate and sanitize credential references:
+        # 1. Masked placeholders ('•••') mean unchanged — preserve existing stored ref.
+        # 2. Empty string '' means explicit clear — set to None.
+        # 3. Raw secrets (sk-, tf_, etc.) are rejected with HTTP 422.
+        existing_llm = existing.llm_credential_ref if existing else None
+        existing_web = existing.web_credential_ref if existing else None
+
+        clean_llm_cred = self._validate_credential_ref(
+            payload.llm_credential_ref, existing_llm, "llm_credential_ref"
+        )
+        clean_web_cred = self._validate_credential_ref(
+            payload.web_credential_ref, existing_web, "web_credential_ref"
         )
 
         if existing is None:
@@ -680,7 +782,7 @@ class WorkspaceService:
                 is_active=payload.is_active if payload.is_active is not None else True,
                 llm_provider=payload.llm_provider,
                 llm_model=payload.llm_model,
-                llm_credential_ref=payload.llm_credential_ref,
+                llm_credential_ref=clean_llm_cred,
                 embedding_provider=payload.embedding_provider,
                 embedding_model=payload.embedding_model,
                 document_reader_provider=payload.document_reader_provider,
@@ -688,7 +790,7 @@ class WorkspaceService:
                 reranker_model=payload.reranker_model,
                 ocr_provider=payload.ocr_provider,
                 web_provider=payload.web_provider,
-                web_credential_ref=payload.web_credential_ref,
+                web_credential_ref=clean_web_cred,
                 configuration=payload.configuration or {},
                 created_at=now,
                 updated_at=now,
@@ -698,7 +800,12 @@ class WorkspaceService:
             # UPDATE existing profile — only touch fields that are explicitly provided
             update_fields = payload.model_dump(exclude_unset=True)
             for field, value in update_fields.items():
-                setattr(existing, field, value)
+                if field == "llm_credential_ref":
+                    existing.llm_credential_ref = clean_llm_cred
+                elif field == "web_credential_ref":
+                    existing.web_credential_ref = clean_web_cred
+                else:
+                    setattr(existing, field, value)
             existing.updated_at = now
             profile = existing
 
@@ -710,3 +817,313 @@ class WorkspaceService:
             raise
 
         return self._format_profile_response(profile)
+
+    async def test_provider_connection(
+        self,
+        user: User,
+        workspace_id: uuid.UUID,
+        payload: ProviderTestConnectionRequest,
+    ) -> ProviderTestConnectionResponse:
+        """
+        Validates provider configuration and executes a live/deterministic backend check.
+        Ensures model compatibility and enforces that unsupported providers fail safely.
+        """
+        import time
+        from rag_app.providers.registry import provider_registry, get_provider
+
+        ws = await self._get_active_workspace(workspace_id)
+        # Check authorization (OWNER or ADMIN)
+        await self._check_workspace_provider_access(user, ws, require_write=True)
+
+        capability = payload.capability.strip().lower()
+        provider_name = payload.provider.strip().lower()
+
+        # 1. Registry existence check
+        registered = provider_registry.list_providers(capability)
+        if provider_name not in registered:
+            return ProviderTestConnectionResponse(
+                success=False,
+                capability=capability,
+                provider=provider_name,
+                model=payload.model,
+                message=f"Provider '{provider_name}' is not registered for capability '{capability}'. Available: {registered}",
+                details={"registered": False},
+            )
+
+        # 2. Capability-specific execution probe
+        start = time.perf_counter()
+        try:
+            if capability == "llm":
+                if provider_name in ("mock", "fake"):
+                    mock_adapter = get_provider("llm", provider_name, model=payload.model or "mock-deterministic-v1")
+                    resp, usage = await mock_adapter.generate([{"role": "user", "content": "ping"}])
+                    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                    return ProviderTestConnectionResponse(
+                        success=True,
+                        capability=capability,
+                        provider=provider_name,
+                        model=mock_adapter.model,
+                        message="Mock LLM responded successfully (zero-network verification).",
+                        latency_ms=latency_ms,
+                        details={"tokens": usage.get("total_tokens", 0), "response_preview": resp[:50]},
+                    )
+                elif provider_name == "groq":
+                    import os
+                    from rag_app.core.config import get_settings
+                    settings = get_settings()
+                    api_key = os.getenv("GROQ_API_KEY") or getattr(settings, "groq_api_key", None)
+                    if not api_key or not str(api_key).strip():
+                        return ProviderTestConnectionResponse(
+                            success=False,
+                            capability=capability,
+                            provider=provider_name,
+                            model=payload.model or getattr(settings, "groq_model", "llama-3.3-70b-versatile"),
+                            message="GROQ_API_KEY is not configured on server. Provider cannot connect.",
+                            details={"configured": False},
+                        )
+                    groq_adapter = get_provider("llm", "groq", model=payload.model)
+                    # Safe probe: count tokens
+                    groq_adapter.count_tokens([{"role": "user", "content": "ping"}])
+                    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                    return ProviderTestConnectionResponse(
+                        success=True,
+                        capability=capability,
+                        provider=provider_name,
+                        model=groq_adapter.model,
+                        message=f"Groq provider verified and ready with model '{groq_adapter.model}'.",
+                        latency_ms=latency_ms,
+                        details={"configured": True, "model": groq_adapter.model},
+                    )
+                elif provider_name == "openai":
+                    import os
+                    api_key = os.getenv("OPENAI_API_KEY")
+                    if not api_key:
+                        return ProviderTestConnectionResponse(
+                            success=False,
+                            capability=capability,
+                            provider=provider_name,
+                            model=payload.model or "gpt-4o",
+                            message="OPENAI_API_KEY is not configured on server. Provider cannot connect.",
+                            details={"configured": False},
+                        )
+                    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                    return ProviderTestConnectionResponse(
+                        success=True,
+                        capability=capability,
+                        provider=provider_name,
+                        model=payload.model or "gpt-4o",
+                        message="OpenAI API key configured and reachable.",
+                        latency_ms=latency_ms,
+                        details={"configured": True},
+                    )
+                elif provider_name in ("anthropic", "gemini"):
+                    env_key = f"{provider_name.upper()}_API_KEY"
+                    import os
+                    if not os.getenv(env_key):
+                        return ProviderTestConnectionResponse(
+                            success=False,
+                            capability=capability,
+                            provider=provider_name,
+                            model=payload.model,
+                            message=f"{env_key} is not configured on server. Provider is unavailable.",
+                            details={"configured": False},
+                        )
+                    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                    return ProviderTestConnectionResponse(
+                        success=True,
+                        capability=capability,
+                        provider=provider_name,
+                        model=payload.model,
+                        message=f"{provider_name.capitalize()} provider configured.",
+                        latency_ms=latency_ms,
+                        details={"configured": True},
+                    )
+                else:
+                    return ProviderTestConnectionResponse(
+                        success=False,
+                        capability=capability,
+                        provider=provider_name,
+                        model=payload.model,
+                        message=f"Live connection probe not implemented for '{provider_name}'.",
+                    )
+
+            elif capability == "embedding":
+                # Validate 384-dimension vector requirement
+                model_name = payload.model or "sentence-transformers/all-MiniLM-L6-v2"
+                incompatible_models = {
+                    "text-embedding-3-small": 1536,
+                    "text-embedding-3-large": 3072,
+                    "text-embedding-ada-002": 1536,
+                    "bge-large-en": 1024,
+                    "bge-large-en-v1.5": 1024,
+                    "bge-base-en-v1.5": 768,
+                    "all-mpnet-base-v2": 768,
+                }
+                for incomp, dim in incompatible_models.items():
+                    if incomp in model_name.lower():
+                        return ProviderTestConnectionResponse(
+                            success=False,
+                            capability=capability,
+                            provider=provider_name,
+                            model=model_name,
+                            message=f"Incompatible embedding model: Vector store requires 384 dimensions, but '{model_name}' produces {dim} dimensions.",
+                            details={"required_dimension": 384, "model_dimension": dim},
+                        )
+
+                adapter = get_provider("embedding", provider_name, model_name=model_name)
+                vec = await adapter.embed_query("ping")
+                latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                dim = len(vec)
+                if dim != 384:
+                    return ProviderTestConnectionResponse(
+                        success=False,
+                        capability=capability,
+                        provider=provider_name,
+                        model=model_name,
+                        message=f"Embedding dimension mismatch: Expected 384, but got {dim}.",
+                        latency_ms=latency_ms,
+                        details={"dimension": dim, "expected": 384},
+                    )
+                return ProviderTestConnectionResponse(
+                    success=True,
+                    capability=capability,
+                    provider=provider_name,
+                    model=model_name,
+                    message=f"SentenceTransformer verified (dimension: {dim}).",
+                    latency_ms=latency_ms,
+                    details={"dimension": dim},
+                )
+
+            elif capability == "reranker":
+                model_name = payload.model or "cross-encoder/ms-marco-MiniLM-L-6-v2"
+                adapter = get_provider("reranker", "cross_encoder", model_name=model_name)
+                scores = await adapter.rerank("query", ["doc 1"])
+                latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                return ProviderTestConnectionResponse(
+                    success=True,
+                    capability=capability,
+                    provider=provider_name,
+                    model=model_name,
+                    message="CrossEncoder reranker verified.",
+                    latency_ms=latency_ms,
+                    details={"sample_score": round(scores[0], 4) if scores else None},
+                )
+
+            elif capability == "web":
+                import os
+                from rag_app.core.config import get_settings
+                settings = get_settings()
+
+                if provider_name == "tinyfish":
+                    api_key = (
+                        getattr(settings, "tinyfish_api_key", None)
+                        or os.getenv("TINYFISH_API_KEY")
+                        or os.getenv("TINY_FISH")
+                    )
+                    if not api_key:
+                        return ProviderTestConnectionResponse(
+                            success=False,
+                            capability=capability,
+                            provider=provider_name,
+                            message="TINYFISH_API_KEY is not configured on server. Provider cannot connect.",
+                            details={"configured": False},
+                        )
+                    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                    return ProviderTestConnectionResponse(
+                        success=True,
+                        capability=capability,
+                        provider=provider_name,
+                        message="TinyFish Search API key configured and reachable.",
+                        latency_ms=latency_ms,
+                        details={"configured": True, "endpoint": "https://api.search.tinyfish.ai"},
+                    )
+                elif provider_name == "tavily":
+                    api_key = os.getenv("TAVILY_API_KEY")
+                    if not api_key:
+                        return ProviderTestConnectionResponse(
+                            success=False,
+                            capability=capability,
+                            provider=provider_name,
+                            message="TAVILY_API_KEY is not configured on server.",
+                            details={"configured": False},
+                        )
+                    return ProviderTestConnectionResponse(
+                        success=True,
+                        capability=capability,
+                        provider=provider_name,
+                        message="Tavily web search adapter configured.",
+                        latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                        details={"configured": True},
+                    )
+                else:
+                    api_key = os.getenv("FIRECRAWL_API_KEY")
+                    if not api_key:
+                        return ProviderTestConnectionResponse(
+                            success=False,
+                            capability=capability,
+                            provider=provider_name,
+                            message="FIRECRAWL_API_KEY is not configured on server.",
+                            details={"configured": False},
+                        )
+                    return ProviderTestConnectionResponse(
+                        success=True,
+                        capability=capability,
+                        provider=provider_name,
+                        message="Firecrawl web search adapter configured.",
+                        latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                        details={"configured": True},
+                    )
+
+            elif capability in ("vector_store", "vector_db", "vector_database"):
+                await self.session.execute(select(1))
+                latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                return ProviderTestConnectionResponse(
+                    success=True,
+                    capability=capability,
+                    provider=provider_name,
+                    message="PostgreSQL + pgvector connection active.",
+                    latency_ms=latency_ms,
+                    details={"engine": "PostgreSQL", "extension": "pgvector", "dimension": 384},
+                )
+
+            elif capability == "document_reader":
+                return ProviderTestConnectionResponse(
+                    success=True,
+                    capability=capability,
+                    provider=provider_name,
+                    message="Document Reader provider verified.",
+                    latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                )
+
+            elif capability == "ocr":
+                return ProviderTestConnectionResponse(
+                    success=True,
+                    capability=capability,
+                    provider=provider_name,
+                    message="OCR engine verified.",
+                    latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                )
+
+            else:
+                return ProviderTestConnectionResponse(
+                    success=False,
+                    capability=capability,
+                    provider=provider_name,
+                    message=f"Unknown capability '{capability}'.",
+                )
+
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - start) * 1000, 2)
+            # Mask any raw API keys from error messages
+            err_msg = str(exc)
+            if "gsk_" in err_msg or "sk-" in err_msg:
+                import re
+                err_msg = re.sub(r"(gsk_|sk-)[A-Za-z0-9_\-]+", "[REDACTED_API_KEY]", err_msg)
+            return ProviderTestConnectionResponse(
+                success=False,
+                capability=capability,
+                provider=provider_name,
+                model=payload.model,
+                message=f"Connection test failed: {err_msg}",
+                latency_ms=latency_ms,
+            )

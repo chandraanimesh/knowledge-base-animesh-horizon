@@ -12,6 +12,8 @@ class GroqLLMAdapter(LLMProvider):
     Wraps ChatGroq for text generation and records observability metrics.
     """
 
+    provider_name: str = "groq"
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -20,12 +22,12 @@ class GroqLLMAdapter(LLMProvider):
         **kwargs: Any,
     ):
         settings = get_settings()
-        self.api_key = api_key or settings.groq_api_key
+        self.api_key = api_key if api_key is not None else settings.groq_api_key
         self.model = model or settings.groq_model
         self.temperature = temperature
         self.extra_kwargs = kwargs
 
-        if not self.api_key:
+        if not self.api_key or not str(self.api_key).strip():
             raise InvalidProviderConfigError(
                 "GROQ_API_KEY is required to initialize GroqLLMAdapter."
             )
@@ -38,6 +40,10 @@ class GroqLLMAdapter(LLMProvider):
             temperature=self.temperature,
             **self.extra_kwargs,
         )
+
+    def count_tokens(self, messages: list[dict[str, str]]) -> int:
+        from rag_app.core.tokenizer import count_messages
+        return count_messages(messages, model=self.model)
 
     async def generate(
         self,
@@ -56,11 +62,18 @@ class GroqLLMAdapter(LLMProvider):
         latency_ms = round((time.perf_counter() - start) * 1000, 2)
 
         usage = response.usage_metadata or {}
+        estimated_input = None
+        try:
+            estimated_input = self.count_tokens(messages)
+        except Exception:
+            estimated_input = None
+
         record_llm_call(
             stage_name=stage,
             usage=usage,
             latency_ms=latency_ms,
-            model_name=getattr(self.llm, "model_name", None),
+            model_name=getattr(self.llm, "model_name", self.model),
+            estimated_prompt_tokens=estimated_input,
         )
 
         if isinstance(response.content, str):

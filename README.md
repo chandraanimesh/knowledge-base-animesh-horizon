@@ -88,38 +88,58 @@ ADMIN_PASSWORD=Admin@12345
 ## 3. Setup & Installation Guide
 
 ### Prerequisites
-1. **PostgreSQL with pgvector**: Ensure PostgreSQL is running on your configured port (e.g. `5433` or `5432`) with the `pgvector` extension installed (`CREATE EXTENSION IF NOT EXISTS vector;`).
-2. **Install `uv`** (Recommended Python Package Manager):
-   ```bash
-   # Windows (PowerShell)
-   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-   # Linux/macOS
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
+
+#### For macOS (Mac):
+```bash
+# 1. Install Homebrew (if not already installed)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# 2. Install Python package manager (uv), Node.js, and PostgreSQL
+brew install uv node postgresql@16
+
+# 3. Install pgvector for PostgreSQL
+brew install pgvector
+
+# 4. Start PostgreSQL service
+brew services start postgresql@16
+
+# 5. Create database & enable pgvector
+createdb ragdb
+psql -d ragdb -c "CREATE EXTENSION IF NOT EXISTS vector;"
+```
+
+#### For Windows:
+```powershell
+# 1. Install uv (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 2. Ensure PostgreSQL with pgvector is running on localhost (default 5432 or 5433)
+```
 
 ---
 
-### Backend Setup
+### Backend Setup (macOS & Windows)
 
-1. **Install Dependencies**:
+1. **Install Python Dependencies**:
    ```bash
    uv sync
    ```
 
-2. **Run Database Migrations**:
+2. **Run Database Migrations** (Creates all core RAG tables + MCP tables):
    ```bash
    uv run alembic upgrade head
    ```
 
-3. **Start the Backend Dev Server**:
+3. **Start the Backend Dev Server** (Exposes API & MCP Server):
    ```bash
    uv run uvicorn rag_app.main:app --reload --port 8000
    ```
    *The backend API and Swagger docs will be live at `http://localhost:8000/docs`.*
+   *The built-in MCP server will be active at `http://localhost:8000/mcp` and `http://localhost:8000/mcp/sse`.*
 
 ---
 
-### Frontend Setup
+### Frontend Setup (macOS & Windows)
 
 1. **Navigate to the frontend directory**:
    ```bash
@@ -138,6 +158,7 @@ ADMIN_PASSWORD=Admin@12345
    *The application UI will be accessible at `http://localhost:5173`.*
 
 ---
+
 
 ## 4. Architecture, Algorithms & Retrieval Processes
 
@@ -234,13 +255,15 @@ MCP uses a **Hub & Spoke** architecture. External AI clients (Cline, Cursor, Cla
 
 ---
 
-### Endpoints
+### Architecture & Supported Protocols
 
-| Endpoint | Protocol | Purpose |
-| :--- | :--- | :--- |
-| `http://localhost:8000/mcp` | HTTP GET | **Discovery & Status**: Returns HTTP 200 with server status, tool count, and SSE endpoints. |
-| `http://localhost:8000/mcp/sse` | Server-Sent Events (SSE) | **Live MCP Stream**: Connection URL for external clients. |
-| `http://localhost:8000/mcp/messages/` | HTTP POST | **JSON-RPC Dispatcher**: Inbound message endpoint for tool execution. |
+The platform provides a **Unified Dual-Transport MCP Gateway** under `/mcp` supporting 52 authoritative tools:
+
+| Endpoint | Protocol | Supported Clients | Purpose |
+| :--- | :--- | :--- | :--- |
+| `http://localhost:8000/mcp` | Streamable HTTP (JSON-RPC) & HTTP GET | **ChatGPT**, Modern MCP Clients, Web Browsers | Direct POST JSON-RPC execution & GET JSON discovery metadata. |
+| `http://localhost:8000/mcp/sse` | Server-Sent Events (SSE) | **Cursor IDE**, **Claude Desktop**, Twenty CRM | Streaming event transport with unbuffered delivery. |
+| `http://localhost:8000/mcp/messages/` | HTTP POST | Standard SSE clients | Inbound JSON-RPC session message dispatcher. |
 
 ---
 
@@ -252,101 +275,110 @@ uv run uvicorn rag_app.main:app --host 127.0.0.1 --port 8000
 Verify status:
 ```bash
 curl http://localhost:8000/mcp
+# Output: {"status":"ready","name":"Production RAG MCP Server","transport":"streamable-http+sse","tools_count":52,...}
 ```
 
 ---
 
-### Step 2: Generate a Local Authentication Token
+### Step 2: Client Setup & Connection Guides
 
-For secure client connections requiring a Bearer token:
-```bash
-uv run python scripts/generate_mcp_token.py
-```
-This prints an active 30-day Admin JWT token and a ready-to-copy configuration block.
+#### 1. ChatGPT (Web & Desktop)
+ChatGPT runs on cloud servers, so it needs a public HTTPS URL to reach your local MCP server.
 
-> **Note on Local Development**: When running with `ENV=dev`, the backend automatically permits connections configured with **"No authentication"** (synthesizing a local development admin context), enabling zero-friction local testing.
+1. **Start a public tunnel** (using Cloudflare or ngrok):
+   - **On macOS**:
+     ```bash
+     brew install cloudflared
+     cloudflared tunnel --url http://localhost:8000
+     ```
+   - **On Windows**:
+     ```powershell
+     cloudflared tunnel --url http://localhost:8000
+     ```
+   Copy the assigned URL (e.g. `https://<random-name>.trycloudflare.com`).
 
----
-
-### Step 3: Connect Your MCP Client
-
-#### Option A: VS Code (Cline / Roo Code / Continue)
-Add to your extension's `settings.json` (MCP Servers section):
-```json
-{
-  "mcpServers": {
-    "twenty-crm": {
-      "url": "http://localhost:3000/mcp",
-      "headers": {
-        "Authorization": "Bearer <YOUR_TWENTY_API_KEY>"
-      }
-    },
-    "production-rag": {
-      "url": "http://localhost:8000/mcp/sse"
-    }
-  }
-}
-```
-
-#### Option B: Cursor / Claude Desktop
-Add to your `claude_desktop_config.json` (Windows: `%APPDATA%\Claude\claude_desktop_config.json`):
-```json
-{
-  "mcpServers": {
-    "twenty-crm": {
-      "url": "http://localhost:3000/mcp",
-      "headers": {
-        "Authorization": "Bearer <YOUR_TWENTY_API_KEY>"
-      }
-    },
-    "production-rag": {
-      "url": "http://localhost:8000/mcp/sse",
-      "headers": {
-        "Authorization": "Bearer <YOUR_GENERATED_RAG_TOKEN>"
-      }
-    }
-  }
-}
-```
-
-#### Option C: ChatGPT ("Add custom MCP server")
-Because ChatGPT runs on cloud servers, expose your local port via a secure tunnel:
-1. Start an HTTPS tunnel:
-   ```bash
-   npx ngrok http 8000
-   ```
-2. In ChatGPT under **Plugins → Add custom MCP server**:
-   - **Name**: `Production RAG`
-   - **Connection**: Select **Server URL** (not Tunnel)
-   - **Server URL**: `https://<your-ngrok-id>.ngrok-free.app/mcp`
+2. **In ChatGPT**:
+   - Go to **Settings → Connected Apps / Custom MCP Server** (or click **+ Add custom MCP server**).
+   - **Name**: `rag` (or `Production RAG`)
+   - **Connection**: Select **Server URL**
+   - **URL**: `https://<your-tunnel-url>.trycloudflare.com/mcp` *(or `/mcp/sse` — both work seamlessly)*
    - **Authentication**: Select **No authentication**
-3. Save and connect.
-
-#### Option D: Interactive Testing with MCP Inspector
-Inspect and test all 52 tools through Anthropic's visual web dashboard:
-```bash
-npx @modelcontextprotocol/inspector
-```
-1. Open the inspector in your browser (`http://localhost:5173`).
-2. Set **Transport** to `SSE`.
-3. Set **URL** to `http://localhost:8000/mcp/sse`.
-4. Click **Connect** and test any tool (e.g. `list_documents`, `rag_ask`, `rag_search`).
+   - Check **"I understand and want to continue"**
+   - Click **Create as a plugin**.
+3. **Usage**: In a new chat, mention `@rag` or ask:
+   > *"Search our workspace documents for company policies and summarize them"*
 
 ---
 
-### Direct CRM Ingestion (Twenty CRM -> RAG)
+#### 2. Cursor IDE (macOS & Windows)
+Cursor runs locally on your machine, so you can connect directly to `localhost` without any tunnel.
 
-To sync company and customer records directly from a local Twenty CRM instance into the RAG vector store without an AI client in the loop:
-1. Ensure your `.env` contains:
-   ```ini
-   TWENTY_BASE_URL=http://localhost:3000
-   TWENTY_API_KEY=your_twenty_api_key_here
-   RAG_BASE_URL=http://localhost:8000
+1. In Cursor, open **Settings (Gear Icon) → Cursor Settings**.
+2. In the left sidebar, navigate to **Features → MCP**.
+3. Click **"+ Add New MCP Server"**:
+   - **Name**: `rag-backend`
+   - **Type**: `sse`
+   - **Server URL**: `http://localhost:8000/mcp/sse`
+4. Click **Add**.
+5. The status indicator will turn green and expose all 52 tools.
+6. **Usage**: In Cursor Composer (`Ctrl + I` on Windows / `Cmd + I` on macOS) or Agent Chat, ask questions about your documents. Cursor will autonomously call `rag_search` and `preview_document`.
+
+---
+
+#### 3. Claude Desktop (macOS & Windows)
+Claude Desktop configures MCP servers via its central JSON configuration file.
+
+1. **Locate the configuration file**:
+   - **On macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+   - **On Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+2. **Add the MCP Server configuration**:
+   ```json
+   {
+     "mcpServers": {
+       "production-rag": {
+         "command": "npx",
+         "args": [
+           "-y",
+           "mcp-remote",
+           "http://localhost:8000/mcp/sse"
+         ]
+       }
+     }
+   }
    ```
-2. Execute the sync runner:
-   ```bash
-   uv run python scripts/twenty_sync_demo.py
-   ```
+3. Restart **Claude Desktop**.
+4. In any chat, click the **Hammer (Tools)** icon at the bottom of the prompt box to inspect the 52 available RAG tools.
+
+---
+
+#### 4. Twenty CRM Integration (Outbound MCP Client)
+Your RAG platform can also act as an **MCP Client** connecting to Twenty CRM running locally (`http://localhost:3000`).
+
+1. Open your RAG frontend at `http://localhost:5173`.
+2. Select your Workspace → navigate to **Settings → MCP Connections** tab.
+3. Click **"Add Connection"**:
+   - **Name**: `Twenty CRM`
+   - **Endpoint URL**: `http://localhost:3000/mcp`
+   - **Transport**: `streamable-http`
+   - **Credential**: Your Twenty CRM API key (or *No Credential* for local testing).
+4. Click **Test Connection** (Status will change to `CONNECTED`).
+5. **Tool Allowlist**:
+   Twenty CRM uses a **Meta-Tool Architecture**. Toggle **ON** the following key tools:
+   - `execute_tool`: Required for creating, updating, and querying records (`create_one_company`, `create_one_person`, `create_one_opportunity`, etc.).
+   - `learn_tools`: Allows the AI agent to inspect schema requirements before creating records.
+   - `list_object_metadata_names`: Allows the AI agent to discover all available CRM objects.
+6. Click **Save Connection**.
+
+---
+
+#### 5. Connecting Any Other CRM (HubSpot, Salesforce, Pipedrive)
+The database schema (`workspace_mcp_connections` & `crm_sync_records`) is **vendor-agnostic and generic**:
+1. In the RAG Frontend (**Settings → MCP Connections**), click **Add Connection**.
+2. Enter the CRM's MCP Server URL (e.g. `https://mcp.hubspot.com/mcp`) and your API Key.
+3. The platform automatically discovers the CRM's tools into a dynamic JSONB schema.
+4. Toggle on the approved tools under the **Default-Deny Policy**.
+5. All records are normalized server-side into canonical `CRMCompanyState` entities (`CRMCompany`, `CRMPerson`, `CRMOpportunity`), requiring **zero database schema migrations**.
+
 
 ---
 

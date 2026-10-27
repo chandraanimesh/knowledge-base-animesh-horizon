@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID,JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
@@ -525,6 +525,10 @@ class Workspace(Base):
         cascade="all, delete-orphan",
         uselist=False,
     )
+    mcp_connections: Mapped[list["WorkspaceMCPConnection"]] = relationship(
+        back_populates="workspace",
+        cascade="all, delete-orphan",
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -666,6 +670,285 @@ class WorkspaceProviderProfile(Base):
         ),
         Index("ix_workspace_provider_profiles_workspace_id", "workspace_id"),
     )
+
+
+class WorkspaceMCPConnection(Base):
+    """
+    Workspace-scoped External MCP Connection.
+    Enforces strict multi-tenant boundary, server-managed credential reference,
+    and default-deny tool allowlist.
+    """
+    __tablename__ = "workspace_mcp_connections"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    endpoint_url: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    transport: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="streamable-http",
+    )
+    credential_ref: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="DISCONNECTED",
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    last_connected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    server_info: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default="{}",
+    )
+    discovered_tools: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default="[]",
+    )
+    enabled_tools: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default="[]",
+    )
+    configuration: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default="{}",
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    workspace: Mapped["Workspace"] = relationship(back_populates="mcp_connections")
+    creator: Mapped["User | None"] = relationship(foreign_keys=[created_by])
+
+    @property
+    def credential_mode(self) -> str:
+        """Explicit credential mode: 'default', 'custom', or 'env_ref'."""
+        if not self.configuration:
+            return "env_ref" if self.credential_ref else "default"
+        return self.configuration.get(
+            "credential_mode",
+            "env_ref" if self.credential_ref else "default",
+        )
+
+    @credential_mode.setter
+    def credential_mode(self, value: str) -> None:
+        cfg = dict(self.configuration or {})
+        cfg["credential_mode"] = str(value).lower()
+        self.configuration = cfg
+
+    @property
+    def encrypted_credential(self) -> str | None:
+        """Ciphertext token of the encrypted custom credential, if configured."""
+        if not self.configuration:
+            return None
+        return self.configuration.get("encrypted_credential")
+
+    @encrypted_credential.setter
+    def encrypted_credential(self, value: str | None) -> None:
+        cfg = dict(self.configuration or {})
+        if value is None:
+            cfg.pop("encrypted_credential", None)
+        else:
+            cfg["encrypted_credential"] = str(value)
+        self.configuration = cfg
+
+    @property
+    def credential_key_version(self) -> str | None:
+        """Version tag of the key used to encrypt the credential."""
+        if not self.configuration:
+            return None
+        return self.configuration.get("credential_key_version")
+
+    @credential_key_version.setter
+    def credential_key_version(self, value: str | None) -> None:
+        cfg = dict(self.configuration or {})
+        if value is None:
+            cfg.pop("credential_key_version", None)
+        else:
+            cfg["credential_key_version"] = str(value)
+        self.configuration = cfg
+
+    @property
+    def has_custom_credential(self) -> bool:
+        """True if an encrypted custom credential is saved on this connection."""
+        return bool(self.encrypted_credential)
+
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "name", name="uq_workspace_mcp_connections_ws_name"),
+        CheckConstraint("status IN ('DISCONNECTED', 'CONNECTED', 'ERROR', 'INITIALIZING')", name="ck_workspace_mcp_connections_status"),
+        CheckConstraint("transport IN ('streamable-http', 'sse')", name="ck_workspace_mcp_connections_transport"),
+        Index("ix_workspace_mcp_connections_ws_enabled", "workspace_id", "is_enabled"),
+    )
+
+
+class MCPToolOperationRecord(Base):
+    """
+    Durable operation record for external MCP tool invocations (Milestone 6C.2).
+    Tracks external write lifecycle, idempotency key correlation, bounded reconciliation,
+    and prevents ambiguous timeouts from being treated as failures or blindly retried.
+    """
+    __tablename__ = "mcp_tool_operation_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspace_mcp_connections.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    tool_name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="PENDING",
+    )
+    arguments: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default="{}",
+    )
+    result_payload: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    retry_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    reconciliation_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    approval_ticket_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflow_tasks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    workspace: Mapped["Workspace"] = relationship()
+    connection: Mapped["WorkspaceMCPConnection"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_mcp_tool_op_ws_idempotency_key"),
+        CheckConstraint(
+            "status IN ('PENDING', 'IN_FLIGHT', 'CONFIRMED', 'FAILED', 'UNKNOWN', 'RECONCILIATION_REQUIRED')",
+            name="ck_mcp_tool_operation_records_status",
+        ),
+        Index("ix_mcp_tool_operation_records_ws_status", "workspace_id", "status"),
+        Index("ix_mcp_tool_operation_records_conn_tool", "connection_id", "tool_name"),
+    )
+
+
 
 
 
@@ -1380,7 +1663,15 @@ class MemoryProcessingJob(Base):
         Index("ix_memory_processing_jobs_status_created", "status", "created_at"),
         Index("ix_memory_processing_jobs_user_status", "owner_user_id", "status"),
         Index("ix_memory_processing_jobs_next_attempt", "status", "next_attempt_at"),
+        Index(
+            "ix_memory_processing_jobs_source_trigger_unique",
+            "source_message_id",
+            "trigger_kind",
+            unique=True,
+            postgresql_where=text("source_message_id IS NOT NULL"),
+        ),
     )
+
 
 
 class MemoryItem(Base):
@@ -1836,6 +2127,1148 @@ class KnowledgeExtractionJob(Base):
     __table_args__ = (
         Index("ix_extraction_jobs_status_created", "status", "created_at"),
         Index("ix_extraction_jobs_locked_at", "locked_at"),
+    )
+
+
+class ConnectionCandidate(Base):
+    __tablename__ = "connection_candidates"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    source_knowledge_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_items.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    source_memory_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("memory_items.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    target_knowledge_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_items.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    target_memory_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("memory_items.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    connection_type: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+    )
+    predicate: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        default="associated_with",
+    )
+    lifecycle_state: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="SUGGESTED",
+        index=True,
+    )
+    is_directed: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=True,
+    )
+    ranking_score: Mapped[float] = mapped_column(
+        nullable=False,
+        default=0.0,
+    )
+    source_version_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    target_version_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    valid_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    transaction_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    transaction_superseded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connection_candidates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    author_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    source_knowledge_item: Mapped["KnowledgeItem | None"] = relationship(
+        foreign_keys=[source_knowledge_item_id]
+    )
+    source_memory_item: Mapped["MemoryItem | None"] = relationship(
+        foreign_keys=[source_memory_item_id]
+    )
+    target_knowledge_item: Mapped["KnowledgeItem | None"] = relationship(
+        foreign_keys=[target_knowledge_item_id]
+    )
+    target_memory_item: Mapped["MemoryItem | None"] = relationship(
+        foreign_keys=[target_memory_item_id]
+    )
+    reviews: Mapped[list["ConnectionCandidateReview"]] = relationship(
+        back_populates="candidate",
+        cascade="all, delete-orphan",
+    )
+    evidence_links: Mapped[list["ConnectionCandidateEvidence"]] = relationship(
+        back_populates="candidate",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "(source_knowledge_item_id IS NOT NULL AND source_memory_item_id IS NULL) OR "
+            "(source_knowledge_item_id IS NULL AND source_memory_item_id IS NOT NULL)",
+            name="chk_candidate_source",
+        ),
+        CheckConstraint(
+            "(target_knowledge_item_id IS NOT NULL AND target_memory_item_id IS NULL) OR "
+            "(target_knowledge_item_id IS NULL AND target_memory_item_id IS NOT NULL)",
+            name="chk_candidate_target",
+        ),
+        Index("ix_connection_candidates_lookup", "source_knowledge_item_id", "target_knowledge_item_id", "predicate"),
+    )
+
+
+class ConnectionCandidateReview(Base):
+    __tablename__ = "connection_candidate_reviews"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    candidate_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connection_candidates.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    reviewer_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    decision: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+    )
+    rationale: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    source_version_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    target_version_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    policy_version: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="v1.0",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    candidate: Mapped["ConnectionCandidate"] = relationship(
+        back_populates="reviews",
+        foreign_keys=[candidate_id],
+    )
+    reviewer: Mapped["User"] = relationship(
+        foreign_keys=[reviewer_user_id],
+    )
+
+
+class ConnectionCandidateEvidence(Base):
+    __tablename__ = "connection_candidate_evidence"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    candidate_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connection_candidates.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    document_chunk_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_chunks.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    chat_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chat_messages.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    research_evidence_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("research_evidence.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    claim_excerpt: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    content_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    verification_status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="VERIFIED",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    candidate: Mapped["ConnectionCandidate"] = relationship(
+        back_populates="evidence_links",
+        foreign_keys=[candidate_id],
+    )
+
+
+class ConnectionDiscoveryJob(Base):
+    __tablename__ = "connection_discovery_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    source_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+    )
+    source_item_type: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+    target_source_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    requesting_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="PENDING",
+        nullable=False,
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        default=3,
+        nullable=False,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    locked_by: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    requesting_user: Mapped["User"] = relationship(foreign_keys=[requesting_user_id])
+
+    __table_args__ = (
+        Index("ix_connection_jobs_status_created", "status", "created_at"),
+        Index("ix_connection_jobs_locked_at", "locked_at"),
+    )
+
+
+class CRMSyncJob(Base):
+    __tablename__ = "crm_sync_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    job_type: Mapped[str] = mapped_column(
+        String(50),
+        default="BATCH_SYNC",
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="PENDING",
+        nullable=False,
+    )
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    checkpoint_cursor: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    total_records: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    processed_records: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    succeeded_records: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    skipped_records: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    failed_records: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+class CRMSyncRecord(Base):
+    __tablename__ = "crm_sync_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("crm_sync_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(
+        String(50),
+        default="twenty_crm",
+        nullable=False,
+    )
+    entity_type: Mapped[str] = mapped_column(
+        String(50),
+        default="company",
+        nullable=False,
+    )
+    external_record_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+    )
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_fingerprint: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="PENDING",
+        nullable=False,
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        default=3,
+        nullable=False,
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "entity_type",
+            "external_record_id",
+            name="uq_crm_sync_records_provider_entity_external",
+        ),
+        Index("ix_crm_sync_records_status_retry", "status", "next_retry_at"),
+    )
+
+
+class CRMWriteBackRecord(Base):
+    __tablename__ = "crm_writeback_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    operation_type: Mapped[str] = mapped_column(
+        String(50),
+        default="NOTE_CREATE",
+        nullable=False,
+    )
+    provider: Mapped[str] = mapped_column(
+        String(50),
+        default="twenty_crm",
+        nullable=False,
+    )
+    external_record_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+    )
+    target_object: Mapped[str] = mapped_column(
+        String(50),
+        default="company",
+        nullable=False,
+    )
+    idempotency_key: Mapped[str] = mapped_column(
+        String(255),
+        unique=True,
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="PENDING",
+        nullable=False,
+    )
+    crm_note_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    crm_note_target_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    note_title: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    summary_content: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    approved_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class CRMWriteBackApproval(Base):
+    __tablename__ = "crm_writeback_approvals"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    operation_type: Mapped[str] = mapped_column(
+        String(50),
+        default="NOTE_CREATE",
+        nullable=False,
+    )
+    external_record_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+    )
+    target_object: Mapped[str] = mapped_column(
+        String(50),
+        default="company",
+        nullable=False,
+    )
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    approved_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="APPROVED",
+        nullable=False,
+    )  # APPROVED, CONSUMED, REVOKED, EXPIRED
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    workflow_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    approved_draft_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    intended_action: Mapped[str] = mapped_column(
+        String(50),
+        default="CRM_CREATE_NOTE",
+        server_default="CRM_CREATE_NOTE",
+        nullable=False,
+    )
+
+    workflow_run: Mapped["WorkflowRun | None"] = relationship(
+        back_populates="approvals",
+        foreign_keys="[CRMWriteBackApproval.workflow_run_id]",
+    )
+
+
+class CRMWebhookEvent(Base):
+    __tablename__ = "crm_webhook_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(255),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    event_name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="RECEIVED",
+        nullable=False,
+    )
+    payload_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class GeneratedArtifact(Base):
+    __tablename__ = "generated_artifacts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chat_messages.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    format: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+    safe_filename: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    mime_type: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    byte_size: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    storage_path: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    checksum_sha256: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    source_departments: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        default=list,
+    )
+    authorized_roles: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        default=list,
+    )
+    tabular_data: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+    coverage_metadata: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    download_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    last_downloaded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    workflow_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    workflow_run: Mapped["WorkflowRun | None"] = relationship(
+        back_populates="artifacts",
+        foreign_keys="[GeneratedArtifact.workflow_run_id]",
+    )
+
+    __table_args__ = (
+        Index("ix_artifacts_user_created", "user_id", "created_at"),
+        Index("ix_artifacts_expires", "expires_at"),
+    )
+
+
+class WorkflowRun(Base):
+    __tablename__ = "workflow_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    scope_type: Mapped[str] = mapped_column(
+        String(20),
+        default="WORKSPACE",
+        nullable=False,
+    )
+    thread_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="PENDING",
+        nullable=False,
+        index=True,
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    request_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    draft_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    initial_query: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    # Budget limits & real-time accounting
+    max_tokens_budget: Mapped[int] = mapped_column(Integer, nullable=False, default=25000)
+    tokens_spent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tokens_reserved: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_provider_calls_budget: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
+    provider_calls_spent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    provider_calls_reserved: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    wall_clock_timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=180)
+
+    # Error classification
+    failure_category: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    # Auditable timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    awaiting_approval_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    executing_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    tasks: Mapped[list["WorkflowTask"]] = relationship(
+        back_populates="workflow_run",
+        cascade="all, delete-orphan",
+        order_by="WorkflowTask.created_at.asc()",
+    )
+    artifacts: Mapped[list["GeneratedArtifact"]] = relationship(
+        back_populates="workflow_run",
+    )
+    approvals: Mapped[list["CRMWriteBackApproval"]] = relationship(
+        back_populates="workflow_run",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'PLANNING', 'RUNNING', 'AWAITING_APPROVAL', 'EXECUTING', 'COMPLETED', 'REJECTED', 'EXPIRED', 'CANCELLED', 'FAILED')",
+            name="ck_workflow_runs_status",
+        ),
+        CheckConstraint(
+            "scope_type IN ('GLOBAL', 'WORKSPACE')",
+            name="ck_workflow_runs_scope_type",
+        ),
+        CheckConstraint(
+            "(scope_type = 'GLOBAL' AND workspace_id IS NULL) OR (scope_type = 'WORKSPACE' AND workspace_id IS NOT NULL)",
+            name="ck_workflow_runs_scope_workspace_consistency",
+        ),
+        CheckConstraint("tokens_spent >= 0", name="ck_workflow_runs_tokens_spent_nonneg"),
+        CheckConstraint("tokens_reserved >= 0", name="ck_workflow_runs_tokens_reserved_nonneg"),
+        CheckConstraint("provider_calls_spent >= 0", name="ck_workflow_runs_calls_spent_nonneg"),
+        CheckConstraint("provider_calls_reserved >= 0", name="ck_workflow_runs_calls_reserved_nonneg"),
+        Index("ix_workflow_runs_status_created", "status", "created_at"),
+        Index(
+            "uq_workflow_runs_user_ws_idempotency",
+            "user_id",
+            "workspace_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL AND workspace_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_workflow_runs_user_global_idempotency",
+            "user_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL AND workspace_id IS NULL"),
+        ),
+    )
+
+
+class WorkflowTask(Base):
+    __tablename__ = "workflow_tasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    workflow_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    task_key: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    task_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(20),
+        default="PENDING",
+        nullable=False,
+        index=True,
+    )
+    dependencies: Mapped[list[str]] = mapped_column(
+        JSONB,
+        default=list,
+        nullable=False,
+    )
+    input_payload: Mapped[dict] = mapped_column(
+        JSONB,
+        default=dict,
+        nullable=False,
+    )
+    output_result: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    tokens_spent: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    provider_calls: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    retry_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    max_retries: Mapped[int] = mapped_column(
+        Integer,
+        default=3,
+        nullable=False,
+    )
+    locked_by: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    fencing_token: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    workflow_run: Mapped["WorkflowRun"] = relationship(
+        back_populates="tasks",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'READY', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'SKIPPED')",
+            name="ck_workflow_task_status",
+        ),
+        UniqueConstraint(
+            "workflow_run_id",
+            "task_key",
+            name="uq_workflow_tasks_run_task_key",
+        ),
+        Index("ix_workflow_tasks_claim", "status", "lease_expires_at"),
     )
 
 

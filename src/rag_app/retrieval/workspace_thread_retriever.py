@@ -76,7 +76,10 @@ class WorkspaceThreadRetriever:
         If workspace_id is provided: scopes search to that single workspace after verifying authorization.
         If workspace_id is None: searches across all workspaces the user is authorized to access.
         """
-        if not user.is_active:
+        from rag_app.schemas.users import UserContext
+        user_ctx = user if isinstance(user, UserContext) else UserContext.from_user(user)
+
+        if not user_ctx.is_active:
             return []
 
         authorized_workspaces: dict[uuid.UUID, str] = {}
@@ -117,23 +120,23 @@ class WorkspaceThreadRetriever:
             logger.warning(f"Department for workspace {ws.name} is inactive or deleted.")
             return []
 
-        if user.role != "ADMIN":
-            if user.role != "USER":
+        if user_ctx.role != "ADMIN":
+            if user_ctx.role != "USER":
                 return []
             # Department VIEW permission check
-            is_dept_auth = await authorize(session, user, "VIEW", dept.code)
+            is_dept_auth = await authorize(session, user_ctx, "VIEW", dept.code)
             if not is_dept_auth:
-                logger.warning(f"User {user.id} unauthorized for department {dept.code}.")
+                logger.warning(f"User {user_ctx.id} unauthorized for department {dept.code}.")
                 return []
             # Workspace membership check
             ws_member = await session.scalar(
                 select(WorkspaceMember).where(
                     WorkspaceMember.workspace_id == ws.id,
-                    WorkspaceMember.user_id == user.id,
+                    WorkspaceMember.user_id == user_ctx.id,
                 )
             )
             if not ws_member:
-                logger.warning(f"User {user.id} is not a member of workspace {ws.name}.")
+                logger.warning(f"User {user_ctx.id} is not a member of workspace {ws.name}.")
                 return []
 
         authorized_workspaces[ws.id] = ws.name

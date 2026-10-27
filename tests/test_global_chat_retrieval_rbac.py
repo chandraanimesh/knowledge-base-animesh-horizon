@@ -198,7 +198,8 @@ async def setup_test_data(db_session: AsyncSession):
 async def test_admin_global_conversation_retrieval(db_session: AsyncSession, setup_test_data):
     """
     Test 1: ADMIN asks 'What did ABC Company discuss?' in Global Chat.
-    Expected: ADMIN retrieves conversation evidence across Sales, Finance, and HR workspaces.
+    Expected: Policy containment - Global Chat (workspace_id=None) returns 0 raw cross-workspace employee threads.
+    Approved shared organizational knowledge requires explicit sharing/approval policies.
     """
     data = setup_test_data
     admin_user = data["users"]["ADMIN"]
@@ -211,38 +212,40 @@ async def test_admin_global_conversation_retrieval(db_session: AsyncSession, set
         limit=10,
     )
 
-    assert len(results) >= 3, "ADMIN Global Chat should retrieve messages from multiple workspaces"
-    workspaces_found = {r["workspace_name"] for r in results if r.get("workspace_name")}
-    assert "Sales Test Workspace" in workspaces_found
-    assert "Finance Test Workspace" in workspaces_found
-    assert "HR Test Workspace" in workspaces_found
-
-    contents = " ".join(r["content"] for r in results)
-    assert "pricing discount" in contents
-    assert "confidential financial terms" in contents
-    assert "executive hiring" in contents
+    assert len(results) == 0, "Global Chat must NOT retrieve raw cross-workspace employee conversation threads"
 
 
 @pytest.mark.asyncio
 async def test_sales_user_global_conversation_retrieval_isolation(db_session: AsyncSession, setup_test_data):
     """
-    Test 2 & 3: SALES_USER asks 'What did ABC Company discuss?' in Global Chat.
-    Expected: Can use ONLY authorized Sales information.
-    Must NOT retrieve Finance or HR messages.
+    Test 2 & 3: SALES_USER asks in Global Chat vs Workspace Chat.
+    Expected: Global Chat returns 0 raw cross-workspace threads.
+    Workspace Chat retrieves authorized Sales messages only, with zero Finance or HR leaks.
     """
     data = setup_test_data
     sales_user = data["users"]["SALES"]
+    sales_ws = data["workspaces"]["WS_SALES_TEST"]
 
-    results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+    # Global Chat scope containment
+    global_results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
         session=db_session,
         user=sales_user,
         workspace_id=None,  # Global Scope
         query="What did ABC Company discuss?",
         limit=10,
     )
+    assert len(global_results) == 0, "Global Chat must return 0 raw conversation threads"
 
-    assert len(results) > 0, "Sales user should retrieve authorized Sales messages"
-    for r in results:
+    # Workspace Chat scope
+    ws_results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+        session=db_session,
+        user=sales_user,
+        workspace_id=sales_ws.id,
+        query="What did ABC Company discuss?",
+        limit=10,
+    )
+    assert len(ws_results) > 0, "Sales user should retrieve authorized Sales messages in workspace scope"
+    for r in ws_results:
         assert r["workspace_name"] == "Sales Test Workspace", f"Unauthorized workspace data leaked: {r['workspace_name']}"
         assert "confidential financial terms" not in r["content"], "Finance content leaked to Sales user"
         assert "executive hiring" not in r["content"], "HR content leaked to Sales user"
@@ -276,22 +279,34 @@ async def test_sales_user_explicit_unauthorized_finance_query(db_session: AsyncS
 @pytest.mark.asyncio
 async def test_finance_user_global_conversation_retrieval(db_session: AsyncSession, setup_test_data):
     """
-    Test 4: FINANCE_USER asks 'What did ABC Company discuss?'.
-    Expected: Retrieves Finance information, but NOT Sales or HR.
+    Test 4: FINANCE_USER asks in Global Chat vs Workspace Chat.
+    Expected: Global Chat returns 0 raw cross-workspace threads.
+    Workspace Chat retrieves Finance information, but NOT Sales or HR.
     """
     data = setup_test_data
     fin_user = data["users"]["FINANCE"]
+    fin_ws = data["workspaces"]["WS_FINANCE_TEST"]
 
-    results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+    # Global Chat scope containment
+    global_results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
         session=db_session,
         user=fin_user,
         workspace_id=None,
         query="What did ABC Company discuss?",
         limit=10,
     )
+    assert len(global_results) == 0, "Global Chat must return 0 raw conversation threads"
 
-    assert len(results) > 0
-    for r in results:
+    # Workspace Chat scope
+    ws_results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+        session=db_session,
+        user=fin_user,
+        workspace_id=fin_ws.id,
+        query="What did ABC Company discuss?",
+        limit=10,
+    )
+    assert len(ws_results) > 0
+    for r in ws_results:
         assert r["workspace_name"] == "Finance Test Workspace"
         assert "Sales Test Workspace" != r["workspace_name"]
         assert "HR Test Workspace" != r["workspace_name"]
@@ -300,22 +315,34 @@ async def test_finance_user_global_conversation_retrieval(db_session: AsyncSessi
 @pytest.mark.asyncio
 async def test_hr_user_global_conversation_retrieval(db_session: AsyncSession, setup_test_data):
     """
-    Test 6: HR_USER asks 'What did ABC Company discuss?'.
-    Expected: Retrieves HR information, but NOT Sales or Finance.
+    Test 6: HR_USER asks in Global Chat vs Workspace Chat.
+    Expected: Global Chat returns 0 raw cross-workspace threads.
+    Workspace Chat retrieves HR information, but NOT Sales or Finance.
     """
     data = setup_test_data
     hr_user = data["users"]["HR"]
+    hr_ws = data["workspaces"]["WS_HR_TEST"]
 
-    results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+    # Global Chat scope containment
+    global_results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
         session=db_session,
         user=hr_user,
         workspace_id=None,
         query="What did ABC Company discuss?",
         limit=10,
     )
+    assert len(global_results) == 0, "Global Chat must return 0 raw conversation threads"
 
-    assert len(results) > 0
-    for r in results:
+    # Workspace Chat scope
+    ws_results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+        session=db_session,
+        user=hr_user,
+        workspace_id=hr_ws.id,
+        query="What did ABC Company discuss?",
+        limit=10,
+    )
+    assert len(ws_results) > 0
+    for r in ws_results:
         assert r["workspace_name"] == "HR Test Workspace"
         assert "Sales Test Workspace" != r["workspace_name"]
         assert "Finance Test Workspace" != r["workspace_name"]
@@ -325,24 +352,52 @@ async def test_hr_user_global_conversation_retrieval(db_session: AsyncSession, s
 async def test_multi_department_user_retrieval(db_session: AsyncSession, setup_test_data):
     """
     Test 16: MULTI_DEPT_USER (Sales + Finance).
-    Expected: Retrieves Sales + Finance messages, but zero HR messages.
+    Expected: Global Chat returns 0 raw cross-workspace threads.
+    Scoped workspace queries retrieve Sales and Finance messages, but zero HR messages.
     """
     data = setup_test_data
     multi_user = data["users"]["MULTI"]
+    sales_ws = data["workspaces"]["WS_SALES_TEST"]
+    fin_ws = data["workspaces"]["WS_FINANCE_TEST"]
+    hr_ws = data["workspaces"]["WS_HR_TEST"]
 
-    results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+    # Global Chat containment
+    global_results = await WorkspaceThreadRetriever.retrieve_workspace_threads(
         session=db_session,
         user=multi_user,
         workspace_id=None,
         query="What did ABC Company discuss?",
         limit=10,
     )
+    assert len(global_results) == 0, "Global Chat must return 0 raw conversation threads"
 
-    assert len(results) >= 2
-    ws_names = {r["workspace_name"] for r in results}
-    assert "Sales Test Workspace" in ws_names
-    assert "Finance Test Workspace" in ws_names
-    assert "HR Test Workspace" not in ws_names, "HR workspace data must NOT leak to user authorized only for Sales + Finance"
+    # Authorized workspace retrieval
+    sales_res = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+        session=db_session,
+        user=multi_user,
+        workspace_id=sales_ws.id,
+        query="What did ABC Company discuss?",
+        limit=10,
+    )
+    fin_res = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+        session=db_session,
+        user=multi_user,
+        workspace_id=fin_ws.id,
+        query="What did ABC Company discuss?",
+        limit=10,
+    )
+    hr_res = await WorkspaceThreadRetriever.retrieve_workspace_threads(
+        session=db_session,
+        user=multi_user,
+        workspace_id=hr_ws.id,
+        query="What did ABC Company discuss?",
+        limit=10,
+    )
+
+    assert len(sales_res) > 0
+    assert len(fin_res) > 0
+    assert len(hr_res) == 0, "HR workspace data must NOT leak to user authorized only for Sales + Finance"
+
 
 
 @pytest.mark.asyncio

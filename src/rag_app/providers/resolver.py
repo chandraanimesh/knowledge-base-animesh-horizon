@@ -100,9 +100,19 @@ async def resolve_providers_for_workspace(
             if provider_name:
                 source = "workspace_default"
 
+        # Prepare profile kwargs (e.g. model)
+        kwargs: dict[str, Any] = {}
+        if profile is not None:
+            if capability == "llm" and profile.llm_model:
+                kwargs["model"] = profile.llm_model
+            elif capability == "embedding" and profile.embedding_model:
+                kwargs["model_name"] = profile.embedding_model
+            elif capability == "reranker" and profile.reranker_model:
+                kwargs["model_name"] = profile.reranker_model
+
         if provider_name:
             try:
-                resolved[capability] = get_provider(capability, provider_name)
+                resolved[capability] = get_provider(capability, provider_name, **kwargs)
                 logger.debug(
                     "workspace_provider_resolved",
                     extra={

@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,8 +19,22 @@ class Settings(BaseSettings):
     groq_api_key: str | None = None
     groq_model: str = "openai/gpt-oss-20b"
 
-    firecrawl_api_key: str | None = None
+    firecrawl_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("firecrawl_api_key", "FIRECRAWL_API_KEY"),
+    )
     firecrawl_base_url: str | None = None
+
+    web_search_provider: str = Field(
+        default="tinyfish",
+        validation_alias=AliasChoices("web_search_provider", "WEB_SEARCH_PROVIDER", "web_provider", "WEB_PROVIDER"),
+    )
+    tinyfish_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("tinyfish_api_key", "TINYFISH_API_KEY", "TINY_FISH", "tiny_fish"),
+    )
+    tinyfish_search_url: str = "https://api.search.tinyfish.ai"
+    tinyfish_fetch_url: str = "https://api.fetch.tinyfish.ai"
 
     chunk_size: int = 900
     chunk_overlap: int = 150
@@ -34,7 +49,14 @@ class Settings(BaseSettings):
     structured_search_weight: float = 2.0
     hierarchical_search_weight: float = 0.8
     hierarchical_max_descendant_depth: int = 3
-    enable_web_research: bool = False
+    enable_web_research: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("enable_web_research", "ENABLE_WEB_RESEARCH"),
+    )
+    web_research_target_pages: int = 2
+    web_research_max_scrapes: int = 4
+    web_research_max_candidates_per_domain: int = 1
+    enable_conversational_memory_extraction: bool = False
     unsafe_bypass_security_preprocessing: bool = False
     stirling_pdf_url: str | None = None
     stirling_api_key: str | None = None
@@ -60,6 +82,25 @@ class Settings(BaseSettings):
     twenty_api_key: str | None = None
     twenty_timeout_seconds: float = 5.0
     enable_crm_integration: bool = True
+    enable_connection_discovery: bool = True
+    twenty_mcp_enabled: bool = False
+    twenty_mcp_url: str | None = None
+    twenty_crm_department_id: str | None = None
+    twenty_webhook_secret: str | None = None
+    twenty_webhook_max_bytes: int = 1024 * 1024  # 1 MB safe default
+
+    # Multi-format artifact storage and retention settings
+    artifact_storage_dir: str = "storage/artifacts"
+    artifact_retention_hours: int = 48
+    artifact_max_bytes: int = 25 * 1024 * 1024
+    artifact_max_rows: int = 500
+
+    # Dedicated encryption key for workspace custom credentials (Fernet / MultiFernet)
+    app_encryption_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("app_encryption_key", "APP_ENCRYPTION_KEY"),
+        description="Dedicated Fernet key or comma-separated keys for MultiFernet rotation. Never derived from JWT_SECRET.",
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

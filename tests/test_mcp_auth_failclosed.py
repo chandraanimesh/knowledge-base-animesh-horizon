@@ -30,6 +30,8 @@ from rag_app.mcp.server import (
     get_current_user_access,
     admin_list_users,
     rag_search,
+    run_diagnostics,
+    list_documents,
 )
 from rag_app.security.authentication import create_access_token
 
@@ -233,3 +235,126 @@ async def test_sanitized_audit_logging_no_secrets(auth_test_users, caplog):
     assert user_token not in raw_logs
     assert "jwt_secret" not in raw_logs
     assert "[MCP-GATEWAY]" in raw_logs
+
+
+# ── 9. Dev Mode Unauthenticated Request Fails Closed ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_dev_mode_unauthenticated_request_fails_closed(monkeypatch):
+    """Ensure that in dev mode (settings.env == 'dev'), unauthenticated requests fail closed with 401."""
+    monkeypatch.setattr(settings, "env", "dev")
+
+    # Mock get_http_request to simulate an external HTTP call without authorization header
+    class FakeHttpRequest:
+        headers = {}
+
+    import fastmcp.server.dependencies
+    monkeypatch.setattr(fastmcp.server.dependencies, "get_http_request", lambda: FakeHttpRequest())
+
+    with pytest.raises(MCPGatewayError) as exc_info:
+        await get_current_user_profile(auth_token=None)
+    assert exc_info.value.code == "AUTHENTICATION_REQUIRED"
+    assert exc_info.value.status_code == 401
+
+
+# ── 10. Milestone 6A.1: Diagnostics Security & Scope Regression ───────────────
+
+@pytest.mark.asyncio
+async def test_diagnostics_unauthenticated_returns_only_minimal_public_probe():
+    """
+    Unauthenticated call to run_diagnostics must return ONLY a minimal public health probe.
+    Must strictly NOT disclose database counts, user counts, department counts,
+    document counts, chunk counts, pgvector status, or internal model configurations.
+    """
+    res = await run_diagnostics(include_rag_smoketest=False, auth_token=None)
+    assert isinstance(res, dict)
+    assert res.get("status") == "healthy"
+    assert res.get("authenticated") is False
+    assert res.get("public_probe") is True
+
+    # Critical assertions: zero leak of database counts or internal infrastructure
+    assert "database" not in res
+    assert "tables" not in res
+    assert "models" not in res
+    assert "imports" not in res
+    assert "runtime" not in res
+    assert "documents" not in str(res)
+    assert "document_chunks" not in str(res)
+    assert "departments" not in str(res)
+    assert "users" not in str(res)
+    assert "pgvector" not in str(res)
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_invalid_token_fails_closed():
+    """Invalid token passed to run_diagnostics must fail closed with 401 AUTHENTICATION_REQUIRED."""
+    with pytest.raises(MCPGatewayError) as exc_info:
+        await run_diagnostics(include_rag_smoketest=False, auth_token="Bearer invalid_token_signature_xyz")
+    assert exc_info.value.code == "AUTHENTICATION_REQUIRED"
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_expired_token_fails_closed(auth_test_users):
+    """Expired token passed to run_diagnostics must fail closed with 401 AUTHENTICATION_REQUIRED."""
+    user = auth_test_users["active_user"]
+    expired_token = f"Bearer {create_access_token(subject=str(user.id), expires_delta=timedelta(seconds=-60))}"
+
+    with pytest.raises(MCPGatewayError) as exc_info:
+        await run_diagnostics(include_rag_smoketest=False, auth_token=expired_token)
+    assert exc_info.value.code == "AUTHENTICATION_REQUIRED"
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_insufficient_scope_fails_closed(auth_test_users):
+    """Token with restricted scopes excluding 'diagnostics' must fail closed with 403 FORBIDDEN."""
+    user = auth_test_users["active_user"]
+    # Issue token with only 'identity.read' and 'rag.read' (lacks 'diagnostics')
+    payload = {
+        "sub": str(user.id),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=15),
+        "scopes": ["identity.read", "rag.read"],
+    }
+    scoped_token = f"Bearer {jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)}"
+
+    with pytest.raises(MCPGatewayError) as exc_info:
+        await run_diagnostics(include_rag_smoketest=False, auth_token=scoped_token)
+    assert exc_info.value.code == "FORBIDDEN"
+    assert exc_info.value.status_code == 403
+    assert "diagnostics" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_authorized_call_returns_detailed_report(auth_test_users):
+    """Authorized caller with 'diagnostics' scope receives the full, detailed system report."""
+    admin_token = auth_test_users["admin_token"]
+    res = await run_diagnostics(include_rag_smoketest=False, auth_token=admin_token)
+
+    assert isinstance(res, dict)
+    assert res.get("status") in ("healthy", "degraded")
+    assert "runtime" in res
+    assert "imports" in res
+    assert "database" in res
+    assert "models" in res
+    assert "rag" in res
+    assert res["database"].get("connected") is True
+    assert "tables" in res["database"]
+    assert "documents" in res["database"]["tables"]
+    assert "users" in res["database"]["tables"]
+
+
+@pytest.mark.asyncio
+async def test_other_mcp_tools_remain_strictly_fail_closed_without_token():
+    """Verify other MCP tools remain strictly fail-closed when called unauthenticated."""
+    with pytest.raises(MCPGatewayError) as exc1:
+        await list_documents(auth_token=None)
+    assert exc1.value.code == "AUTHENTICATION_REQUIRED"
+    assert exc1.value.status_code == 401
+
+    with pytest.raises(MCPGatewayError) as exc2:
+        await rag_search(query="test", auth_token=None)
+    assert exc2.value.code == "AUTHENTICATION_REQUIRED"
+    assert exc2.value.status_code == 401
+
+

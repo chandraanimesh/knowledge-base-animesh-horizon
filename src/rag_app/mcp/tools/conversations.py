@@ -23,6 +23,58 @@ from rag_app.mcp.gateway import mcp_gateway
 
 # ── Underlying Handlers ───────────────────────────────────────────────────────
 
+async def _resolve_workspace_identifier(
+    session: AsyncSession,
+    user: User,
+    workspace_id: Optional[str],
+) -> Optional[str]:
+    """
+    Resolves omitted workspace_id adhering to application policy:
+    1. If explicitly provided, returns it as-is.
+    2. If user is ADMIN, returns None (legitimate Global Chat).
+    3. If user is USER and workspace_id is omitted:
+       - Checks allowed workspaces. If exactly 1 allowed workspace exists, returns it.
+       - If no allowed workspaces exist, checks allowed departments (with VIEW permission).
+         If exactly 1 allowed department exists, returns department code so ConversationService
+         can auto-provision/link the established department workspace.
+       - If multiple workspaces/departments exist, raises HTTPException(400) requiring explicit workspace_id.
+       - If 0 workspaces/departments exist, raises HTTPException(403) requiring valid workspace membership.
+    """
+    if workspace_id and str(workspace_id).strip():
+        return str(workspace_id).strip()
+    if user.role == "ADMIN":
+        return None
+
+    from rag_app.security.authorization import get_allowed_workspaces, get_allowed_departments
+    from rag_app.db.models import Department
+
+    allowed_ws = await get_allowed_workspaces(session, user)
+    if allowed_ws and len(allowed_ws) == 1:
+        return str(allowed_ws[0])
+    elif allowed_ws and len(allowed_ws) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Multiple accessible workspaces found. Please specify 'workspace_id'.",
+        )
+
+    # If user has no existing workspace memberships, check their allowed departments
+    allowed_depts = await get_allowed_departments(session, user)
+    if not allowed_depts:
+        raise HTTPException(
+            status_code=403,
+            detail="Standard users must belong to an active department/workspace to use conversations. Please specify 'workspace_id'.",
+        )
+    if len(allowed_depts) == 1:
+        dept = await session.get(Department, allowed_depts[0])
+        if dept:
+            return dept.code
+
+    raise HTTPException(
+        status_code=400,
+        detail="Multiple accessible departments found. Please specify 'workspace_id'.",
+    )
+
+
 async def handle_list_conversations(
     session: AsyncSession,
     user: User,
@@ -30,9 +82,9 @@ async def handle_list_conversations(
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     """List conversations for current user."""
-    ws_uuid = uuid.UUID(workspace_id) if workspace_id else None
+    resolved_ws = await _resolve_workspace_identifier(session, user, workspace_id)
     service = ConversationService(session)
-    res = await service.list_conversations(user=user, workspace_id=ws_uuid, limit=min(max(1, limit), 100))
+    res = await service.list_conversations(user=user, workspace_id=resolved_ws, limit=min(max(1, limit), 100))
     return [r.model_dump() if hasattr(r, "model_dump") else dict(r) for r in res]
 
 
@@ -43,9 +95,9 @@ async def handle_create_conversation(
     workspace_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new conversation for current user."""
-    ws_uuid = uuid.UUID(workspace_id) if workspace_id else None
+    resolved_ws = await _resolve_workspace_identifier(session, user, workspace_id)
     service = ConversationService(session)
-    res = await service.create_conversation(user=user, title=title, workspace_id=ws_uuid)
+    res = await service.create_conversation(user=user, title=title, workspace_id=resolved_ws)
     return res.model_dump() if hasattr(res, "model_dump") else dict(res)
 
 

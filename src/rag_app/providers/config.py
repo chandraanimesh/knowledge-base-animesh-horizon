@@ -39,8 +39,19 @@ def get_ocr_provider_name() -> str:
 
 def get_web_provider_name() -> str:
     settings = get_settings()
-    name = (os.getenv("WEB_PROVIDER") or getattr(settings, "web_provider", "firecrawl") or "firecrawl").strip().lower()
-    return name
+    env_name = os.getenv("WEB_PROVIDER") or os.getenv("WEB_SEARCH_PROVIDER")
+    if env_name:
+        return env_name.strip().lower()
+    if getattr(settings, "web_provider", None):
+        return str(settings.web_provider).strip().lower()
+    if getattr(settings, "web_search_provider", None):
+        val = str(settings.web_search_provider).strip().lower()
+        if val == "firecrawl" and not settings.firecrawl_api_key and settings.tinyfish_api_key:
+            return "tinyfish"
+        return val
+    if settings.tinyfish_api_key and not settings.firecrawl_api_key:
+        return "tinyfish"
+    return "firecrawl"
 
 
 def get_vector_store_provider_name() -> str:

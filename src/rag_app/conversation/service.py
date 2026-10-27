@@ -87,21 +87,41 @@ class ConversationService:
         self.session = session
 
     @staticmethod
-    def _require_global_chat_admin(user: User) -> None:
+    def _require_global_chat_admin(user: Any) -> None:
         """Keep organization-wide Global Chat available only to administrators."""
-        if user.role != "ADMIN":
+        user_role = None
+        sa_state = getattr(user, "_sa_instance_state", None)
+        if sa_state is not None and type(sa_state).__name__ == "InstanceState" and getattr(sa_state, "expired", False):
+            loaded_dict = getattr(sa_state, "dict", {})
+            user_role = loaded_dict.get("role")
+        else:
+            user_role = getattr(user, "role", None)
+
+        if user_role != "ADMIN":
             raise HTTPException(
                 status_code=403,
                 detail="Global Chat is available to administrators only.",
             )
 
-    async def _validate_workspace_access(self, user: User, workspace_id: uuid.UUID | str) -> Workspace:
+    async def _validate_workspace_access(self, user: Any, workspace_id: uuid.UUID | str) -> Workspace:
         """
         Validates workspace exists, is active, department access, and user membership.
         Supports resolving workspace by ID, Code, Name, Department ID, or Department Code.
         """
         if not workspace_id:
             raise HTTPException(status_code=400, detail="Workspace identifier cannot be empty.")
+
+        user_id = None
+        user_role = "USER"
+        sa_state = getattr(user, "_sa_instance_state", None)
+        if sa_state is not None and type(sa_state).__name__ == "InstanceState" and getattr(sa_state, "expired", False):
+            if sa_state.key and len(sa_state.key) > 1 and sa_state.key[1]:
+                user_id = sa_state.key[1][0]
+            loaded_dict = getattr(sa_state, "dict", {})
+            user_role = loaded_dict.get("role", "USER")
+        else:
+            user_id = getattr(user, "id", None)
+            user_role = getattr(user, "role", "USER")
 
         ws_str = str(workspace_id).strip()
         ws_uuid: uuid.UUID | None = None
@@ -176,7 +196,7 @@ class ConversationService:
                     )
                     self.session.add(ws)
                     await self.session.flush()
-                    self.session.add(WorkspaceMember(workspace_id=ws.id, user_id=user.id, role="OWNER" if user.role == "ADMIN" else "EDITOR"))
+                    self.session.add(WorkspaceMember(workspace_id=ws.id, user_id=user_id, role="OWNER" if user_role == "ADMIN" else "EDITOR"))
                     await self.session.flush()
 
         # 4. Fallback: Auto-provision under active UNCLASSIFIED or first active department for new workspace code
@@ -208,8 +228,8 @@ class ConversationService:
                 self.session.add(
                     WorkspaceMember(
                         workspace_id=ws.id,
-                        user_id=user.id,
-                        role="OWNER" if user.role == "ADMIN" else "EDITOR",
+                        user_id=user_id,
+                        role="OWNER" if user_role == "ADMIN" else "EDITOR",
                     )
                 )
                 await self.session.flush()
@@ -220,7 +240,7 @@ class ConversationService:
                 detail=f"Workspace '{workspace_id}' not found or inactive.",
             )
 
-        if user.role != "ADMIN":
+        if user_role != "ADMIN":
             dept = await self.session.get(Department, ws.department_id)
             if not dept or not (await authorize(self.session, user, "VIEW", dept.code)):
                 raise HTTPException(
@@ -230,7 +250,7 @@ class ConversationService:
             ws_member = await self.session.scalar(
                 select(WorkspaceMember).where(
                     WorkspaceMember.workspace_id == ws.id,
-                    WorkspaceMember.user_id == user.id,
+                    WorkspaceMember.user_id == user_id,
                 )
             )
             if not ws_member:
@@ -365,6 +385,42 @@ class ConversationService:
         else:
             await self._validate_workspace_access(user, conv.workspace_id)
 
+        from rag_app.db.models import GeneratedArtifact
+        from rag_app.schemas.artifacts import ArtifactMetadata, DownloadableArtifactFormat
+
+        art_stmt = select(GeneratedArtifact).where(GeneratedArtifact.conversation_id == conv.id)
+        artifacts_res = await self.session.scalars(art_stmt)
+        all_artifacts = list(artifacts_res.all())
+
+        now = datetime.now(timezone.utc)
+        artifacts_by_msg: dict[str, list[ArtifactMetadata]] = {}
+        unassigned_artifacts: list[ArtifactMetadata] = []
+        for art in all_artifacts:
+            meta = ArtifactMetadata(
+                id=art.id,
+                format=DownloadableArtifactFormat(art.format),
+                filename=art.safe_filename,
+                mime_type=art.mime_type,
+                size_bytes=art.byte_size,
+                download_url=f"/api/reports/{art.id}/download",
+                created_at=art.created_at,
+                expires_at=art.expires_at,
+                is_expired=art.expires_at < now,
+            )
+            if art.message_id:
+                artifacts_by_msg.setdefault(str(art.message_id), []).append(meta)
+            else:
+                unassigned_artifacts.append(meta)
+
+        if unassigned_artifacts:
+            latest_asst_id = None
+            for msg in reversed(conv.messages):
+                if msg.role == "assistant":
+                    latest_asst_id = str(msg.id)
+                    break
+            if latest_asst_id:
+                artifacts_by_msg.setdefault(latest_asst_id, []).extend(unassigned_artifacts)
+
         messages_resp = [
             ChatMessageResponse(
                 id=str(msg.id),
@@ -374,6 +430,7 @@ class ConversationService:
                 visualization=msg.visualization,
                 sources=msg.sources,
                 execution_metrics=msg.execution_metrics,
+                artifacts=artifacts_by_msg.get(str(msg.id)),
                 created_at=msg.created_at,
             )
             for msg in conv.messages
@@ -526,13 +583,21 @@ class ConversationService:
             except (ValueError, TypeError, AttributeError):
                 conv_uuid = None
 
-            conv: Conversation | None = None
-            if conv_uuid:
-                stmt = select(Conversation).where(
-                    Conversation.id == conv_uuid,
-                    Conversation.user_id == user.id,
+            if not conv_uuid:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+
+            stmt = select(Conversation).where(Conversation.id == conv_uuid)
+            conv = await self.session.scalar(stmt)
+
+            if not conv:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+
+            # Ownership authorization: Reject foreign conversation with HTTP 403 Forbidden
+            if conv.user_id != user.id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Forbidden: You do not have access to this conversation.",
                 )
-                conv = await self.session.scalar(stmt)
 
             if conv:
                 # Validate scope match between request and existing conversation
@@ -563,6 +628,9 @@ class ConversationService:
                     conv.title = generate_deterministic_title(initial_query)
                     conv.updated_at = datetime.now(timezone.utc)
                     await self.session.commit()
+                    await self.session.refresh(conv)
+                    if hasattr(user, "_sa_instance_state"):
+                        await self.session.refresh(user)
 
                 return conv
 
@@ -578,6 +646,9 @@ class ConversationService:
         )
         self.session.add(conv)
         await self.session.commit()
+        await self.session.refresh(conv)
+        if hasattr(user, "_sa_instance_state"):
+            await self.session.refresh(user)
         return conv
 
     async def search_workspace_threads(
@@ -714,6 +785,7 @@ class ConversationService:
         self,
         conversation_id: uuid.UUID,
         content: str,
+        commit: bool = True,
     ) -> ChatMessage:
         msg = ChatMessage(
             conversation_id=conversation_id,
@@ -721,8 +793,13 @@ class ConversationService:
             content=content,
         )
         self.session.add(msg)
-        await self.session.commit()
+        if commit:
+            await self.session.commit()
+            await self.session.refresh(msg)
+        else:
+            await self.session.flush()
         return msg
+
 
     async def save_assistant_message(
         self,
@@ -749,5 +826,6 @@ class ConversationService:
             conv.updated_at = datetime.now(timezone.utc)
 
         await self.session.commit()
+        await self.session.refresh(msg)
         return msg
 

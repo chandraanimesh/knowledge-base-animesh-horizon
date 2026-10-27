@@ -26,6 +26,8 @@ import {
   askQuestion,
   getConversation,
   ChatMessageRecord,
+  ArtifactMetadata,
+  CoverageReport,
 } from '../api/chat'
 import {
   documentApi,
@@ -39,9 +41,12 @@ import {
   PermissionCode,
 } from '../api/accessRequests'
 import WorkspaceProviderSettingsModal from './WorkspaceProviderSettingsModal'
+import WorkspaceSettingsView from './WorkspaceSettingsView'
 import WorkspaceMembersModal from './WorkspaceMembersModal'
 import { VisualizationRenderer, VisualizationSpec } from './visualizations'
 import { MarkdownRenderer } from './MarkdownRenderer'
+import { SourceCards } from './SourceCards'
+import { ArtifactList, CoverageNotice } from './ArtifactList'
 import CompanyNotesView from './CompanyNotesView'
 import {
   SlashCommandMenu,
@@ -56,7 +61,7 @@ import {
 } from './UploadQueueReview'
 import { ExecutionMetricsModal, ExecutionMetrics } from './ExecutionMetricsModal'
 
-type GlobalNavView = 'chat' | 'documents' | 'knowledge' | 'admin' | 'departments' | 'requests'
+type GlobalNavView = 'chat' | 'documents' | 'knowledge' | 'admin' | 'departments' | 'requests' | 'settings'
 type WorkspaceTab = 'threads' | 'documents' | 'knowledge' | 'members' | 'provider'
 
 interface AnythingLLMAppProps {
@@ -117,8 +122,9 @@ export default function AnythingLLMApp({
   const [threads, setThreads] = useState<ConversationItem[]>([])
   const [activeThreadId, setActiveThreadId] = useState<string | null>(propActiveThreadId || null)
   const [loadingThreads, setLoadingThreads] = useState(false)
-  const [messages, setMessages] = useState<Array<{ id: string; role: 'user' | 'assistant' | 'system'; content: string; visualization?: VisualizationSpec | null; sources?: Array<{ type?: string; title: string; excerpt?: string; thread_id?: string; thread_title?: string }>; execution_metrics?: ExecutionMetrics | null }>>([])
+  const [messages, setMessages] = useState<Array<{ id: string; role: 'user' | 'assistant' | 'system'; content: string; visualization?: VisualizationSpec | null; sources?: any[]; execution_metrics?: ExecutionMetrics | null; artifacts?: ArtifactMetadata[]; coverage?: CoverageReport | null }>>([])
   const [selectedMetrics, setSelectedMetrics] = useState<ExecutionMetrics | null>(null)
+  const [focusedCitationByMsg, setFocusedCitationByMsg] = useState<Record<string, string | null>>({})
 
   // Documents State
   const [documents, setDocuments] = useState<DocumentListItem[]>([])
@@ -255,11 +261,17 @@ export default function AnythingLLMApp({
 
   // Multi-File Upload Queue State & Controls
   const uploadQueue = useUploadQueue()
+  const [isUploadPanelOpen, setIsUploadPanelOpen] = useState(false)
+  const [ingestionSuccess, setIngestionSuccess] = useState<{
+    filesCount: number
+    chunksIndexed: number
+  } | null>(null)
   const toolsFileInputRef = useRef<HTMLInputElement>(null)
 
   const handleToolsFilesSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
       uploadQueue.addFiles(Array.from(e.target.files))
+      setIsUploadPanelOpen(true)
       e.target.value = ''
     }
   }
@@ -411,6 +423,7 @@ export default function AnythingLLMApp({
       if (res) {
         const normalizedRole = ((res.user.role || 'USER').toUpperCase()) as 'ADMIN' | 'USER'
         loadDepartmentsAndWorkspaces(normalizedRole, res.access)
+        loadDocuments()
       }
     })
   }, [token])
@@ -487,6 +500,8 @@ export default function AnythingLLMApp({
             visualization: m.visualization,
             sources: m.sources,
             execution_metrics: m.execution_metrics || null,
+            artifacts: m.artifacts,
+            coverage: m.coverage,
           }))
           setMessages(deduplicateMessages(loaded))
         }
@@ -604,6 +619,7 @@ export default function AnythingLLMApp({
           workspace_id: activeWorkspace?.id || undefined,
           action: actionVal,
           target_message_id: targetMsgId,
+          execution_mode: 'fast_path',
         },
         token
       )
@@ -626,6 +642,8 @@ export default function AnythingLLMApp({
         visualization: response.visualization,
         sources: rawSources,
         execution_metrics: response.execution_metrics || null,
+        artifacts: response.artifacts,
+        coverage: response.coverage,
       }
       setMessages((prev) => deduplicateMessages([...prev, assistantMsg]))
 
@@ -678,6 +696,7 @@ export default function AnythingLLMApp({
           target_message_id: targetMessageId,
           conversation_id: currentThreadId || undefined,
           workspace_id: activeWorkspace?.id || undefined,
+          execution_mode: 'fast_path',
         },
         token
       )
@@ -864,16 +883,23 @@ export default function AnythingLLMApp({
   // Scoped documents for active department / view
   const workspaceDocs = documents.filter((d) => {
     if (activeWorkspace) {
-      return (
-        d.workspace_id === activeWorkspace.id ||
-        d.department_id === activeWorkspace.department_id ||
-        (activeDeptCode && d.department_code?.toUpperCase() === activeDeptCode.toUpperCase())
+      const wsIdMatch = Boolean(activeWorkspace.id && d.workspace_id && d.workspace_id === activeWorkspace.id)
+      const deptIdMatch = Boolean(
+        activeWorkspace.department_id &&
+        d.department_id &&
+        d.department_id === activeWorkspace.department_id
       )
+      const deptCodeMatch = Boolean(
+        activeDeptCode &&
+        d.department_code &&
+        d.department_code.trim().toUpperCase() === activeDeptCode.trim().toUpperCase()
+      )
+      return wsIdMatch || deptIdMatch || deptCodeMatch
     }
     // Global Documents view (no active workspace selected)
     if (docFilterDeptCode && docFilterDeptCode !== 'ALL') {
       return (
-        d.department_code?.toUpperCase() === docFilterDeptCode.toUpperCase() ||
+        (d.department_code && d.department_code.trim().toUpperCase() === docFilterDeptCode.trim().toUpperCase()) ||
         d.department_id === docFilterDeptCode
       )
     }
@@ -1561,8 +1587,8 @@ export default function AnythingLLMApp({
             }}
           >
             <button
-              onClick={() => setShowSettingsModal(true)}
-              title="Settings & Access"
+              onClick={() => setCurrentNavView('settings')}
+              title="Workspace Settings"
               style={{
                 background: 'transparent',
                 border: 'none',
@@ -1838,7 +1864,18 @@ export default function AnythingLLMApp({
         </header>
 
         {/* Scrollable View Content */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px 140px 20px', boxSizing: 'border-box' }}>
+        {currentNavView === 'settings' ? (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+            <WorkspaceSettingsView
+              workspace={activeWorkspace || workspaces[0] || ({ id: '00000000-0000-0000-0000-000000000000', name: 'Default Workspace', code: 'DEFAULT', department_id: '', is_active: true, created_at: '', updated_at: '' } as WorkspaceItem)}
+              token={token}
+              isOwnerOrAdmin={currentUser?.role === 'ADMIN'}
+              onToast={showToast}
+              onBackToChat={() => setCurrentNavView('chat')}
+            />
+          </div>
+        ) : (
+          <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px 140px 20px', boxSizing: 'border-box' }}>
           {/* TAB 1: THREADS / CHAT VIEW */}
           {activeWsTab === 'threads' && currentNavView === 'chat' && (
             <div style={{ maxWidth: '768px', margin: '0 auto', width: '100%', fontSize: '12px', lineHeight: 1.6, color: '#252525' }}>
@@ -2061,48 +2098,48 @@ export default function AnythingLLMApp({
                             </div>
                           </div>
                           <div style={{ paddingLeft: '26px' }}>
-                            <MarkdownRenderer content={m.content} style={{ fontSize: '13px', color: '#1F2937', lineHeight: 1.65 }} />
+                            <MarkdownRenderer
+                              content={m.content}
+                              artifacts={m.artifacts}
+                              onCitationClick={(label) =>
+                                setFocusedCitationByMsg((prev) => ({ ...prev, [m.id]: label }))
+                              }
+                              style={{ fontSize: '13px', color: '#1F2937', lineHeight: 1.65 }}
+                            />
                             {m.visualization && (
                               <div style={{ marginTop: '10px' }}>
                                 <VisualizationRenderer spec={m.visualization} />
                               </div>
                             )}
-                            {m.sources && m.sources.length > 0 && (
-                              <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid #F1F5F9', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                                <span style={{ fontSize: '10px', fontWeight: 600, color: '#6B7280', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                                  Sources
-                                </span>
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                                  {m.sources.map((s, sIdx) => {
-                                    const isThread = s.type === 'thread' || s.title?.startsWith('Thread:')
-                                    const isMemory = s.type === 'memory' || s.title?.startsWith('🧠 Personal Memory:')
-                                    return (
-                                      <span
-                                        key={sIdx}
-                                        title={s.excerpt || s.title}
-                                        style={{
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '3px',
-                                          fontSize: '10px',
-                                          padding: '2px 6px',
-                                          borderRadius: '4px',
-                                          background: isMemory ? '#F5F3FF' : isThread ? '#EFF6FF' : '#F1F5F9',
-                                          color: isMemory ? '#6D28D9' : isThread ? '#1D4ED8' : '#374151',
-                                          border: isMemory ? '1px solid #DDD6FE' : isThread ? '1px solid #BFDBFE' : '1px solid #E2E8F0',
-                                          maxWidth: '280px',
-                                          overflow: 'hidden',
-                                          textOverflow: 'ellipsis',
-                                          whiteSpace: 'nowrap',
-                                        }}
-                                      >
-                                        {isMemory ? '' : isThread ? '💬 ' : '📄 '}
-                                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
-                                      </span>
+                            {m.coverage && <CoverageNotice coverage={m.coverage} />}
+                            {m.artifacts && m.artifacts.length > 0 && (
+                              <ArtifactList
+                                artifacts={m.artifacts}
+                                token={token}
+                                onRegenerate={(updated) => {
+                                  setMessages((prev) =>
+                                    prev.map((msg) =>
+                                      msg.id === m.id
+                                        ? {
+                                            ...msg,
+                                            artifacts: (msg.artifacts || []).map((a) =>
+                                              a.id === updated.id ? updated : a
+                                            ),
+                                          }
+                                        : msg
                                     )
-                                  })}
-                                </div>
-                              </div>
+                                  );
+                                }}
+                              />
+                            )}
+                            {m.sources && m.sources.length > 0 && (
+                              <SourceCards
+                                sources={m.sources}
+                                focusedCitation={focusedCitationByMsg[m.id]}
+                                onClearFocusedCitation={() =>
+                                  setFocusedCitationByMsg((prev) => ({ ...prev, [m.id]: null }))
+                                }
+                              />
                             )}
                           </div>
                         </div>
@@ -2547,6 +2584,7 @@ export default function AnythingLLMApp({
             </div>
           )}
         </div>
+        )}
 
         {/* ========================================================================= */}
         {/* MESSAGE COMPOSER (Floating / Centered Bottom)                             */}
@@ -2582,86 +2620,132 @@ export default function AnythingLLMApp({
                 gap: '3px',
               }}
             >
-            {!activeWorkspace && uploadQueue.queue.length > 0 && (
+            {/* Ingestion Completion Success Banner */}
+            {ingestionSuccess && (
               <div
                 style={{
                   display: 'flex',
                   alignItems: 'center',
-                  gap: '8px',
-                  padding: '2px 2px 5px',
-                  fontSize: '10.5px',
-                  color: '#4B5563',
+                  justifyContent: 'space-between',
+                  padding: '8px 12px',
+                  borderRadius: '8px',
+                  background: '#F0FDF4',
+                  border: '1px solid #BBF7D0',
+                  marginBottom: '6px',
+                  fontSize: '11.5px',
+                  color: '#166534',
                 }}
               >
-                <label htmlFor="global-upload-department" style={{ whiteSpace: 'nowrap' }}>
-                  Upload to
-                </label>
-                <select
-                  id="global-upload-department"
-                  value={globalUploadDepartmentCode}
-                  onChange={(e) => setGlobalUploadDepartmentCode(e.target.value)}
-                  disabled={uploadQueue.isProcessing}
-                  style={{
-                    flex: 1,
-                    minWidth: 0,
-                    padding: '4px 6px',
-                    borderRadius: '5px',
-                    border: '1px solid #D1D5DB',
-                    background: '#FFFFFF',
-                    fontSize: '10.5px',
-                    color: '#374151',
-                  }}
-                >
-                  <option value="">Select an active department</option>
-                  {uploadableDepartments.map((department) => (
-                    <option key={department.id} value={department.code}>
-                      {department.name} ({department.code})
-                    </option>
-                  ))}
-                </select>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ fontSize: '13px' }}>✓</span>
+                  <span>
+                    <strong>Ingestion complete</strong> · {ingestionSuccess.filesCount} file(s) processed · {ingestionSuccess.chunksIndexed.toLocaleString()} chunks indexed
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIngestionSuccess(null)
+                      setActiveWsTab('documents')
+                      setCurrentNavView('documents')
+                    }}
+                    style={{
+                      background: '#DCFCE7',
+                      border: '1px solid #86EFAC',
+                      borderRadius: '5px',
+                      color: '#15803D',
+                      fontSize: '11px',
+                      fontWeight: 600,
+                      padding: '2px 8px',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    View documents →
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIngestionSuccess(null)}
+                    style={{
+                      background: 'transparent',
+                      border: 'none',
+                      color: '#166534',
+                      fontSize: '12px',
+                      cursor: 'pointer',
+                      padding: '2px',
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
             )}
-            {/* Multi-File Upload Queue Review */}
-            <UploadQueueReview
-              queue={uploadQueue.queue}
-              isProcessing={uploadQueue.isProcessing}
-              activeFileId={uploadQueue.activeFileId}
-              isDestinationReady={hasUploadDestination}
-              onToggleSelect={uploadQueue.toggleSelect}
-              onSelectAll={uploadQueue.selectAll}
-              onDeselectAll={uploadQueue.deselectAll}
-              onRemoveItem={uploadQueue.removeItem}
-              onMoveUp={uploadQueue.moveUp}
-              onMoveDown={uploadQueue.moveDown}
-              onClearQueue={uploadQueue.clearQueue}
-              onStartIngestion={() => {
-                if (!uploadDepartmentCode) {
-                  showToast('error', 'Select an active department before uploading.')
-                  return
-                }
-                uploadQueue.startIngestion({
-                  departmentCode: uploadDepartmentCode,
-                  token,
-                  workspaceId: activeWorkspace?.id,
-                  onCompleted: () => {
-                    loadDocuments()
-                    showToast('success', 'Selected files were uploaded and indexed. Knowledge enrichment may continue in the background.')
-                  },
-                })
-              }}
-              onRetryItem={(id) => {
-                if (!uploadDepartmentCode) {
-                  showToast('error', 'Select an active department before retrying.')
-                  return
-                }
-                uploadQueue.retryItem(id, {
-                  departmentCode: uploadDepartmentCode,
-                  token,
-                  workspaceId: activeWorkspace?.id,
-                  onCompleted: () => loadDocuments(),
-                })
-              }}
-            />
+
+            {/* Document Ingestion & Queue Review Panel */}
+            {(isUploadPanelOpen || uploadQueue.queue.length > 0) && (
+              <UploadQueueReview
+                queue={uploadQueue.queue}
+                isProcessing={uploadQueue.isProcessing}
+                activeFileId={uploadQueue.activeFileId}
+                isDestinationReady={hasUploadDestination}
+                selectedDepartmentCode={uploadDepartmentCode || ''}
+                departments={uploadableDepartments.map((d) => ({ id: d.id, code: d.code, name: d.name }))}
+                onSelectDepartment={(code) => {
+                  if (!activeWorkspace) setGlobalUploadDepartmentCode(code)
+                }}
+                onAddFiles={(files) => {
+                  uploadQueue.addFiles(files)
+                  setIsUploadPanelOpen(true)
+                }}
+                onToggleSelect={uploadQueue.toggleSelect}
+                onSelectAll={uploadQueue.selectAll}
+                onDeselectAll={uploadQueue.deselectAll}
+                onRemoveItem={uploadQueue.removeItem}
+                onMoveUp={uploadQueue.moveUp}
+                onMoveDown={uploadQueue.moveDown}
+                onClearQueue={uploadQueue.clearQueue}
+                onClose={() => {
+                  uploadQueue.clearQueue()
+                  setIsUploadPanelOpen(false)
+                }}
+                onStartIngestion={(metadataMap) => {
+                  if (!uploadDepartmentCode) {
+                    showToast('error', 'Select an active department before uploading.')
+                    return
+                  }
+                  uploadQueue.startIngestion({
+                    departmentCode: uploadDepartmentCode,
+                    token,
+                    workspaceId: activeWorkspace?.id,
+                    metadataMap,
+                    onCompleted: () => {
+                      loadDocuments()
+                    },
+                    onSuccess: (info) => {
+                      uploadQueue.clearQueue()
+                      setIsUploadPanelOpen(false)
+                      setIngestionSuccess({
+                        filesCount: info.filesCount,
+                        chunksIndexed: info.chunksIndexed,
+                      })
+                      loadDocuments()
+                    },
+                  })
+                }}
+                onRetryItem={(id) => {
+                  if (!uploadDepartmentCode) {
+                    showToast('error', 'Select an active department before retrying.')
+                    return
+                  }
+                  uploadQueue.retryItem(id, {
+                    departmentCode: uploadDepartmentCode,
+                    token,
+                    workspaceId: activeWorkspace?.id,
+                    onCompleted: () => loadDocuments(),
+                  })
+                }}
+              />
+            )}
 
             {/* Slash Command Autocomplete Dropdown */}
             <SlashCommandMenu
@@ -2774,6 +2858,7 @@ export default function AnythingLLMApp({
                     {canUpload && <div
                       onClick={() => {
                         setToolsOpen(false)
+                        setIsUploadPanelOpen(true)
                         toolsFileInputRef.current?.click()
                       }}
                       style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', padding: '5px 6px', borderRadius: '4px', cursor: 'pointer', color: '#374151' }}

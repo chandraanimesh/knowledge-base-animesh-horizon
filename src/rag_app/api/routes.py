@@ -1,13 +1,14 @@
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, BackgroundTasks
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, BackgroundTasks
 from fastapi.responses import FileResponse, PlainTextResponse
 from sqlalchemy import select, or_, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rag_app.core.config import get_settings
 from rag_app.db.session import get_db_session
 from rag_app.generation.service import GenerationService
 from rag_app.ingestion.service_v1 import IngestionService
@@ -255,6 +256,11 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     workspace_id: Optional[str] = Query(None, description="Optional Workspace UUID or Code to assign document to"),
+    doc_type: Optional[str] = Form(None),
+    tags: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    classification: Optional[str] = Form(None),
+    visibility: Optional[str] = Form(None),
     user: User = Depends(RequirePermission("UPLOAD")),
 ) -> IngestResponse:
     from rag_app.knowledge.worker import run_document_knowledge_extraction
@@ -313,8 +319,60 @@ async def upload_document(
             ws = await conv_service._validate_workspace_access(user, workspace_id)
             target_ws_id = ws.id
             if ws.department_id != dept.id and user.role != "ADMIN":
-                # Align department if needed or validate
-                pass
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Forbidden: Workspace '{ws.name}' belongs to a different department than '{dept.code}'.",
+                )
+
+        # Server-side metadata validation and sanitization
+        doc_metadata: dict[str, Any] = {}
+        if isinstance(doc_type, str) and doc_type.strip():
+            cleaned_dt = doc_type.strip()
+            if len(cleaned_dt) > 100:
+                raise HTTPException(status_code=400, detail="Document type exceeds maximum length (100 chars).")
+            doc_metadata["doc_type"] = cleaned_dt
+
+        if isinstance(tags, str) and tags.strip():
+            raw_tags = tags.strip()
+            parsed_tags: list[str] = []
+            if raw_tags.startswith("[") and raw_tags.endswith("]"):
+                try:
+                    import json
+                    parsed = json.loads(raw_tags)
+                    if isinstance(parsed, list):
+                        parsed_tags = [str(t).strip() for t in parsed if str(t).strip()]
+                except Exception:
+                    parsed_tags = [t.strip() for t in raw_tags.strip("[]").split(",") if t.strip()]
+            else:
+                parsed_tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+
+            if len(parsed_tags) > 30:
+                raise HTTPException(status_code=400, detail="Too many tags (maximum 30 tags).")
+            for t in parsed_tags:
+                if len(t) > 50:
+                    raise HTTPException(status_code=400, detail=f"Tag '{t[:20]}...' exceeds maximum length (50 chars).")
+            if parsed_tags:
+                doc_metadata["tags"] = parsed_tags
+
+        if isinstance(description, str) and description.strip():
+            cleaned_desc = description.strip()
+            if len(cleaned_desc) > 2000:
+                raise HTTPException(status_code=400, detail="Description exceeds maximum length (2000 chars).")
+            doc_metadata["description"] = cleaned_desc
+
+        if isinstance(classification, str) and classification.strip():
+            cleaned_class = classification.strip()
+            allowed_classifications = {"Internal", "Public", "Confidential", "Restricted"}
+            if cleaned_class not in allowed_classifications:
+                raise HTTPException(status_code=400, detail=f"Invalid classification '{cleaned_class}'.")
+            doc_metadata["classification"] = cleaned_class
+
+        if isinstance(visibility, str) and visibility.strip():
+            cleaned_vis = visibility.strip()
+            allowed_visibility = {"Department only", "Workspace", "Organization-wide", "DEPARTMENT", "WORKSPACE", "PUBLIC", "ORGANIZATION"}
+            if cleaned_vis not in allowed_visibility:
+                raise HTTPException(status_code=400, detail=f"Invalid visibility intent '{cleaned_vis}'.")
+            doc_metadata["visibility_intent"] = cleaned_vis
 
         # Ingestion Layer
         try:
@@ -323,6 +381,7 @@ async def upload_document(
                 department_id=dept.id,
                 created_by=user.id,
                 workspace_id=target_ws_id,
+                doc_metadata=doc_metadata or None,
             )
             # Only schedule the background task if a document was actually processed/created
             if not resp.skipped and resp.document_id:
@@ -370,65 +429,110 @@ async def ask_question(
     request_id = str(uuid4())
     init_request_metrics(request_id)
     
+    from rag_app.schemas.users import UserContext
+    user_context = UserContext.from_user(user)
+    
     conv_service = ConversationService(session)
     # Get or create conversation (with deterministic title from first query if new, and workspace validation)
     conv = await conv_service.get_or_create_conversation(
-        user=user,
+        user=user_context,
         conversation_id=request.conversation_id,
         initial_query=request.query,
         workspace_id=request.workspace_id,
     )
-    effective_workspace_id = conv.workspace_id or request.workspace_id
+    conv_id = conv.id
+    conv_title = conv.title
+    effective_workspace_id = getattr(conv, "workspace_id", None) or request.workspace_id
     record_request_context(
         workspace_id=str(effective_workspace_id) if effective_workspace_id else None,
-        thread_id=str(conv.id),
+        thread_id=str(conv_id),
     )
 
     # 1. Global vs Workspace Chat authorization & scoping
     ws = None
     if effective_workspace_id is None:
         # Global Chat: search across all authorized workspaces
-        if user.role == "ADMIN":
+        if user_context.role == "ADMIN":
             from rag_app.db.models import Department
             active_depts = (await session.scalars(select(Department.id).where(Department.is_active == True, Department.deleted_at.is_(None)))).all()
             allowed_departments = list(active_depts)
         else:
-            allowed_departments = await get_allowed_departments(session, user)
+            allowed_departments = await get_allowed_departments(session, user_context)
 
         # Policy containment: Global Chat does not retrieve raw employee conversation threads across workspaces.
         # Shared organizational knowledge requires explicit sharing/approval policies, not unapproved raw ChatMessage retrieval.
         workspace_thread_context = []
     else:
         # Department workspace chat: scoped strictly to this workspace's department
-        ws = await conv_service._validate_workspace_access(user, effective_workspace_id)
+        ws = await conv_service._validate_workspace_access(user_context, effective_workspace_id)
         effective_workspace_id = ws.id
         allowed_departments = [ws.department_id]
         
         # Retrieve relevant messages from prior threads in the SAME workspace
         workspace_thread_context = await conv_service.search_workspace_threads(
-            user=user,
+            user=user_context,
             workspace_id=effective_workspace_id,
             query=request.query,
-            current_conversation_id=conv.id,
+            current_conversation_id=conv_id,
             limit=5,
         )
     
     # Retrieve prior conversation history (latest 5 turns = max 10 messages) with memory seam retrieval
     conv_history = await conv_service.get_conversation_context_window(
-        conversation_id=conv.id,
+        conversation_id=conv_id,
         max_turns=5,
         query=request.query,
     )
     
-    # Persist user's incoming message
-    user_msg = await conv_service.save_user_message(
-        conversation_id=conv.id,
-        content=request.query,
-    )
-
     # 2. Deterministic routing for Personal Memory slash commands
     query_stripped = request.query.strip()
     cmd_lower = query_stripped.split(maxsplit=1)[0].lower() if query_stripped.startswith("/") else ""
+
+    # Phase B: Atomic user message and durable memory extraction job persistence
+    settings = get_settings()
+    is_conversational_eligible = (
+        getattr(settings, "enable_conversational_memory_extraction", False)
+        and not query_stripped.startswith("/")
+    )
+
+    if is_conversational_eligible:
+        from rag_app.memory.command_parser import detect_memory_candidate_rules
+        from rag_app.core.safety import check_sensitive_request
+
+        is_candidate, is_transient, _ = detect_memory_candidate_rules(query_stripped)
+        safety = check_sensitive_request(query_stripped, can_view_pii=False)
+
+        if not is_transient and not safety.blocked:
+            from rag_app.memory.jobs import create_memory_job
+            # Atomically persist user message and durable job in the exact same transaction
+            user_msg = await conv_service.save_user_message(
+                conversation_id=conv_id,
+                content=request.query,
+                commit=False,
+            )
+            await create_memory_job(
+                session=session,
+                owner_user_id=user_context.id,
+                source_text=request.query,
+                trigger_kind="conversational_turn",
+                workspace_id=effective_workspace_id,
+                source_message_id=user_msg.id,
+                conversation_id=conv_id,
+            )
+            await session.commit()
+        else:
+            user_msg = await conv_service.save_user_message(
+                conversation_id=conv_id,
+                content=request.query,
+                commit=True,
+            )
+    else:
+        user_msg = await conv_service.save_user_message(
+            conversation_id=conv_id,
+            content=request.query,
+            commit=True,
+        )
+
 
     if cmd_lower in ("/rem", "/remember"):
         from rag_app.memory.jobs import create_memory_job, execute_memory_job
@@ -437,12 +541,12 @@ async def ask_question(
         # Capture durable job referencing user message before execution
         job = await create_memory_job(
             session=session,
-            owner_user_id=user.id,
+            owner_user_id=user_context.id,
             source_text=request.query,
             trigger_kind="explicit_rem",
             workspace_id=effective_workspace_id,
             source_message_id=user_msg.id,
-            conversation_id=conv.id,
+            conversation_id=conv_id,
         )
 
         job_status, materialized_items, reason = await execute_memory_job(
@@ -462,7 +566,7 @@ async def ask_question(
             ans = "⏳ **Memory capture pending**: Your statement has been securely captured and queued for background processing."
 
         asst_msg = await conv_service.save_assistant_message(
-            conversation_id=conv.id,
+            conversation_id=conv_id,
             content=ans,
             sources=[],
         )
@@ -472,8 +576,8 @@ async def ask_question(
             citations=[],
             retrieved_chunks=[],
             execution_metrics=metrics,
-            conversation_id=str(conv.id),
-            conversation_title=conv.title,
+            conversation_id=str(conv_id),
+            conversation_title=conv_title,
             message_id=str(asst_msg.id),
         )
 
@@ -481,7 +585,7 @@ async def ask_question(
         from rag_app.memory.materializer import MemoryMaterializer
         records = await MemoryMaterializer.get_user_memories(
             session=session,
-            user_id=user.id,
+            user_id=user_context.id,
             workspace_id=effective_workspace_id,
             include_global=True,
             limit=50,
@@ -529,7 +633,7 @@ async def ask_question(
                 archived = await MemoryMaterializer.archive_memory(
                     session=session,
                     memory_id=target_uuid,
-                    user_id=user.id,
+                    user_id=user_context.id,
                 )
                 if archived:
                     ans = "🗑️ Memory has been archived."
@@ -538,7 +642,7 @@ async def ask_question(
             else:
                 all_user_mems = await MemoryMaterializer.get_user_memories(
                     session=session,
-                    user_id=user.id,
+                    user_id=user_context.id,
                     workspace_id=effective_workspace_id,
                     include_global=True,
                     limit=100,
@@ -550,7 +654,7 @@ async def ask_question(
                     await MemoryMaterializer.archive_memory(
                         session=session,
                         memory_id=matches[0].id,
-                        user_id=user.id,
+                        user_id=user_context.id,
                     )
                     ans = f"🗑️ Archived memory matching '\"{arg_text}\"':\n> \"{matches[0].content}\""
                 else:
@@ -558,7 +662,7 @@ async def ask_question(
                     ans = f"⚠️ Multiple memories matched '\"{arg_text}\"'. Please be more specific with the text to forget:\n" + "\n".join(match_lines)
 
         asst_msg = await conv_service.save_assistant_message(
-            conversation_id=conv.id,
+            conversation_id=conv_id,
             content=ans,
             sources=[],
         )
@@ -568,8 +672,8 @@ async def ask_question(
             citations=[],
             retrieved_chunks=[],
             execution_metrics=metrics,
-            conversation_id=str(conv.id),
-            conversation_title=conv.title,
+            conversation_id=str(conv_id),
+            conversation_title=conv_title,
             message_id=str(asst_msg.id),
         )
 
@@ -686,6 +790,81 @@ async def ask_question(
             execution_metrics=metrics.model_dump() if metrics else None,
         )
         return auth_resp
+
+    # 3. Execution Mode Selection & Adaptive Workflow Dispatch
+    from rag_app.orchestration.service import WorkflowService
+    from rag_app.schemas.workflow import WorkflowRunCreate, BudgetLimits
+
+    # Mutating actions (CRM writebacks, workflow runs) must NEVER bypass the adaptive workflow approval gate,
+    # regardless of client-supplied execution_mode.
+    is_mutation_action = not WorkflowService.is_fast_path(request.query)
+
+    should_use_workflow = False
+    if is_mutation_action:
+        # Fail-closed security: Force adaptive workflow for mutations regardless of client param
+        should_use_workflow = True
+    elif request.execution_mode == "adaptive_workflow":
+        should_use_workflow = True
+    elif request.execution_mode == "fast_path":
+        should_use_workflow = False
+    else:
+        # Backward-compatible automatic evaluation using verified WorkflowService heuristics
+        should_use_workflow = not WorkflowService.is_fast_path(request.query)
+
+    if should_use_workflow:
+        import uuid as _uuid
+        workflow_service = WorkflowService(session=session)
+        ws_uuid = None
+        if effective_workspace_id:
+            try:
+                ws_uuid = _uuid.UUID(str(effective_workspace_id))
+            except (ValueError, TypeError):
+                ws_uuid = None
+
+        dept_uuid = None
+        if allowed_departments and len(allowed_departments) == 1:
+            try:
+                dept_uuid = _uuid.UUID(str(allowed_departments[0]))
+            except (ValueError, TypeError):
+                dept_uuid = None
+
+        wf_request = WorkflowRunCreate(
+            query=request.query,
+            workspace_id=ws_uuid,
+            department_id=dept_uuid,
+            conversation_id=conv.id,
+            idempotency_key=request.workflow_idempotency_key,
+            budget_limits=BudgetLimits(),
+        )
+
+        wf_run, is_new = await workflow_service.get_or_create_workflow_run(user=user, request=wf_request)
+        if is_new:
+            wf_outcome = await workflow_service.execute_workflow(wf_run)
+            await session.refresh(wf_run)
+        else:
+            wf_outcome = {"synthesis": f"Workflow run {wf_run.id} previously executed with status {wf_run.status}."}
+
+        ans_content = wf_outcome.get("synthesis") or wf_outcome.get("draft") or f"Adaptive workflow execution {wf_run.status}."
+        if wf_run.status == "AWAITING_APPROVAL":
+            ans_content += f"\n\n*Workflow Run `{wf_run.id}` is paused awaiting human approval.*"
+
+        asst_msg = await conv_service.save_assistant_message(
+            conversation_id=conv.id,
+            content=ans_content,
+            sources=[],
+        )
+        metrics = finalize_request_metrics()
+        return GenerateResponse(
+            answer=ans_content,
+            citations=[],
+            retrieved_chunks=[],
+            execution_metrics=metrics,
+            conversation_id=str(conv.id),
+            conversation_title=conv.title,
+            message_id=str(asst_msg.id),
+            workflow_run_id=str(wf_run.id),
+            workflow_status=wf_run.status,
+        )
 
     # Check natural language structured task and follow-up intent
     from rag_app.tasks.intent import detect_task_intent
@@ -984,15 +1163,50 @@ async def ask_question(
         resp.message_id = str(asst_msg.id)
         return resp
 
+    from rag_app.retrieval.query_parser import parse_output_preferences, strip_presentation_instructions
+    from rag_app.schemas.artifacts import OutputPreferences
+
+    inferred_preferences = parse_output_preferences(request.query)
+    if request.output_preferences:
+        effective_preferences = OutputPreferences(
+            chat_summary=(
+                request.output_preferences.chat_summary
+                if request.output_preferences.chat_summary is not None
+                else inferred_preferences.chat_summary
+            ),
+            include_inline_json=(
+                request.output_preferences.include_inline_json
+                if request.output_preferences.include_inline_json is not None
+                else inferred_preferences.include_inline_json
+            ),
+            include_inline_table=(
+                request.output_preferences.include_inline_table
+                if request.output_preferences.include_inline_table is not None
+                else inferred_preferences.include_inline_table
+            ),
+            download_formats=(
+                request.output_preferences.download_formats
+                if request.output_preferences.download_formats
+                else inferred_preferences.download_formats
+            ),
+        )
+    else:
+        effective_preferences = inferred_preferences
+
+    retrieval_query = strip_presentation_instructions(request.query)
+
     initial_state = {
-        "query": request.query,
+        "query": retrieval_query,
+        "raw_query": request.query,
         "top_k": request.top_k,
         "rerank": request.rerank,
-        "user": user,
+        "user": user_context,
         "allowed_departments": allowed_departments,
         "workspace_id": effective_workspace_id,
         "conversation_history": conv_history,
         "workspace_thread_context": workspace_thread_context,
+        "output_preferences": effective_preferences,
+        "conversation_id": conv_id,
     }
     
     config = {
@@ -1009,7 +1223,8 @@ async def ask_question(
     resp: GenerateResponse = final_state["final_response"]
     if resp is not None:
         resp.execution_metrics = metrics
-        resp.conversation_id = str(conv.id)
+        resp.conversation_id = str(conv_id)
+        resp.conversation_title = conv_title
         
         from rag_app.context.sources import (
             deduplicate_sources_payload,
@@ -1018,20 +1233,35 @@ async def ask_question(
         from rag_app.retrieval.sufficiency import is_personal_memory_relevant
 
         # Persist assistant message in DB with complete chunk metadata
-        sources_payload = [
-            {
-                "type": "shared_knowledge" if c.chunk_id.startswith("shared_kn_") else "document",
+        sources_payload = []
+        for c in resp.retrieved_chunks:
+            if c.chunk_id.startswith("web_"):
+                source_type = "web_research"
+                title = f"Web: {c.file_name}"
+                url = str(c.document_id) if str(c.document_id).startswith("http") else None
+            elif c.chunk_id.startswith("shared_kn_"):
+                source_type = "shared_knowledge"
+                title = f"{c.file_name}{f' (Page {c.page_number})' if c.page_number else ''}"
+                url = None
+            else:
+                source_type = "document"
+                title = f"{c.file_name}{f' (Page {c.page_number})' if c.page_number else ''}"
+                url = None
+
+            item = {
+                "type": source_type,
                 "chunk_id": c.chunk_id,
                 "document_id": str(c.document_id),
                 "department_id": str(c.department_id),
                 "file_name": c.file_name,
                 "chunk_index": c.chunk_index,
                 "page_number": c.page_number,
-                "title": f"{c.file_name}{f' (Page {c.page_number})' if c.page_number else ''}",
+                "title": title,
                 "excerpt": c.text,
             }
-            for c in resp.retrieved_chunks
-        ]
+            if url:
+                item["url"] = url
+            sources_payload.append(item)
 
         # Extract personal memories that were provided in conv_history and used as evidence
         personal_mems_candidates = []
@@ -1059,7 +1289,7 @@ async def ask_question(
                     build_personal_memory_source_item(
                         memory_id=pmem.get("id"),
                         memory_text=mem_content,
-                        user_id=pmem.get("user_id", user.id),
+                        user_id=pmem.get("user_id", user_context.id),
                         workspace_id=pmem.get("workspace_id", effective_workspace_id),
                         canonical_key=pmem.get("canonical_key"),
                         created_at=pmem.get("created_at"),
@@ -1087,7 +1317,7 @@ async def ask_question(
 
         metrics_payload = metrics.model_dump() if metrics else None
         asst_msg = await conv_service.save_assistant_message(
-            conversation_id=conv.id,
+            conversation_id=conv_id,
             content=resp.answer,
             sources=sources_payload,
             execution_metrics=metrics_payload,
@@ -1095,24 +1325,38 @@ async def ask_question(
         )
         resp.message_id = str(asst_msg.id)
 
+        if resp.artifacts:
+            from rag_app.db.models import GeneratedArtifact
+            from sqlalchemy import update
+            artifact_ids = [a.id for a in resp.artifacts]
+            await session.execute(
+                update(GeneratedArtifact)
+                .where(GeneratedArtifact.id.in_(artifact_ids))
+                .values(message_id=asst_msg.id)
+            )
+            await session.commit()
+
         # Automatic Thread Naming (Requirement 3)
         # If thread has default/placeholder title, generate descriptive title and persist
-        if conv_service.is_placeholder_title(conv.title):
+        if conv_service.is_placeholder_title(conv_title):
             try:
                 new_title = await conv_service.generate_llm_title(
                     query=request.query,
                     assistant_response=resp.answer,
                     llm=getattr(service, "llm", None),
                 )
-                if new_title and new_title != conv.title:
-                    conv.title = new_title
-                    conv.updated_at = datetime.now(timezone.utc)
-                    await session.commit()
+                if new_title and new_title != conv_title:
+                    conv_obj = await session.get(Conversation, conv_id)
+                    if conv_obj:
+                        conv_obj.title = new_title
+                        conv_obj.updated_at = datetime.now(timezone.utc)
+                        await session.commit()
+                    conv_title = new_title
             except Exception as title_err:
                 import logging
                 logging.getLogger(__name__).warning(f"Non-fatal title generation error: {title_err}")
 
-        resp.conversation_title = conv.title
+        resp.conversation_title = conv_title
         
     return resp
 

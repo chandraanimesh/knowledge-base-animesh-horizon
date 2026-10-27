@@ -138,3 +138,27 @@ class ProviderRegistrySummary(BaseModel):
     Used by the frontend to populate provider selection dropdowns.
     """
     capabilities: Dict[str, list[str]]
+
+
+class ProviderTestConnectionRequest(BaseModel):
+    """
+    Request to verify provider connectivity and configuration.
+    """
+    capability: str = Field(..., description="Capability category, e.g. 'llm', 'embedding', 'reranker', 'web'")
+    provider: str = Field(..., description="Provider name, e.g. 'groq', 'mock', 'sentence_transformers'")
+    model: Optional[str] = Field(None, description="Optional model identifier to test")
+    credential_ref: Optional[str] = Field(None, description="Optional credential reference label")
+    extra_config: Optional[Dict[str, Any]] = None
+
+
+class ProviderTestConnectionResponse(BaseModel):
+    """
+    Result of a provider connectivity verification test.
+    """
+    success: bool
+    capability: str
+    provider: str
+    model: Optional[str] = None
+    message: str
+    latency_ms: Optional[float] = None
+    details: Optional[Dict[str, Any]] = None

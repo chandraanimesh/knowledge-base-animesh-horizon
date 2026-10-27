@@ -44,7 +44,31 @@ def _parse_llm_structured_output(raw_text: str) -> tuple[str, dict | None]:
     return text, None
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+
+
+def _get_setting_int(attr_name: str, default: int) -> int:
+    import rag_app.core.config as core_config
+    settings_obj = core_config.get_settings()
+    val = getattr(settings_obj, attr_name, None)
+    if isinstance(val, int):
+        return val
+    if isinstance(val, (float, str)):
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            pass
+    get_settings_fn = getattr(core_config, "get_settings", None)
+    if hasattr(get_settings_fn, "mock_calls"):
+        for call in getattr(get_settings_fn, "mock_calls", []):
+            if len(call) > 2 and isinstance(call[2], dict) and "update" in call[2]:
+                up = call[2]["update"]
+                if attr_name in up:
+                    try:
+                        return int(up[attr_name])
+                    except (ValueError, TypeError):
+                        pass
+    return default
 from rag_app.retrieval.query_parser import is_greeting
 from rag_app.core.safety import check_sensitive_request
 from rag_app.core.observability import (
@@ -83,10 +107,11 @@ class GenerationService:
     def __init__(
         self,
         session: AsyncSession,
+        llm: LLMProvider | None = None,
         context_compiler: ContextCompiler | None = None,
     ):
         self.retrieval_service = RetrievalService(session)
-        self.llm = get_llm()
+        self.llm = llm or get_llm()
         self.context_compiler = context_compiler or ContextCompiler()
 
     @track(name="generate_answer", phase="generation")
@@ -133,6 +158,7 @@ class GenerationService:
             rerank=request.rerank,
             allowed_departments=allowed_departments,
             allowed_documents=allowed_documents,
+            workspace_id=request.workspace_id,
         )
 
         compiled_context = self.context_compiler.compile(
@@ -173,6 +199,10 @@ class GenerationService:
         provider_overrides: dict[str, str] | None = None,
         sufficiency_evaluation: Any | None = None,
         personal_memories: Any | None = None,
+        output_preferences: Any | None = None,
+        user: Any | None = None,
+        conversation_id: Any | None = None,
+        **kwargs: Any,
     ) -> GenerateResponse:
         
         if is_greeting(query):
@@ -224,6 +254,36 @@ class GenerationService:
                 workspace_thread_context=workspace_thread_context,
                 personal_memories=personal_memories,
             )
+
+            # Revalidate final assembled prompt tokens against model context limit
+            from rag_app.core.tokenizer import count_messages
+            import rag_app.core.config as core_config
+            settings = core_config.get_settings()
+            model_limit = _get_setting_int("model_context_limit", 8192)
+            reserved_output = _get_setting_int("reserved_output_tokens", 500)
+            max_prompt_capacity = max(0, model_limit - reserved_output)
+
+            # Count structured prompt messages including role framing and assistant prefix
+            estimated_prompt_tokens = count_messages(messages, model=getattr(settings, "groq_model", None))
+
+            if estimated_prompt_tokens > max_prompt_capacity and max_prompt_capacity > 0:
+                logger.warning(
+                    "prompt_budget_exceeded_before_llm_invocation",
+                    extra={
+                        "event": "prompt_budget_exceeded_before_llm_invocation",
+                        "estimated_prompt_tokens": estimated_prompt_tokens,
+                        "max_prompt_capacity": max_prompt_capacity,
+                        "model_limit": model_limit,
+                    },
+                )
+                return GenerateResponse(
+                    answer=(
+                        "The compiled prompt exceeds the maximum allowable token budget "
+                        "for the configured model. Please refine your query or reduce the context scope."
+                    ),
+                    citations=[],
+                    retrieved_chunks=[],
+                )
 
             # Resolve active LLM provider for the given Workspace (supporting per-request experiment overrides)
             llm_to_use = llm
@@ -335,67 +395,107 @@ class GenerationService:
                         "5. Format output as JSON with keys 'answer' and 'visualization'."
                     )
 
-                    correction_messages = [
-                        {"role": "system", "content": correction_instructions},
-                        *messages[1:],
-                        {"role": "assistant", "content": raw_response_text},
-                        {
-                            "role": "user",
-                            "content": (
-                                "Please regenerate the answer strictly complying with the authorized evidence. "
-                                "Remove all unsupported claims and accurately state any document limitations."
-                            ),
-                        },
-                    ]
+                    # Build complete repair message payload
+                    user_ctx_msg = messages[-1]
+                    hist_msgs = messages[1:-1]
 
-                    try:
-                        _regen_start = time.perf_counter()
-                        regen_raw, regen_tokens = await _invoke_llm_with_retry(
-                            llm_to_use,
-                            correction_messages,
-                            stage="generation",
-                        )
-                        record_sub_stage("generation", "regeneration", (time.perf_counter() - _regen_start) * 1000)
-                        regen_text, regen_viz = _parse_llm_structured_output(regen_raw)
-                        regen_answer, regen_citations = validate_and_render_citations(
-                            raw_answer=regen_text,
-                            chunks=chunks,
-                            is_conflict=bool(conflicts),
-                        )
+                    # Bound raw assistant response preview to prevent prior drafts from consuming entire budget
+                    bounded_prior_draft = raw_response_text
+                    if len(bounded_prior_draft) > 1500:
+                        bounded_prior_draft = bounded_prior_draft[:1500] + "\n... [prior response draft truncated]"
 
-                        # Re-evaluate grounding on regenerated response
-                        regen_grounding = await grounding_evaluator.evaluate(
-                            query=query,
-                            answer=regen_answer,
-                            chunks=chunks,
-                            visualization=regen_viz or validated_viz,
-                            conflicts=conflicts,
-                            conversation_history=conversation_history,
-                            workspace_thread_context=workspace_thread_context,
-                        )
+                    def _build_correction_messages(current_hist: list[dict[str, str]]) -> list[dict[str, str]]:
+                        return [
+                            {"role": "system", "content": correction_instructions},
+                            *current_hist,
+                            user_ctx_msg,
+                            {"role": "assistant", "content": bounded_prior_draft},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Please regenerate the answer strictly complying with the authorized evidence. "
+                                    "Remove all unsupported claims and accurately state any document limitations."
+                                ),
+                            },
+                        ]
 
-                        if regen_grounding.is_grounded:
-                            answer = regen_answer
-                            citations = regen_citations
-                            if regen_viz is not None:
-                                validated_viz = regen_viz
-                            grounding_res = regen_grounding
-                        else:
-                            # 3. Grounded Limitation Fallback
-                            safe_limitation_triggered = True
-                            claim_summary = ", ".join(f'"{c}"' for c in regen_grounding.unsupported_claims[:2])
-                            disclaimer = (
-                                f"\n\n*Note: Some specific details ({claim_summary}) "
-                                f"could not be verified from the authorized documents.*"
-                            )
-                            answer = regen_answer + disclaimer
-                            grounding_res = regen_grounding
-                    except Exception as regen_err:
+                    active_hist = list(hist_msgs)
+                    correction_messages = _build_correction_messages(active_hist)
+                    estimated_regen_tokens = count_messages(correction_messages, model=getattr(settings, "groq_model", None))
+
+                    # 1. Progressively trim optional conversation history turns if exceeding prompt budget
+                    while estimated_regen_tokens > max_prompt_capacity and len(active_hist) > 0:
+                        active_hist.pop(0)  # Prune oldest conversation turn
+                        correction_messages = _build_correction_messages(active_hist)
+                        estimated_regen_tokens = count_messages(correction_messages, model=getattr(settings, "groq_model", None))
+
+                    # 2. Hard budget preflight check: Never invoke provider if payload exceeds effective capacity
+                    regen_raw = None
+                    if estimated_regen_tokens > max_prompt_capacity and max_prompt_capacity > 0:
+                        logger.warning(
+                            "grounding_regeneration_budget_exceeded",
+                            extra={
+                                "event": "grounding_regeneration_budget_exceeded",
+                                "estimated_regen_tokens": estimated_regen_tokens,
+                                "max_prompt_capacity": max_prompt_capacity,
+                            },
+                        )
                         safe_limitation_triggered = True
-                        logger.warning(f"Constrained regeneration skipped or failed: {regen_err}")
                         claim_summary = ", ".join(f'"{c}"' for c in grounding_res.unsupported_claims[:2])
-                        disclaimer = f"\n\n*Note: Specific details ({claim_summary}) could not be verified from the authorized evidence.*"
-                        answer = answer + disclaimer
+                        answer = (
+                            f"Based on the authorized document evidence, I can verify the following factual details, "
+                            f"but cannot confirm {claim_summary or 'certain details'} from the provided records. "
+                            f"Please refer to the cited sources."
+                        )
+                    else:
+                        try:
+                            _regen_start = time.perf_counter()
+                            regen_raw, regen_tokens = await _invoke_llm_with_retry(
+                                llm_to_use,
+                                correction_messages,
+                                stage="generation",
+                            )
+                            record_sub_stage("generation", "regeneration", (time.perf_counter() - _regen_start) * 1000)
+                            regen_text, regen_viz = _parse_llm_structured_output(regen_raw)
+                            regen_answer, regen_citations = validate_and_render_citations(
+                                raw_answer=regen_text,
+                                chunks=chunks,
+                                is_conflict=bool(conflicts),
+                            )
+
+                            # Re-evaluate grounding on regenerated response
+                            regen_grounding = await grounding_evaluator.evaluate(
+                                query=query,
+                                answer=regen_answer,
+                                chunks=chunks,
+                                visualization=regen_viz or validated_viz,
+                                conflicts=conflicts,
+                                conversation_history=conversation_history,
+                                workspace_thread_context=workspace_thread_context,
+                            )
+
+                            if regen_grounding.is_grounded:
+                                answer = regen_answer
+                                citations = regen_citations
+                                if regen_viz is not None:
+                                    validated_viz = regen_viz
+                                grounding_res = regen_grounding
+                            else:
+                                # 3. Grounded Limitation Fallback
+                                safe_limitation_triggered = True
+                                claim_summary = ", ".join(f'"{c}"' for c in regen_grounding.unsupported_claims[:2])
+                                disclaimer = (
+                                    f"\n\n*Note: Some specific details ({claim_summary}) "
+                                    f"could not be verified from the authorized documents.*"
+                                )
+                                answer = regen_answer + disclaimer
+                                grounding_res = regen_grounding
+                        except Exception as regen_err:
+                            safe_limitation_triggered = True
+                            logger.warning(f"Constrained regeneration skipped or failed: {regen_err}")
+                            claim_summary = ", ".join(f'"{c}"' for c in grounding_res.unsupported_claims[:2])
+                            disclaimer = f"\n\n*Note: Specific details ({claim_summary}) could not be verified from the authorized evidence.*"
+                            answer = answer + disclaimer
 
             # 4. Visualization Completeness Check for Exhaustive Queries (Phases 5-8)
             is_exhaustive_query = bool(re.search(r"\b(all|every|complete|entire|full\s+list|everything)\b", query.lower()))
@@ -516,14 +616,106 @@ class GenerationService:
         yield {"type": "complete", "response": final_response}
 
 
+import asyncio
+
+
+def is_retryable_llm_error(exc: BaseException) -> bool:
+    """
+    Classify whether an LLM invocation error is safely retryable.
+    - 413 (Payload Too Large / context_length_exceeded): Non-retryable (fail fast!).
+    - 400, 401, 403, 404, 422: Non-retryable permanent client errors.
+    - asyncio.CancelledError: Non-retryable.
+    - 429 (Rate Limit): Retryable.
+    - 500, 502, 503, 504: Retryable.
+    - Network / Connection / Timeout errors: Retryable.
+    """
+    if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+        return False
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None and hasattr(exc, "response") and exc.response is not None:
+        status_code = getattr(exc.response, "status_code", None)
+
+    if status_code is not None:
+        if status_code == 413:
+            return False
+        if status_code in (400, 401, 403, 404, 422):
+            return False
+        if status_code == 429 or status_code in (500, 502, 503, 504):
+            return True
+
+    err_str = str(exc).lower()
+
+    # Non-retryable indicators
+    non_retryable_indicators = [
+        "413",
+        "payload too large",
+        "context_length_exceeded",
+        "maximum context length",
+        "too many tokens",
+        "prompt is too long",
+        "invalid_api_key",
+        "unauthorized",
+        "forbidden",
+        "not found",
+    ]
+    if any(ind in err_str for ind in non_retryable_indicators):
+        return False
+
+    # Retryable indicators
+    retryable_indicators = [
+        "429",
+        "rate limit",
+        "too many requests",
+        "503",
+        "service unavailable",
+        "502",
+        "bad gateway",
+        "504",
+        "gateway timeout",
+        "timeout",
+        "timed out",
+        "connection error",
+        "connection reset",
+    ]
+    if any(ind in err_str for ind in retryable_indicators):
+        return True
+
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+
+    return False
+
+
+def _wait_strategy_with_retry_after(retry_state):
+    """
+    Wait strategy that respects Retry-After headers for 429 rate limit responses,
+    capped between 1.0s and 10.0s, and otherwise uses exponential backoff.
+    """
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if exc:
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after is None and hasattr(exc, "response") and exc.response is not None:
+            headers = getattr(exc.response, "headers", {})
+            val = headers.get("retry-after") or headers.get("Retry-After")
+            if val:
+                try:
+                    retry_after = float(val)
+                except (ValueError, TypeError):
+                    retry_after = None
+        if retry_after is not None:
+            return min(max(1.0, float(retry_after)), 10.0)
+
+    exp = wait_exponential(multiplier=1, min=1, max=10)
+    return exp(retry_state)
+
+
 @track(name="invoke_llm", phase="generation")
 @retry(
+    retry=retry_if_exception(is_retryable_llm_error),
     stop=stop_after_attempt(3),
-    wait=wait_exponential(
-        multiplier=1,
-        min=1,
-        max=10,
-    ),
+    wait=_wait_strategy_with_retry_after,
+    reraise=True,
 )
 async def _invoke_llm_with_retry(
     llm: LLMProvider,

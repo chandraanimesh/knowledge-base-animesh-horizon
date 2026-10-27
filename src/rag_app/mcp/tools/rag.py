@@ -20,11 +20,21 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_app.core.config import get_settings
-from rag_app.db.models import Department, Document, DocumentChunk, User, Workspace, WorkspaceMember
+from rag_app.db.models import (
+    Department,
+    Document,
+    DocumentChunk,
+    Permission,
+    User,
+    UserDepartment,
+    UserPermission,
+    Workspace,
+    WorkspaceMember,
+)
 from rag_app.generation.service import GenerationService
 from rag_app.ingestion.service_v1 import IngestionService
 from rag_app.mcp.gateway import mcp_gateway
@@ -267,13 +277,42 @@ async def handle_ingest_document(
             )
             target_dept_id = dept.id if dept else None
         else:
-            user_depts = await get_allowed_departments(session, user)
-            if not user_depts:
+            # For USER: find active departments where user explicitly possesses active UPLOAD permission
+            stmt = (
+                select(Department.id)
+                .join(UserDepartment, UserDepartment.department_id == Department.id)
+                .join(
+                    UserPermission,
+                    and_(
+                        UserPermission.user_id == user.id,
+                        UserPermission.department_id == Department.id,
+                    ),
+                )
+                .join(
+                    Permission,
+                    and_(
+                        Permission.id == UserPermission.permission_id,
+                        Permission.code == "UPLOAD",
+                        Permission.is_active == True,
+                    ),
+                )
+                .where(
+                    UserDepartment.user_id == user.id,
+                    Department.is_active == True,
+                )
+            )
+            upload_dept_ids = list((await session.scalars(stmt)).all())
+            if not upload_dept_ids:
                 raise HTTPException(
                     status_code=403,
-                    detail="User does not have access to any department for upload.",
+                    detail="User lacks UPLOAD permission in any department.",
                 )
-            target_dept_id = user_depts[0]
+            if len(upload_dept_ids) > 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Multiple departments with UPLOAD permission available. Please specify 'department_code'.",
+                )
+            target_dept_id = upload_dept_ids[0]
 
     # Workspace validation
     ws_uuid: Optional[uuid.UUID] = None
@@ -420,6 +459,27 @@ async def handle_rag_ask(
     if workspace_id:
         try:
             ws_uuid = uuid.UUID(workspace_id)
+            ws = await session.scalar(
+                select(Workspace).where(
+                    Workspace.id == ws_uuid,
+                    Workspace.deleted_at.is_(None),
+                    Workspace.is_active == True,
+                )
+            )
+            if not ws:
+                raise HTTPException(status_code=404, detail=f"Workspace '{workspace_id}' not found.")
+            if user.role != "ADMIN":
+                dept = await session.get(Department, ws.department_id)
+                if not dept or not (await authorize(session, user, "VIEW", dept.code)):
+                    raise HTTPException(status_code=403, detail="Forbidden department access.")
+                ws_member = await session.scalar(
+                    select(WorkspaceMember).where(
+                        WorkspaceMember.workspace_id == ws.id,
+                        WorkspaceMember.user_id == user.id,
+                    )
+                )
+                if not ws_member:
+                    raise HTTPException(status_code=403, detail="Forbidden workspace access.")
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid workspace UUID: {workspace_id}")
 
@@ -430,20 +490,7 @@ async def handle_rag_ask(
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid conversation UUID: {conversation_id}")
 
-    allowed_departments = await get_allowed_departments(session, user)
-    allowed_documents = await get_allowed_document_ids(session, user, "VIEW")
-
-    retrieval_service = RetrievalService(session)
     generation_service = GenerationService(session)
-
-    retrieval_resp = await retrieval_service.retrieve(
-        query=query,
-        top_k=min(max(1, top_k), 20),
-        rerank=rerank,
-        allowed_departments=allowed_departments,
-        allowed_documents=allowed_documents,
-        workspace_id=ws_uuid,
-    )
 
     gen_req = GenerateRequest(
         query=query,

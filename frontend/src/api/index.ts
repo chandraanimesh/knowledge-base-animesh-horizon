@@ -7,3 +7,4 @@ export * from './chat';
 export * from './departments';
 export * from './accessRequests';
 export * from './workspaces';
+export * from './mcpConnections';

@@ -23,8 +23,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from rag_app.db.session import AsyncSessionLocal
 from rag_app.knowledge.company_notes_service import CompanyNotesService
 from rag_app.knowledge.worker import process_pending_jobs, recover_abandoned_jobs
+from rag_app.knowledge.connection_worker import process_pending_discovery_jobs
+from rag_app.memory.jobs import (
+    process_pending_memory_jobs,
+    recover_stale_memory_jobs,
+    reconcile_missing_conversational_memory_jobs,
+)
 
 logger = logging.getLogger(__name__)
+
 
 
 class DurableReconciliationScheduler:
@@ -111,13 +118,69 @@ class DurableReconciliationScheduler:
                 extra={"event": "orphan_notes_reconciliation_error", "error": str(rec_err)},
             )
 
+        # 3. Process pending connection discovery jobs
+        discovered_jobs = 0
+        try:
+            discovered_jobs = await process_pending_discovery_jobs(
+                worker_id="scheduler-connection-worker",
+                max_jobs=5,
+                session_factory=sf,
+            )
+        except Exception as conn_job_err:
+            logger.error(
+                "scheduler_connection_jobs_error",
+                extra={"event": "connection_jobs_error", "error": str(conn_job_err)},
+            )
+
+        # 4. Recover stale memory jobs, reconcile missing conversational jobs, & process pending memory extraction jobs
+        recovered_mem_jobs = 0
+        reconciled_mem_jobs = 0
+        processed_mem_jobs = 0
+        try:
+            async with sf() as session:
+                recovered_mem_jobs = await recover_stale_memory_jobs(session, lock_timeout_seconds=180)
+                reconciled_mem_jobs = await reconcile_missing_conversational_memory_jobs(session, lookback_hours=24)
+            processed_mem_jobs = await process_pending_memory_jobs(
+                worker_id="scheduler-memory-worker",
+                max_jobs=10,
+                session_factory=sf,
+            )
+        except Exception as mem_job_err:
+            logger.error(
+                "scheduler_memory_jobs_error",
+                extra={"event": "memory_jobs_error", "error": str(mem_job_err)},
+            )
+
+        # 5. Recover abandoned CRM sync jobs and retry eligible failed records
+        recovered_crm_sync_jobs = 0
+        retried_crm_records = 0
+        try:
+            from rag_app.crm.sync_service import CRMSyncService
+            async with sf() as session:
+                recovered_crm_sync_jobs = await CRMSyncService.recover_abandoned_sync_jobs(session, lease_timeout_seconds=900)
+                crm_svc = CRMSyncService(session)
+                retried = await crm_svc.retry_eligible_failed_records(limit=10)
+                retried_crm_records = len(retried)
+        except Exception as crm_err:
+            logger.error(
+                "scheduler_crm_sync_error",
+                extra={"event": "crm_sync_scheduler_error", "error": str(crm_err)},
+            )
+
         duration = round(time.perf_counter() - start, 2)
         metrics = {
             "recovered_jobs": recovered_jobs,
             "processed_jobs": processed_jobs,
             "reconciled_notes": reconciled_notes,
+            "discovered_jobs": discovered_jobs,
+            "recovered_memory_jobs": recovered_mem_jobs,
+            "reconciled_memory_jobs": reconciled_mem_jobs,
+            "processed_memory_jobs": processed_mem_jobs,
+            "recovered_crm_sync_jobs": recovered_crm_sync_jobs,
+            "retried_crm_records": retried_crm_records,
             "duration_seconds": duration,
         }
+
 
         logger.info(
             "scheduler_cycle_complete",

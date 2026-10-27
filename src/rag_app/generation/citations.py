@@ -44,6 +44,23 @@ def render_citation_label(chunk: RetrievedChunk) -> str:
         return f"chunk: {chunk.chunk_id}"
 
 
+def normalize_citation_brackets(text: str) -> str:
+    """
+    Normalizes full-width / lenticular citation brackets (【1】, 【chunk: id】)
+    produced by some LLMs to standard square brackets ([1], [chunk: id]).
+    """
+    if not text:
+        return ""
+    # Normalize 【1】 -> [1], 【12】 -> [12]
+    text = re.sub(r"【\s*(\d+)\s*】", r"[\1]", text)
+    # Normalize 【chunk: ...】 -> [chunk: ...]
+    text = re.sub(r"【\s*chunk:\s*([^】]+)\s*】", r"[chunk: \1]", text, flags=re.IGNORECASE)
+    # Normalize other fullwidth brackets ［1］, 〔1〕
+    text = re.sub(r"［\s*(\d+)\s*］", r"[\1]", text)
+    text = re.sub(r"〔\s*(\d+)\s*〕", r"[\1]", text)
+    return text
+
+
 def validate_and_render_citations(
     raw_answer: str,
     chunks: list[RetrievedChunk],
@@ -55,6 +72,7 @@ def validate_and_render_citations(
     - Valid citation references are preserved in the text and rendered into final unique citations.
     - If no explicit citations are found in normal non-conflict mode, falls back to unique source file names.
     """
+    raw_answer = normalize_citation_brackets(raw_answer)
     chunk_map: dict[str, RetrievedChunk] = {str(c.chunk_id): c for c in chunks}
 
     sanitized_answer = raw_answer
@@ -87,6 +105,32 @@ def validate_and_render_citations(
     # Clean up any leftover double spaces or spacing before punctuation from stripped tokens
     sanitized_answer = re.sub(r" +([.,!?;])", r"\1", sanitized_answer)
     sanitized_answer = re.sub(r"  +", " ", sanitized_answer).strip()
+
+    # 2. Check and strip fabricated line ranges (e.g. "L1-L3", "L1", "lines L1-L3")
+    # unless the retrieved evidence explicitly provides and substantiates those line numbers.
+    has_real_line_numbers = any(
+        bool(re.search(r"\bL\d+(?:[-–—]L?\d+)?\b", c.text, re.IGNORECASE))
+        for c in chunks
+    )
+    if not has_real_line_numbers:
+        # Strip trailing or inline fabricated line coordinates in citations, e.g.:
+        # "[Doc.pdf, L1-L3]" -> "[Doc.pdf]"
+        # "[1, L1-L3]" -> "[1]"
+        # "[chunk: abc, L1-L3]" -> "[chunk: abc]"
+        # "(lines L1-L3)" -> ""
+        # "[L1-L3]" -> ""
+        sanitized_answer = re.sub(
+            r"([\[(][^\])]*?)(?:,\s*|:\s*|\s+)?(?:lines?\s+)?L\d+(?:[-–—]L?\d+)?([^\])]*?[\])])",
+            r"\1\2",
+            sanitized_answer,
+            flags=re.IGNORECASE,
+        )
+        # Remove standalone empty or line-only brackets/parentheses e.g. "[]", "()", "[L1-L3]"
+        sanitized_answer = re.sub(r"\[\s*\]", "", sanitized_answer)
+        sanitized_answer = re.sub(r"\(\s*\)", "", sanitized_answer)
+        sanitized_answer = re.sub(r"\b(?:lines?\s+)?L\d+[-–—]L\d+\b", "", sanitized_answer, flags=re.IGNORECASE)
+        sanitized_answer = re.sub(r" +([.,!?;])", r"\1", sanitized_answer)
+        sanitized_answer = re.sub(r"  +", " ", sanitized_answer).strip()
 
     # 3. Render final citations
     if valid_chunks_cited:

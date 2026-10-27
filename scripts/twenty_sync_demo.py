@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import getpass
@@ -96,7 +96,7 @@ def company_to_markdown(company: dict) -> str:
 """
 
 
-def upload_to_rag(markdown: str, filename: str) -> dict:
+def upload_to_rag(markdown: str, filename: str, department_code: str = DEPARTMENT_CODE) -> dict:
     """Authenticate and upload through the existing RAG API."""
     email = input("RAG admin email: ").strip()
     password = getpass.getpass("RAG admin password: ")
@@ -118,7 +118,7 @@ def upload_to_rag(markdown: str, filename: str) -> dict:
 
         upload_response = session.post(
             f"{RAG_BASE_URL}/documents/upload",
-            params={"department_code": DEPARTMENT_CODE},
+            params={"department_code": department_code},
             headers={"Authorization": f"Bearer {token}"},
             files={
                 "file": (
@@ -142,27 +142,78 @@ def main() -> int:
         action="store_true",
         help="Actually upload to RAG. Without this flag, run a dry-run only.",
     )
+    parser.add_argument(
+        "--mcp",
+        action="store_true",
+        help="Use the native Twenty MCP client adapter (/mcp) instead of legacy REST.",
+    )
+    parser.add_argument(
+        "--company",
+        type=str,
+        default=None,
+        help="Company name to look up and sync (defaults to 'Airbnb' for --mcp or 'RAG Integration Demo' for legacy).",
+    )
+    parser.add_argument(
+        "--department",
+        type=str,
+        default=DEPARTMENT_CODE,
+        help="Target department code in RAG (defaults to UNCLASSIFIED).",
+    )
     args = parser.parse_args()
 
     try:
-        company = fetch_company()
+        dept_code = args.department or DEPARTMENT_CODE
+        company_target = args.company or ("Airbnb" if args.mcp else COMPANY_NAME)
 
-        if company.get("deletedAt") is not None:
-            raise RuntimeError("The CRM company is deleted; refusing to upload it.")
+        if args.mcp:
+            import asyncio
+            from rag_app.crm.twenty_mcp_client import TwentyMCPClient
+            from rag_app.crm.sync_service import normalize_crm_company_to_markdown
 
-        if company.get("name") != COMPANY_NAME:
-            raise RuntimeError(
-                f"Expected {COMPANY_NAME!r}, received {company.get('name')!r}."
+            mcp_client = TwentyMCPClient(enabled=True)
+            print(f"Fetching company '{company_target}' via Twenty MCP adapter ({mcp_client.mcp_url})...")
+            crm_state = asyncio.run(mcp_client.get_live_company_state(company_target))
+
+            if not crm_state.is_connected or not crm_state.company:
+                raise RuntimeError(
+                    f"Twenty MCP fetch failed for '{company_target}': {crm_state.error_message or 'not found'}"
+                )
+
+            markdown, doc_meta = normalize_crm_company_to_markdown(
+                company_state=crm_state,
+                verification_marker=f"CRMKB-MCP-{crm_state.company.id[:8]}",
             )
+            cid = crm_state.company.id
+            filename = f"twenty_company_{cid[:8]}.md"
+            comp_display = {
+                "name": crm_state.company.name,
+                "id": crm_state.company.id,
+                "domain": crm_state.company.domain,
+            }
+        else:
+            company = fetch_company()
 
-        markdown = company_to_markdown(company)
-        filename = f"twenty_company_{COMPANY_ID[:8]}.md"
+            if company.get("deletedAt") is not None:
+                raise RuntimeError("The CRM company is deleted; refusing to upload it.")
+
+            if company.get("name") != COMPANY_NAME:
+                raise RuntimeError(
+                    f"Expected {COMPANY_NAME!r}, received {company.get('name')!r}."
+                )
+
+            markdown = company_to_markdown(company)
+            filename = f"twenty_company_{COMPANY_ID[:8]}.md"
+            comp_display = {
+                "name": company["name"],
+                "id": company["id"],
+                "domain": (company.get("domainName") or {}).get("primaryLinkUrl"),
+            }
 
         print("\nCompany verified:")
-        print(f"  Name: {company['name']}")
-        print(f"  CRM ID: {company['id']}")
-        print(f"  Domain: {(company.get('domainName') or {}).get('primaryLinkUrl')}")
-        print(f"  RAG department: {DEPARTMENT_CODE}")
+        print(f"  Name: {comp_display['name']}")
+        print(f"  CRM ID: {comp_display['id']}")
+        print(f"  Domain: {comp_display['domain']}")
+        print(f"  RAG department: {dept_code}")
         print(f"  Markdown filename: {filename}")
         print("\n--- Generated Markdown ---")
         print(markdown)
@@ -185,7 +236,7 @@ def main() -> int:
             print("Cancelled. No RAG upload was attempted.")
             return 0
 
-        result = upload_to_rag(markdown, filename)
+        result = upload_to_rag(markdown, filename, department_code=dept_code)
         print("\nRAG API response:")
         print(result)
         print("\nCheck the response's skipped/document_id fields and RAG logs.")

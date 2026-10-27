@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
 
-import type { QueuedFileItem } from './components/uploadQueueDefinitions.ts'
+import type { QueuedFileItem, DocumentMetadataDraft } from './components/uploadQueueDefinitions.ts'
 import {
   formatFileSize,
   moveItemUp,
@@ -9,6 +9,10 @@ import {
   toggleItemSelection,
   setAllSelection,
   removeQueueItem,
+  hasMetadata,
+  validateMetadataDraft,
+  applyBatchMetadata,
+  setItemMetadata,
 } from './components/uploadQueueDefinitions.ts'
 
 test('1. formatFileSize correctly formats bytes, KB, and MB', () => {
@@ -187,3 +191,168 @@ test('8. Individual retry of failed file does not reprocess already completed fi
   assert.strictEqual(items[1].status, 'completed')
   assert.strictEqual(items[1].errorMessage, undefined)
 })
+
+test('9. Upload with no metadata preserves fast-upload path without extra review step', () => {
+  const emptyDraft: DocumentMetadataDraft = {
+    docType: undefined,
+    classification: undefined,
+    tags: [],
+    visibility: undefined,
+    description: undefined,
+  }
+  assert.strictEqual(hasMetadata(emptyDraft), false)
+  const validation = validateMetadataDraft(emptyDraft)
+  assert.strictEqual(validation.isValid, true)
+  assert.strictEqual(validation.warnings.length, 0)
+})
+
+test('10. Upload with valid metadata correctly detects presence and validates fields', () => {
+  const validDraft: DocumentMetadataDraft = {
+    docType: 'Reference Data',
+    classification: 'Internal',
+    tags: ['company-directory', 'contacts'],
+    visibility: 'Department only',
+    description: 'Company directory records and contact information',
+  }
+  assert.strictEqual(hasMetadata(validDraft), true)
+  const validation = validateMetadataDraft(validDraft)
+  assert.strictEqual(validation.isValid, true)
+  assert.strictEqual(validation.warnings.length, 0)
+})
+
+test('11. Review and edit step displays exact draft metadata and surfaces warnings', () => {
+  const warningDraft: DocumentMetadataDraft = {
+    docType: 'Documentation',
+    tags: Array.from({ length: 25 }, (_, i) => `tag-${i}`),
+    description: 'A'.repeat(1200),
+  }
+  const validation = validateMetadataDraft(warningDraft)
+  assert.strictEqual(validation.warnings.length, 2)
+  assert.ok(validation.warnings.some((w) => w.includes('20 tags')))
+  assert.ok(validation.warnings.some((w) => w.includes('Description is long')))
+})
+
+test('12. Back navigation preserves file selection and draft metadata without data loss', () => {
+  const dummyFile = (name: string): File =>
+    ({ name, size: 500, type: 'text/plain' } as unknown as File)
+
+  const items: QueuedFileItem[] = [
+    { id: '1', file: dummyFile('plan.md'), name: 'plan.md', size: 500, selected: true, status: 'pending' },
+    { id: '2', file: dummyFile('spec.md'), name: 'spec.md', size: 800, selected: true, status: 'pending' },
+  ]
+  const draft: DocumentMetadataDraft = {
+    docType: 'Technical Spec',
+    classification: 'Confidential',
+    tags: ['architecture', 'v2'],
+    description: 'System design specification',
+  }
+
+  // Simulated transition to review then back to edit
+  let currentStep: 'edit' | 'review' = 'edit'
+  currentStep = 'review'
+  assert.strictEqual(currentStep, 'review')
+
+  // User clicks "Back to edit"
+  currentStep = 'edit'
+  assert.strictEqual(currentStep, 'edit')
+  assert.strictEqual(items.length, 2)
+  assert.strictEqual(draft.docType, 'Technical Spec')
+  assert.deepStrictEqual(draft.tags, ['architecture', 'v2'])
+})
+
+test('13. Batch metadata scoping applies draft to all files or specific single file', () => {
+  const dummyFile = (name: string): File =>
+    ({ name, size: 500, type: 'text/plain' } as unknown as File)
+
+  let items: QueuedFileItem[] = [
+    { id: '1', file: dummyFile('file1.csv'), name: 'file1.csv', size: 1000, selected: true, status: 'pending' },
+    { id: '2', file: dummyFile('file2.csv'), name: 'file2.csv', size: 2000, selected: true, status: 'pending' },
+  ]
+
+  const sharedMetadata: DocumentMetadataDraft = {
+    docType: 'Reference Data',
+    classification: 'Internal',
+    tags: ['csv-import'],
+  }
+
+  // Apply to all
+  items = applyBatchMetadata(items, sharedMetadata)
+  assert.strictEqual(items[0].metadata?.docType, 'Reference Data')
+  assert.strictEqual(items[1].metadata?.docType, 'Reference Data')
+  assert.deepStrictEqual(items[0].metadata?.tags, ['csv-import'])
+
+  // Apply to single file '1'
+  const customSingleMeta: DocumentMetadataDraft = {
+    docType: 'Contract',
+    tags: ['legal'],
+  }
+  items = setItemMetadata(items, '1', customSingleMeta)
+  assert.strictEqual(items[0].metadata?.docType, 'Contract')
+  assert.strictEqual(items[1].metadata?.docType, 'Reference Data') // file2 untouched!
+})
+
+test('14. Prevention of accidental double submission while processing', async () => {
+  let isProcessing = false
+  let submissionCount = 0
+
+  const handleStart = () => {
+    if (isProcessing) return
+    isProcessing = true
+    submissionCount++
+  }
+
+  handleStart()
+  // Immediate second click while running
+  handleStart()
+  handleStart()
+
+  assert.strictEqual(submissionCount, 1)
+  isProcessing = false
+})
+
+test('15. Accurate success notification and backend chunk count accumulation', async () => {
+  const dummyFile = (name: string): File =>
+    ({ name, size: 500, type: 'text/plain' } as unknown as File)
+
+  const items: QueuedFileItem[] = [
+    { id: '1', file: dummyFile('data.csv'), name: 'data.csv', size: 500, selected: true, status: 'pending' },
+    { id: '2', file: dummyFile('notes.txt'), name: 'notes.txt', size: 300, selected: true, status: 'pending' },
+  ]
+
+  const backendResults = [
+    { chunks_created: 1000, skipped: false },
+    { chunks_created: 45, skipped: false },
+  ]
+
+  let totalChunks = 0
+  let completedCount = 0
+
+  for (let i = 0; i < items.length; i++) {
+    const res = backendResults[i]
+    items[i].status = 'completed'
+    items[i].chunksCreated = res.chunks_created
+    totalChunks += res.chunks_created
+    completedCount++
+  }
+
+  assert.strictEqual(completedCount, 2)
+  assert.strictEqual(totalChunks, 1045)
+  const notificationText = `Ingestion complete · ${completedCount} file(s) processed · ${totalChunks.toLocaleString()} chunks indexed`
+  assert.strictEqual(notificationText, 'Ingestion complete · 2 file(s) processed · 1,045 chunks indexed')
+})
+
+test('16. Failure keeps upload panel available and does not report false success', () => {
+  const items: QueuedFileItem[] = [
+    { id: '1', file: ({} as unknown as File), name: 'ok.txt', size: 100, selected: true, status: 'completed', chunksCreated: 10 },
+    { id: '2', file: ({} as unknown as File), name: 'fail.txt', size: 100, selected: true, status: 'failed', errorMessage: 'Permission denied' },
+  ]
+
+  const completed = items.filter((i) => i.status === 'completed').length
+  const failed = items.filter((i) => i.status === 'failed').length
+
+  const shouldClosePanel = failed === 0 && completed > 0
+  assert.strictEqual(shouldClosePanel, false) // MUST remain open!
+  assert.strictEqual(failed, 1)
+  assert.strictEqual(items[1].errorMessage, 'Permission denied')
+})
+

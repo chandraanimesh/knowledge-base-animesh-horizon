@@ -89,6 +89,9 @@ class LLMCallRecord:
     usage: TokenUsage
     latency_ms: float = 0.0
     model_name: str | None = None
+    estimated_prompt_tokens: int | None = None
+    prompt_token_error: int | None = None
+    prompt_token_relative_error: float | None = None
 
 
 @dataclass
@@ -159,6 +162,9 @@ class RequestContextMetrics:
     final_context_count: int = 0
     context_chunks: int = 0
     context_tokens: int = 0
+    context_budget_status: str | None = None
+    dropped_evidence_count: int = 0
+    compiler_latency_ms: float = 0.0
     vector_top_k: int | None = None
     keyword_top_k: int | None = None
     hierarchical_count: int = 0
@@ -314,6 +320,29 @@ def record_retrieval_metrics(
         ctx.conversation_evidence_count = conversation_evidence_count
 
 
+def record_context_compilation_metrics(
+    context_tokens: int | None = None,
+    final_context_count: int | None = None,
+    context_budget_status: str | None = None,
+    dropped_evidence_count: int | None = None,
+    compiler_latency_ms: float | None = None,
+) -> None:
+    ctx = get_request_metrics()
+    if not ctx:
+        return
+    if context_tokens is not None:
+        ctx.context_tokens = context_tokens
+    if final_context_count is not None:
+        ctx.final_context_count = final_context_count
+        ctx.context_chunks = final_context_count
+    if context_budget_status is not None:
+        ctx.context_budget_status = context_budget_status
+    if dropped_evidence_count is not None:
+        ctx.dropped_evidence_count = dropped_evidence_count
+    if compiler_latency_ms is not None:
+        ctx.compiler_latency_ms = compiler_latency_ms
+
+
 def record_sufficiency_metrics(
     sufficiency: bool | None = None,
     status: str | None = None,
@@ -438,6 +467,7 @@ def record_llm_call(
     usage: dict | None = None,
     latency_ms: float = 0.0,
     model_name: str | None = None,
+    estimated_prompt_tokens: int | None = None,
 ) -> None:
     ctx = get_request_metrics()
     if not ctx:
@@ -446,12 +476,34 @@ def record_llm_call(
     target_stage = stage_name or ctx.current_stage or "generation"
     stage = ctx.get_or_create_stage(target_stage)
     parsed_usage = parse_usage_dict(usage)
+
+    error = None
+    rel_error = None
+    if parsed_usage.input_tokens > 0 and estimated_prompt_tokens is not None:
+        error = estimated_prompt_tokens - parsed_usage.input_tokens
+        rel_error = round(abs(error) / parsed_usage.input_tokens, 4)
+        logger.debug(
+            "llm_token_estimation_calibration",
+            extra={
+                "event": "llm_token_estimation_calibration",
+                "stage": target_stage,
+                "model_name": model_name,
+                "estimated_prompt_tokens": estimated_prompt_tokens,
+                "actual_prompt_tokens": parsed_usage.input_tokens,
+                "error": error,
+                "relative_error": rel_error,
+            },
+        )
+
     stage.llm_calls.append(
         LLMCallRecord(
             stage=target_stage,
             usage=parsed_usage,
             latency_ms=round(latency_ms, 2),
             model_name=model_name,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            prompt_token_error=error,
+            prompt_token_relative_error=rel_error,
         )
     )
 
@@ -523,8 +575,6 @@ def finalize_request_metrics() -> ExecutionMetrics | None:
                 regen_lat += sub.latency_ms
 
     total_llm_calls = sum(len(stage_rec.llm_calls) for stage_rec in ctx.stages.values())
-    if total_llm_calls == 0:
-        total_llm_calls = 1
 
     return ExecutionMetrics(
         request_id=ctx.request_id,
@@ -559,6 +609,9 @@ def finalize_request_metrics() -> ExecutionMetrics | None:
         final_context_count=ctx.final_context_count or ctx.accepted_results,
         context_chunks=ctx.context_chunks or ctx.accepted_results,
         context_tokens=ctx.context_tokens,
+        context_budget_status=ctx.context_budget_status,
+        dropped_evidence_count=ctx.dropped_evidence_count,
+        compiler_latency_ms=ctx.compiler_latency_ms,
         vector_top_k=ctx.vector_top_k,
         keyword_top_k=ctx.keyword_top_k,
         hierarchical_count=ctx.hierarchical_count,

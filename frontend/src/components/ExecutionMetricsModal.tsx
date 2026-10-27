@@ -101,7 +101,7 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
   const totalTokens = metrics.total_tokens || metrics.llm_usage?.total_tokens || 0
   const inputTokens = metrics.input_tokens || metrics.llm_usage?.input_tokens || 0
   const outputTokens = metrics.output_tokens || metrics.llm_usage?.output_tokens || 0
-  const llmCalls = metrics.total_llm_calls || metrics.stages?.generation?.llm_calls || 1
+  const llmCalls = metrics.total_llm_calls ?? metrics.stages?.generation?.llm_calls ?? 0
   const totalLatency = metrics.total_latency_ms || 0
   const acceptedCount = metrics.accepted_count || metrics.accepted_results || 0
   const candidateCount = metrics.candidate_count || (
@@ -235,7 +235,7 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
                 {llmCalls} <span style={{ fontSize: '12px', fontWeight: 500, color: '#64748B' }}>call{llmCalls !== 1 ? 's' : ''}</span>
               </div>
               <div style={{ fontSize: '11px', color: '#0284C7', marginTop: '2px' }}>
-                {metrics.stages?.research ? 'Multi-hop graph research' : 'Standard Generation'}
+                {llmCalls === 0 ? 'No LLM calls invoked' : (metrics.stages?.research ? 'Multi-hop graph research' : 'Standard Generation')}
               </div>
             </div>
 
@@ -261,7 +261,7 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
                 {formatDuration(totalLatency)}
               </div>
               <div style={{ fontSize: '11px', color: '#64748B', marginTop: '2px' }}>
-                Retrieval: <strong>{formatDuration(metrics.retrieval_latency_ms || retrieval?.latency_ms)}</strong>
+                Retrieval: <strong>{metrics.stages?.retrieval || metrics.retrieval_latency_ms ? formatDuration(metrics.retrieval_latency_ms || retrieval?.latency_ms) : 'Not invoked'}</strong>
               </div>
             </div>
 
@@ -274,7 +274,9 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
                 {acceptedCount} <span style={{ fontSize: '12px', fontWeight: 500, color: '#64748B' }}>accepted</span>
               </div>
               <div style={{ fontSize: '11px', color: '#64748B', marginTop: '2px' }}>
-                from {candidateCount || acceptedCount} total candidates
+                {metrics.executed_strategies && metrics.executed_strategies.length > 0
+                  ? `from ${candidateCount || acceptedCount} total candidates`
+                  : (metrics.stages?.retrieval ? `from ${candidateCount || acceptedCount} total candidates` : 'Retrieval not invoked')}
               </div>
             </div>
           </div>
@@ -298,14 +300,17 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: '12px', fontWeight: 600, color: '#1E293B' }}>1. Planned Retrieval Strategies</div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '4px' }}>
-                    {(metrics.planned_strategies && metrics.planned_strategies.length > 0
-                      ? metrics.planned_strategies
-                      : ['hybrid_vector', 'bm25_keyword']
-                    ).map((stg, i) => (
-                      <span key={i} style={{ fontSize: '10px', fontWeight: 600, color: '#0369A1', background: '#E0F2FE', padding: '2px 6px', borderRadius: '4px' }}>
-                        {stg.replace(/_/g, ' ').toUpperCase()}
+                    {metrics.planned_strategies && metrics.planned_strategies.length > 0 ? (
+                      metrics.planned_strategies.map((stg, i) => (
+                        <span key={i} style={{ fontSize: '10px', fontWeight: 600, color: '#0369A1', background: '#E0F2FE', padding: '2px 6px', borderRadius: '4px' }}>
+                          {stg.replace(/_/g, ' ').toUpperCase()}
+                        </span>
+                      ))
+                    ) : (
+                      <span style={{ fontSize: '11px', color: '#94A3B8', fontStyle: 'italic' }}>
+                        Retrieval not invoked
                       </span>
-                    ))}
+                    )}
                   </div>
                 </div>
               </div>
@@ -316,18 +321,24 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: '12px', fontWeight: 600, color: '#1E293B' }}>2. Candidate Search Results</div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', marginTop: '4px', fontSize: '11px', color: '#475569' }}>
-                    {metrics.vector_candidates !== undefined && (
-                      <span>Vector Candidates: <strong>{metrics.vector_candidates}</strong></span>
+                    {(metrics.executed_strategies && metrics.executed_strategies.length > 0) || metrics.stages?.retrieval ? (
+                      <>
+                        {metrics.vector_candidates !== undefined && (
+                          <span>Vector Candidates: <strong>{metrics.vector_candidates}</strong></span>
+                        )}
+                        {metrics.keyword_candidates !== undefined && (
+                          <span>BM25 Keyword: <strong>{metrics.keyword_candidates}</strong></span>
+                        )}
+                        {metrics.knowledge_candidates ? (
+                          <span>Knowledge Graph: <strong>{metrics.knowledge_candidates}</strong></span>
+                        ) : null}
+                        {metrics.conversation_evidence_count ? (
+                          <span>Conversation Threads: <strong>{metrics.conversation_evidence_count}</strong></span>
+                        ) : null}
+                      </>
+                    ) : (
+                      <span style={{ color: '#94A3B8', fontStyle: 'italic' }}>Retrieval not invoked</span>
                     )}
-                    {metrics.keyword_candidates !== undefined && (
-                      <span>BM25 Keyword: <strong>{metrics.keyword_candidates}</strong></span>
-                    )}
-                    {metrics.knowledge_candidates ? (
-                      <span>Knowledge Graph: <strong>{metrics.knowledge_candidates}</strong></span>
-                    ) : null}
-                    {metrics.conversation_evidence_count ? (
-                      <span>Conversation Threads: <strong>{metrics.conversation_evidence_count}</strong></span>
-                    ) : null}
                   </div>
                 </div>
               </div>
@@ -340,9 +351,11 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
                   <div style={{ fontSize: '11px', color: '#475569', marginTop: '2px' }}>
                     {metrics.reranked_candidates !== undefined && metrics.reranked_candidates > 0 ? (
                       <span>Evaluated <strong>{metrics.reranked_candidates}</strong> candidates through CrossEncoder.</span>
-                    ) : (
+                    ) : ((metrics.executed_strategies && metrics.executed_strategies.length > 0) || metrics.stages?.retrieval ? (
                       <span>RRF (Reciprocal Rank Fusion) hybrid scoring applied.</span>
-                    )}
+                    ) : (
+                      <span style={{ color: '#94A3B8', fontStyle: 'italic' }}>Reranking not executed</span>
+                    ))}
                     {metrics.reranker_top_score !== undefined && metrics.reranker_top_score !== null && (
                       <span style={{ marginLeft: '6px' }}>Top Score: <strong>{metrics.reranker_top_score.toFixed(3)}</strong></span>
                     )}
@@ -404,7 +417,7 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
             <div style={{ background: '#F8FAFC', border: '1px solid #E2E8F0', borderRadius: '12px', padding: '14px' }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <span style={{ fontSize: '12px', fontWeight: 600, color: '#1E293B' }}>🛡️ Grounding Verification</span>
-                {metrics.grounding !== undefined && metrics.grounding !== null && (
+                {metrics.grounding !== undefined && metrics.grounding !== null ? (
                   <span
                     style={{
                       fontSize: '10px',
@@ -417,10 +430,23 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
                   >
                     {metrics.grounding ? '✓ GROUNDED' : '✖ UNGROUNDED'}
                   </span>
+                ) : (
+                  <span
+                    style={{
+                      fontSize: '10px',
+                      fontWeight: 600,
+                      padding: '2px 6px',
+                      borderRadius: '4px',
+                      background: '#F1F5F9',
+                      color: '#64748B',
+                    }}
+                  >
+                    NOT EVALUATED
+                  </span>
                 )}
               </div>
               <div style={{ fontSize: '11px', color: '#64748B', marginTop: '6px' }}>
-                Confidence: <strong>{metrics.grounding_confidence !== undefined && metrics.grounding_confidence !== null ? `${Math.round(metrics.grounding_confidence * 100)}%` : '100%'}</strong>
+                Confidence: <strong>{metrics.grounding_confidence !== undefined && metrics.grounding_confidence !== null ? `${Math.round(metrics.grounding_confidence * 100)}%` : (metrics.grounding !== undefined && metrics.grounding !== null ? '0%' : 'Not evaluated')}</strong>
               </div>
               {metrics.repair_triggered && (
                 <div style={{ fontSize: '10px', color: '#0284C7', marginTop: '4px', fontWeight: 600 }}>
@@ -433,8 +459,8 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
             <div style={{ background: '#F8FAFC', border: '1px solid #E2E8F0', borderRadius: '12px', padding: '14px' }}>
               <div style={{ fontSize: '12px', fontWeight: 600, color: '#1E293B' }}>💬 Generation Breakdown</div>
               <div style={{ fontSize: '11px', color: '#64748B', marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                <div>Generation Time: <strong>{formatDuration(metrics.generation_latency_ms || generation?.latency_ms)}</strong></div>
-                <div>Tokens Output: <strong>{outputTokens.toLocaleString()} tokens</strong></div>
+                <div>Generation Time: <strong>{metrics.stages?.generation || metrics.generation_latency_ms ? formatDuration(metrics.generation_latency_ms || generation?.latency_ms) : 'Not invoked'}</strong></div>
+                <div>Tokens Output: <strong>{outputTokens > 0 ? `${outputTokens.toLocaleString()} tokens` : (metrics.stages?.generation ? '0 tokens' : 'N/A')}</strong></div>
               </div>
             </div>
           </div>

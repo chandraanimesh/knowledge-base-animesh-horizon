@@ -17,6 +17,8 @@ from rag_app.schemas.workspace import (
     WorkspaceProviderProfileUpdate,
     WorkspaceProviderProfileResponse,
     ProviderRegistrySummary,
+    ProviderTestConnectionRequest,
+    ProviderTestConnectionResponse,
 )
 from rag_app.workspace.service import WorkspaceService
 
@@ -190,6 +192,26 @@ async def upsert_workspace_provider_profile(
 ) -> WorkspaceProviderProfileResponse:
     service = WorkspaceService(session)
     return await service.upsert_provider_profile(user, workspace_id, payload)
+
+
+@router.post(
+    "/{workspace_id}/provider-profile/test-connection",
+    response_model=ProviderTestConnectionResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Test provider connection and validate model compatibility",
+    description=(
+        "Executes a real probe (e.g. test inference or dimension validation) "
+        "to verify provider connectivity and configuration. Requires workspace OWNER or ADMIN."
+    ),
+)
+async def test_workspace_provider_connection(
+    workspace_id: uuid.UUID,
+    payload: ProviderTestConnectionRequest,
+    user: CurrentUser,
+    session: DbSession,
+) -> ProviderTestConnectionResponse:
+    service = WorkspaceService(session)
+    return await service.test_provider_connection(user, workspace_id, payload)
 
 
 # ------------------------------------------------------------------

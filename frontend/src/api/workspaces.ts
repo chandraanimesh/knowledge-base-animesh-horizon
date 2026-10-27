@@ -177,6 +177,39 @@ export async function getProviderCapabilities(
   );
 }
 
+export interface ProviderTestConnectionRequest {
+  capability: string;
+  provider: string;
+  model?: string | null;
+  credential_ref?: string | null;
+  extra_config?: Record<string, any>;
+}
+
+export interface ProviderTestConnectionResponse {
+  success: boolean;
+  capability: string;
+  provider: string;
+  model?: string | null;
+  message: string;
+  latency_ms?: number | null;
+  details?: Record<string, any>;
+}
+
+export async function testProviderConnection(
+  token: string,
+  workspaceId: string,
+  data: ProviderTestConnectionRequest
+): Promise<ProviderTestConnectionResponse> {
+  return apiClient<ProviderTestConnectionResponse>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/provider-profile/test-connection`,
+    {
+      method: 'POST',
+      body: JSON.stringify(data),
+    },
+    token
+  );
+}
+
 export const workspaceApi = {
   listWorkspaces,
   getWorkspace,
@@ -190,5 +223,6 @@ export const workspaceApi = {
   getWorkspaceProviderProfile,
   upsertWorkspaceProviderProfile,
   getProviderCapabilities,
+  testProviderConnection,
 };
 

@@ -167,7 +167,7 @@ async def test_visualize_this_uses_parent_evidence_no_second_retrieval(db_sessio
     dept_id = uuid.uuid4()
     conv_id = uuid.uuid4()
 
-    user = User(id=user_id, email=f"analyst_{uuid.uuid4().hex[:6]}@corp.local", role="USER", hashed_password="fake")
+    user = User(id=user_id, email=f"analyst_{uuid.uuid4().hex[:6]}@corp.local", role="ADMIN", hashed_password="fake")
     dept = Department(id=dept_id, name="Sales", code=f"SALES_{uuid.uuid4().hex[:6]}", is_active=True)
     user_dept = UserDepartment(user_id=user_id, department_id=dept_id)
     conv = Conversation(id=conv_id, user_id=user_id, title="Sales Discussion")
@@ -261,7 +261,9 @@ async def test_unauthorized_evidence_cannot_enter_visualization(db_session: Asyn
     dept1 = Department(id=dept_allowed, name="Finance", code=f"FIN_{uuid.uuid4().hex[:6]}", is_active=True)
     dept2 = Department(id=dept_forbidden, name="Confidential HR", code=f"HR_{uuid.uuid4().hex[:6]}", is_active=True)
     user_dept = UserDepartment(user_id=user_id, department_id=dept_allowed)
-    conv = Conversation(id=conv_id, user_id=user_id, title="Finance Review")
+    ws = Workspace(id=uuid.uuid4(), name="Finance Workspace", code=f"fin_ws_{uuid.uuid4().hex[:6]}", department_id=dept_allowed, is_active=True)
+    ws_member = WorkspaceMember(workspace_id=ws.id, user_id=user_id, role="EDITOR")
+    conv = Conversation(id=conv_id, user_id=user_id, workspace_id=ws.id, title="Finance Review")
 
     parent_sources = [
         {
@@ -282,7 +284,7 @@ async def test_unauthorized_evidence_cannot_enter_visualization(db_session: Asyn
         sources=parent_sources,
     )
 
-    db_session.add_all([user, dept1, dept2, user_dept, conv, parent_msg])
+    db_session.add_all([user, dept1, dept2, user_dept, ws, ws_member, conv, parent_msg])
     await db_session.commit()
 
     mock_retrieval_service = MagicMock()
@@ -294,9 +296,10 @@ async def test_unauthorized_evidence_cannot_enter_visualization(db_session: Asyn
         action="visualize",
         target_message_id=parent_msg.id,
         conversation_id=conv_id,
+        workspace_id=ws.id,
     )
 
-    with patch("rag_app.security.authorization.get_allowed_departments", return_value=[dept_allowed]):
+    with patch("rag_app.security.authorization.get_allowed_departments", return_value=[dept_allowed]), patch("rag_app.conversation.service.authorize", return_value=True):
         resp = await ask_question(
             request=request,
             service=gen_service,

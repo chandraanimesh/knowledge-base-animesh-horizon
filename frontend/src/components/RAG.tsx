@@ -6,6 +6,9 @@ import {
   RetrievedChunk,
   ExecutionMetrics,
   getConversation,
+  ArtifactMetadata,
+  CoverageReport,
+  SourceItem,
 } from '../api/chat'
 import { uploadDocument } from '../api/documents'
 import {
@@ -20,6 +23,7 @@ import WorkspaceProviderSettingsModal from './WorkspaceProviderSettingsModal'
 import { NavItem } from './Sidebar'
 import { VisualizationRenderer, VisualizationSpec } from './visualizations'
 import { MarkdownRenderer } from './MarkdownRenderer'
+import { SourceCards } from './SourceCards'
 import {
   SlashCommandMenu,
   SlashCommandGuidance,
@@ -29,17 +33,23 @@ import {
 } from './SlashCommandAutocomplete'
 
 type Role = 'user' | 'assistant'
-interface Source { title: string; excerpt: string; }
-interface Message { id: number | string; role: Role; text: string; visualization?: VisualizationSpec | null; sources?: Source[]; metrics?: ExecutionMetrics | null; isTyping?: boolean; }
-
-function SourceCard({ source }: { source: Source }) {
-  return (
-    <div style={{ background: 'var(--color-teal-light)', borderLeft: '2px solid var(--color-teal)', padding: '10px 14px', borderRadius: '4px', marginTop: '8px' }}>
-      <div style={{ fontFamily: 'var(--font-mono)', fontSize: '10px', letterSpacing: '0.08em', color: 'var(--color-teal)', marginBottom: '4px', textTransform: 'uppercase' }}>{source.title}</div>
-      <div style={{ fontSize: '13px', color: 'var(--color-ink-muted)', lineHeight: 1.5, fontStyle: 'italic' }}>"{source.excerpt}"</div>
-    </div>
-  )
+export type Source = SourceItem;
+interface Message {
+  id: number | string;
+  role: Role;
+  text: string;
+  visualization?: VisualizationSpec | null;
+  sources?: SourceItem[];
+  metrics?: ExecutionMetrics | null;
+  artifacts?: ArtifactMetadata[];
+  coverage?: CoverageReport | null;
+  workflow_run_id?: string | null;
+  workflow_status?: string | null;
+  isTyping?: boolean;
 }
+
+import { ArtifactCard, ArtifactList, CoverageNotice } from './ArtifactList';
+import { WorkflowRunProgressCard } from './WorkflowRunProgressCard';
 
 function formatTokens(n: number | undefined | null): string {
   if (n === undefined || n === null) return '0 tokens'
@@ -328,7 +338,19 @@ function TypingIndicator({ customLabel }: { customLabel?: string }) {
   )
 }
 
-function AssistantMessage({ msg, onVisualize }: { msg: Message; onVisualize?: (msgId: string | number) => void }) {
+function AssistantMessage({
+  msg,
+  token,
+  onVisualize,
+  onRegenerateArtifact,
+}: {
+  msg: Message;
+  token?: string;
+  onVisualize?: (msgId: string | number) => void;
+  onRegenerateArtifact?: (msgId: string | number, updated: ArtifactMetadata) => void;
+}) {
+  const [focusedCitation, setFocusedCitation] = useState<string | null>(null);
+
   return (
     <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-start' }}>
       <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: 'var(--color-teal)', flexShrink: 0, marginTop: '3px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -367,14 +389,32 @@ function AssistantMessage({ msg, onVisualize }: { msg: Message; onVisualize?: (m
           <>
             <MarkdownRenderer
               content={msg.text}
+              artifacts={msg.artifacts}
+              onCitationClick={(label) => setFocusedCitation(label)}
               style={{ margin: 0, fontFamily: "'Segoe UI', system-ui, sans-serif", fontSize: '16px', lineHeight: 1.7, color: 'var(--color-ink)' }}
             />
             {msg.visualization && <VisualizationRenderer spec={msg.visualization} />}
+            {msg.coverage && <CoverageNotice coverage={msg.coverage} />}
+            {msg.artifacts && msg.artifacts.length > 0 && (
+              <ArtifactList
+                artifacts={msg.artifacts}
+                token={token}
+                onRegenerate={(updated) => onRegenerateArtifact && onRegenerateArtifact(msg.id, updated)}
+              />
+            )}
             {msg.sources && msg.sources.length > 0 && (
-              <div style={{ marginTop: '12px' }}>
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: '10px', letterSpacing: '0.08em', color: 'var(--color-ink-muted)', textTransform: 'uppercase', marginBottom: '6px' }}>{msg.sources.length} source{msg.sources.length !== 1 ? 's' : ''} retrieved</div>
-                {msg.sources.map((s, i) => <SourceCard key={i} source={s} />)}
-              </div>
+              <SourceCards
+                sources={msg.sources}
+                focusedCitation={focusedCitation}
+                onClearFocusedCitation={() => setFocusedCitation(null)}
+              />
+            )}
+            {msg.workflow_run_id && (
+              <WorkflowRunProgressCard
+                runId={msg.workflow_run_id}
+                token={token}
+                initialStatus={msg.workflow_status}
+              />
             )}
             {msg.metrics && <ExecutionMetricsView metrics={msg.metrics} />}
           </>
@@ -499,6 +539,9 @@ export default function RAG({
   const [allWorkspaces, setAllWorkspaces] = useState<WorkspaceItem[]>(workspaces)
   const [chatWorkspaceId, setChatWorkspaceId] = useState<string>(activeWorkspaceId || '')
 
+  // Execution Mode: 'fast_path' (default) or 'adaptive_workflow'
+  const [executionMode, setExecutionMode] = useState<'fast_path' | 'adaptive_workflow'>('fast_path')
+
   // Provider Capabilities for RAG Run Experimentation Knobs
   const [capabilities, setCapabilities] = useState<ProviderCapabilitiesSummary>({
     llm: ['groq'],
@@ -506,7 +549,7 @@ export default function RAG({
     document_reader: ['docling'],
     reranker: ['cross_encoder'],
     ocr: ['paddle_ocr'],
-    web: ['firecrawl'],
+    web: ['tinyfish', 'tavily', 'firecrawl'],
   })
 
   // Per-Run Experiment Overrides State
@@ -590,6 +633,8 @@ export default function RAG({
                 visualization: m.visualization,
                 sources: m.sources || undefined,
                 metrics: m.execution_metrics || undefined,
+                artifacts: m.artifacts,
+                coverage: m.coverage,
               })
             }
           }
@@ -744,6 +789,7 @@ export default function RAG({
           provider_overrides: overrides,
           action: actionVal,
           target_message_id: targetMsgId,
+          execution_mode: executionMode,
         },
         token
       )
@@ -751,10 +797,19 @@ export default function RAG({
         onConversationCreatedOrUpdated(res.conversation_id)
       }
 
-      const mappedSources: Source[] = res.retrieved_chunks.map((c: RetrievedChunk) => ({
-        title: `${c.file_name}${c.page_number ? ` (Page ${c.page_number})` : ''}`,
-        excerpt: c.text,
-      }))
+      const mappedSources: SourceItem[] = (res.sources && res.sources.length > 0)
+        ? res.sources
+        : (res.retrieved_chunks || []).map((c: RetrievedChunk) => ({
+            type: c.chunk_id?.startsWith('web_') ? 'web_research' : 'document',
+            chunk_id: c.chunk_id,
+            document_id: c.document_id,
+            department_id: c.department_id,
+            file_name: c.file_name,
+            page_number: c.page_number,
+            url: (c.chunk_id?.startsWith('web_') && c.document_id?.startsWith('http')) ? c.document_id : undefined,
+            title: `${c.file_name}${c.page_number ? ` (Page ${c.page_number})` : ''}`,
+            excerpt: c.text,
+          }))
 
       // Store raw retrieved chunks for Sources panel
       if (res.retrieved_chunks && res.retrieved_chunks.length > 0) {
@@ -765,7 +820,19 @@ export default function RAG({
       setMessages((m) =>
         m.map((msg) =>
           msg.id === typingMsg.id
-            ? { ...msg, id: res.message_id || msg.id, text: formattedAnswer, visualization: res.visualization, sources: mappedSources, metrics: res.execution_metrics, isTyping: false }
+            ? {
+                ...msg,
+                id: res.message_id || msg.id,
+                text: formattedAnswer,
+                visualization: res.visualization,
+                sources: mappedSources,
+                metrics: res.execution_metrics,
+                artifacts: res.artifacts,
+                coverage: res.coverage,
+                workflow_run_id: res.workflow_run_id,
+                workflow_status: res.workflow_status,
+                isTyping: false,
+              }
             : msg
         )
       )
@@ -799,10 +866,19 @@ export default function RAG({
         token
       )
 
-      const mappedSources: Source[] = (res.retrieved_chunks || []).map((c: RetrievedChunk) => ({
-        title: `${c.file_name}${c.page_number ? ` (Page ${c.page_number})` : ''}`,
-        excerpt: c.text,
-      }))
+      const mappedSources: SourceItem[] = (res.sources && res.sources.length > 0)
+        ? res.sources
+        : (res.retrieved_chunks || []).map((c: RetrievedChunk) => ({
+            type: c.chunk_id?.startsWith('web_') ? 'web_research' : 'document',
+            chunk_id: c.chunk_id,
+            document_id: c.document_id,
+            department_id: c.department_id,
+            file_name: c.file_name,
+            page_number: c.page_number,
+            url: (c.chunk_id?.startsWith('web_') && c.document_id?.startsWith('http')) ? c.document_id : undefined,
+            title: `${c.file_name}${c.page_number ? ` (Page ${c.page_number})` : ''}`,
+            excerpt: c.text,
+          }))
 
       setMessages((m) =>
         m.map((msg) =>
@@ -814,6 +890,8 @@ export default function RAG({
                 visualization: res.visualization,
                 sources: mappedSources,
                 metrics: res.execution_metrics,
+                artifacts: res.artifacts,
+                coverage: res.coverage,
                 isTyping: false,
               }
             : msg
@@ -1262,7 +1340,24 @@ export default function RAG({
         >
           {messages.map((msg) =>
             msg.role === 'assistant' ? (
-              <AssistantMessage key={msg.id} msg={msg} onVisualize={handleVisualizeThis} />
+              <AssistantMessage
+                key={msg.id}
+                msg={msg}
+                token={token}
+                onVisualize={handleVisualizeThis}
+                onRegenerateArtifact={(msgId, updated) => {
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === msgId && m.artifacts
+                        ? {
+                            ...m,
+                            artifacts: m.artifacts.map((a) => (a.id === updated.id ? updated : a)),
+                          }
+                        : m
+                    )
+                  )
+                }}
+              />
             ) : (
               <UserMessage key={msg.id} msg={msg} />
             )
@@ -1364,6 +1459,38 @@ export default function RAG({
               }}
             />
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span
+                  style={{
+                    fontSize: '11px',
+                    color: 'var(--color-ink-muted)',
+                    fontFamily: 'var(--font-mono)',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  Mode:
+                </span>
+                <select
+                  value={executionMode}
+                  onChange={(e) => setExecutionMode(e.target.value as 'fast_path' | 'adaptive_workflow')}
+                  disabled={isInputDisabled}
+                  title="Choose between single-shot Fast-Path RAG and Adaptive Multi-Step Workflow"
+                  style={{
+                    background: executionMode === 'adaptive_workflow' ? 'rgba(16, 185, 129, 0.12)' : 'var(--color-surface)',
+                    border: executionMode === 'adaptive_workflow' ? '1px solid #10b981' : '1px solid var(--color-border)',
+                    borderRadius: '6px',
+                    fontSize: '11px',
+                    padding: '5px 8px',
+                    color: executionMode === 'adaptive_workflow' ? '#10b981' : 'var(--color-ink)',
+                    cursor: isInputDisabled ? 'default' : 'pointer',
+                    fontWeight: executionMode === 'adaptive_workflow' ? 600 : 400,
+                  }}
+                >
+                  <option value="fast_path">⚡ Fast-Path RAG</option>
+                  <option value="adaptive_workflow">🧠 Adaptive Workflow</option>
+                </select>
+              </div>
+
               {normalizedUploadDepts.length > 0 && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                   <span

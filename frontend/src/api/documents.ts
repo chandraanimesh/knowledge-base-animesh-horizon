@@ -8,14 +8,39 @@ export interface IngestResponse {
   reason?: string;
 }
 
+export interface DocumentMetadataPayload {
+  doc_type?: string;
+  tags?: string[];
+  description?: string;
+  classification?: string;
+  visibility?: string;
+}
+
 export async function uploadDocument(
   file: File,
   departmentCode: string,
   token: string,
-  workspaceId?: string
+  workspaceId?: string,
+  metadata?: DocumentMetadataPayload
 ): Promise<IngestResponse> {
   const formData = new FormData();
   formData.append('file', file);
+
+  if (metadata?.doc_type) {
+    formData.append('doc_type', metadata.doc_type);
+  }
+  if (metadata?.tags && metadata.tags.length > 0) {
+    formData.append('tags', JSON.stringify(metadata.tags));
+  }
+  if (metadata?.description) {
+    formData.append('description', metadata.description);
+  }
+  if (metadata?.classification) {
+    formData.append('classification', metadata.classification);
+  }
+  if (metadata?.visibility) {
+    formData.append('visibility', metadata.visibility);
+  }
   
   let url = `/documents/upload?department_code=${encodeURIComponent(departmentCode)}`;
   if (workspaceId) {

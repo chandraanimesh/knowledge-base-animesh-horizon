@@ -12,6 +12,7 @@ Validates:
 """
 
 import uuid
+import asyncio
 import pytest
 import pytest_asyncio
 from sqlalchemy import delete, select
@@ -20,10 +21,13 @@ from rag_app.db.models import (
     AccessRequest,
     AccessRequestPermission,
     Department,
+    Document,
     Permission,
     User,
     UserDepartment,
     UserPermission,
+    Workspace,
+    WorkspaceMember,
 )
 from rag_app.db.session import AsyncSessionLocal, engine
 from rag_app.mcp.gateway import MCPGatewayError
@@ -61,11 +65,17 @@ async def rbac_test_setup():
         if not dept_eng:
             dept_eng = Department(code="MCP_ENG", name="MCP Engineering", is_active=True)
             session.add(dept_eng)
+        else:
+            dept_eng.is_active = True
+            dept_eng.deleted_at = None
 
         dept_fin = await session.scalar(select(Department).where(Department.code == "MCP_FIN"))
         if not dept_fin:
             dept_fin = Department(code="MCP_FIN", name="MCP Finance", is_active=True)
             session.add(dept_fin)
+        else:
+            dept_fin.is_active = True
+            dept_fin.deleted_at = None
 
         await session.flush()
 
@@ -469,4 +479,200 @@ async def test_rag_ask_authorization_boundary_isolation(rbac_test_setup):
     # The unauthorized user cannot retrieve the document, so secret_marker will not be cited/grounded from MCP_ENG doc
     citations = fin_ask.get("citations", [])
     assert not any(secret_marker in str(c) for c in citations)
+
+
+# ── 11. Omitted Department Code Ingestion Authorization Tests ────────────────
+
+@pytest.mark.asyncio
+async def test_upload_denied_without_upload_permission_even_when_department_omitted(rbac_test_setup):
+    """
+    A user with only VIEW permission (no UPLOAD permission) must be strictly DENIED (403)
+    from ingesting documents even when department_code is omitted.
+    """
+    fin_token = rbac_test_setup["fin_token"]
+    unique_suffix = uuid.uuid4().hex[:8]
+
+    with pytest.raises(MCPGatewayError) as exc_info:
+        await ingest_document(
+            filename=f"view_only_bypass_{unique_suffix}.txt",
+            content_text="Attempting to upload without UPLOAD permission by omitting department_code",
+            department_code=None,
+            auth_token=fin_token,
+        )
+    assert exc_info.value.code == "FORBIDDEN"
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_multiple_eligible_departments_require_explicit_department_code(rbac_test_setup):
+    """
+    If a user has UPLOAD permission in multiple departments, omitting department_code
+    must not pick arbitrarily and must return 400 INVALID_REQUEST requiring explicit department_code.
+    """
+    eng_token = rbac_test_setup["eng_token"]
+    eng_user = rbac_test_setup["eng_user"]
+    dept_fin = rbac_test_setup["dept_fin"]
+
+    async with AsyncSessionLocal() as session:
+        perm_upload = await session.scalar(select(Permission).where(Permission.code == "UPLOAD"))
+        # Temporarily grant eng_user UPLOAD in dept_fin as well
+        session.add(UserDepartment(user_id=eng_user.id, department_id=dept_fin.id))
+        session.add(UserPermission(user_id=eng_user.id, department_id=dept_fin.id, permission_id=perm_upload.id))
+        await session.commit()
+
+    try:
+        with pytest.raises(MCPGatewayError) as exc_info:
+            await ingest_document(
+                filename="ambiguous_dept.txt",
+                content_text="Multiple upload departments exist",
+                department_code=None,
+                auth_token=eng_token,
+            )
+        assert exc_info.value.code == "INVALID_REQUEST"
+        assert exc_info.value.status_code == 400
+        assert "Multiple departments" in exc_info.value.message
+    finally:
+        # Cleanup extra membership
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                delete(UserPermission).where(
+                    UserPermission.user_id == eng_user.id,
+                    UserPermission.department_id == dept_fin.id,
+                )
+            )
+            await session.execute(
+                delete(UserDepartment).where(
+                    UserDepartment.user_id == eng_user.id,
+                    UserDepartment.department_id == dept_fin.id,
+                )
+            )
+            await session.commit()
+
+
+# ── 12. Workspace Boundary Isolation in RAG Ask ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_rag_ask_workspace_boundary_isolation(rbac_test_setup):
+    """
+    Verify that rag_ask with workspace_id strictly bounds retrieval to that workspace,
+    and documents in another workspace within the same department do not leak.
+    """
+    admin_token = rbac_test_setup["admin_token"]
+    eng_token = rbac_test_setup["eng_token"]
+    eng_user = rbac_test_setup["eng_user"]
+    dept_eng = rbac_test_setup["dept_eng"]
+
+    ws1_id = uuid.uuid4()
+    ws2_id = uuid.uuid4()
+    secret_marker = f"WS1_EXCLUSIVE_{uuid.uuid4().hex[:8]}"
+
+    async with AsyncSessionLocal() as session:
+        # Create two separate workspaces in the same department
+        ws1 = Workspace(
+            id=ws1_id,
+            name="Eng Project Alpha",
+            code=f"alpha_{uuid.uuid4().hex[:6]}",
+            department_id=dept_eng.id,
+            is_active=True,
+        )
+        ws2 = Workspace(
+            id=ws2_id,
+            name="Eng Project Beta",
+            code=f"beta_{uuid.uuid4().hex[:6]}",
+            department_id=dept_eng.id,
+            is_active=True,
+        )
+        session.add_all([ws1, ws2])
+        await session.flush()
+
+        # eng_user is a member of both workspaces
+        session.add(WorkspaceMember(workspace_id=ws1.id, user_id=eng_user.id, role="OWNER"))
+        session.add(WorkspaceMember(workspace_id=ws2.id, user_id=eng_user.id, role="OWNER"))
+        await session.commit()
+
+    try:
+        # Ingest document exclusively into workspace 1
+        await ingest_document(
+            filename=f"ws1_doc_{secret_marker}.txt",
+            content_text=f"Classified Alpha Workspace Project: {secret_marker}",
+            department_code="MCP_ENG",
+            workspace_id=str(ws1_id),
+            auth_token=admin_token,
+        )
+
+        # 1. Asking within workspace 1 retrieves it
+        ask_ws1 = await rag_ask(
+            query=f"What is the classified alpha project {secret_marker}?",
+            workspace_id=str(ws1_id),
+            auth_token=eng_token,
+        )
+        assert "answer" in ask_ws1
+
+        # 2. Asking within workspace 2 MUST NOT retrieve workspace 1 document
+        ask_ws2 = await rag_ask(
+            query=f"What is the classified alpha project {secret_marker}?",
+            workspace_id=str(ws2_id),
+            auth_token=eng_token,
+        )
+        citations_ws2 = ask_ws2.get("citations", [])
+        assert not any(secret_marker in str(c) for c in citations_ws2)
+    finally:
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(Document).where(Document.workspace_id.in_([ws1_id, ws2_id])))
+            await session.execute(delete(WorkspaceMember).where(WorkspaceMember.workspace_id.in_([ws1_id, ws2_id])))
+            await session.execute(delete(Workspace).where(Workspace.id.in_([ws1_id, ws2_id])))
+            await session.commit()
+
+
+# ── 13. Concurrent Multi-Persona Isolation Test ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_concurrent_multi_persona_isolation(rbac_test_setup):
+    """
+    Ensure simultaneous invocations by ADMIN, USER1 (Dept A), and USER2 (Dept B)
+    do not leak credentials, identities, or permissions across async contexts.
+    """
+    admin_token = rbac_test_setup["admin_token"]
+    eng_token = rbac_test_setup["eng_token"]
+    fin_token = rbac_test_setup["fin_token"]
+
+    admin_user = rbac_test_setup["admin_user"]
+    eng_user = rbac_test_setup["eng_user"]
+    fin_user = rbac_test_setup["fin_user"]
+
+    async def fetch_profile(token):
+        return await get_current_user_profile(auth_token=token)
+
+    async def fetch_access(token):
+        return await get_current_user_access(auth_token=token)
+
+    # Concurrently execute profile and access requests across all 3 personas
+    results = await asyncio.gather(
+        fetch_profile(admin_token),
+        fetch_profile(eng_token),
+        fetch_profile(fin_token),
+        fetch_access(admin_token),
+        fetch_access(eng_token),
+        fetch_access(fin_token),
+    )
+
+    admin_prof, eng_prof, fin_prof, admin_acc, eng_acc, fin_acc = results
+
+    # Verify distinct profile identities
+    assert admin_prof["id"] == str(admin_user.id)
+    assert admin_prof["role"] == "ADMIN"
+
+    assert eng_prof["id"] == str(eng_user.id)
+    assert eng_prof["role"] == "USER"
+
+    assert fin_prof["id"] == str(fin_user.id)
+    assert fin_prof["role"] == "USER"
+
+    # Verify distinct access boundaries
+    assert "MCP_ENG" in eng_acc
+    assert "MCP_FIN" not in eng_acc
+
+    assert "MCP_FIN" in fin_acc
+    assert "MCP_ENG" not in fin_acc
+
 

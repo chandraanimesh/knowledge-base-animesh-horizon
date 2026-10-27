@@ -37,6 +37,20 @@ ALLOWLISTED_PACKAGES = [
 ]
 
 
+def get_public_health_probe() -> dict[str, Any]:
+    """
+    Minimal boolean/service-availability probe for unauthenticated health checks.
+    Strictly discloses NO database counts, user counts, department counts,
+    document counts, chunk counts, or internal infrastructure metrics.
+    """
+    return {
+        "status": "healthy",
+        "authenticated": False,
+        "service": "Production RAG MCP Server",
+        "public_probe": True,
+    }
+
+
 async def run_system_diagnostics(include_rag_smoketest: bool = False) -> DiagnosticsResult:
     """
     Executes controlled system health checks using safe allowlists.

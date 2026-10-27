@@ -6,41 +6,44 @@ from rag_app.research.provider import WebPageResult
 from rag_app.schemas.research import CleanWebPage
 from rag_app.ingestion.chunker import normalize_text
 
-def clean_web_page(page: WebPageResult) -> CleanWebPage:
+MAX_PAGE_CLEAN_CHARS = 16000
+
+
+def clean_web_page(page: WebPageResult, max_chars: int = MAX_PAGE_CLEAN_CHARS) -> CleanWebPage:
     """
     Normalizes a WebPageResult into a CleanWebPage.
     Uses basic deterministic transformations to clean whitespace and noise,
-    without using an LLM or altering factual content.
+    bounds initial character volume, and tracks truncation provenance.
     """
+    meta = dict(page.metadata or {})
     if not page.markdown:
-        # Empty content
         return CleanWebPage(
             url=page.url,
             title=page.title,
             content="",
-            metadata=page.metadata
+            metadata=meta,
         )
     
-    # Use the existing normalize_text from chunker
     cleaned_text = normalize_text(page.markdown)
-    
-    # Remove simple markdown image links to reduce noise
-    # e.g., [![alt](img.jpg)](url) -> we want to keep text, but images are noise for our extraction
-    # Actually, the user says "Do NOT blindly strip content based on assumptions." 
-    # and "The cleaner must prioritize preserving factual content."
-    # Let's keep it very safe. We can strip empty lines and redundant whitespace.
-    
-    # Remove markdown images: ![alt](url)
-    cleaned_text = re.sub(r'!\[.*?\]\(.*?\)', '', cleaned_text)
-    
-    # Ensure it's stripped
-    cleaned_text = cleaned_text.strip()
-    
+    cleaned_text = re.sub(r'!\[.*?\]\(.*?\)', '', cleaned_text).strip()
+
+    if len(cleaned_text) > max_chars:
+        # Bounded initial character trimming at paragraph boundary
+        truncated_slice = cleaned_text[:max_chars]
+        last_para = truncated_slice.rfind("\n\n")
+        if last_para > int(max_chars * 0.7):
+            cleaned_text = truncated_slice[:last_para].strip()
+        else:
+            cleaned_text = truncated_slice.strip()
+        meta["is_truncated"] = True
+        meta["truncated_from_chars"] = len(page.markdown)
+        meta["clean_chars"] = len(cleaned_text)
+
     return CleanWebPage(
         url=page.url,
         title=page.title,
         content=cleaned_text,
-        metadata=page.metadata
+        metadata=meta,
     )
 
 

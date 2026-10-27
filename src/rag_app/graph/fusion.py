@@ -21,6 +21,8 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from rag_app.core.config import settings
+from rag_app.crm.factory import AnyCRMClient, get_crm_client
 from rag_app.crm.twenty_client import TwentyCRMClient
 from rag_app.db.models import (
     Document,
@@ -117,12 +119,13 @@ class FusedEvidenceResult:
             )
 
         # 4. Operational CRM Records
+        crm_dept_str = str(getattr(settings, "twenty_crm_department_id", None) or "SALES_CRM")
         for idx, r in enumerate(self.crm_records):
             chunks.append(
                 RetrievedChunk(
                     chunk_id=r.source_id,
                     document_id=f"crm_{r.provenance.get('crm_object', 'record')}_{r.source_id}",
-                    department_id="SALES_CRM",
+                    department_id=crm_dept_str,
                     file_name=r.title,
                     chunk_index=idx,
                     text=r.content,
@@ -141,11 +144,11 @@ class MultiSourceEvidenceFusionService:
         self,
         session: AsyncSession,
         expansion_service: Optional[BoundedGraphExpansionService] = None,
-        crm_client: Optional[TwentyCRMClient] = None,
+        crm_client: Optional[AnyCRMClient] = None,
     ):
         self.session = session
         self.expansion_service = expansion_service or BoundedGraphExpansionService(session=session)
-        self.crm_client = crm_client or TwentyCRMClient()
+        self.crm_client = crm_client or get_crm_client()
 
     async def fuse_company_evidence(
         self,
@@ -337,111 +340,149 @@ class MultiSourceEvidenceFusionService:
                 result.personal_memories.append(mem_src)
 
         # -------------------------------------------------------------
+        # -------------------------------------------------------------
         # Stream 5: Live Operational CRM State (Twenty CRM)
         # -------------------------------------------------------------
-        try:
-            crm_state = await self.crm_client.get_live_company_state(
-                company_name=company_name,
-                aliases=list(match_terms),
-            )
-            if crm_state.has_crm_records and crm_state.company:
-                result.crm_status_available = True
-                c = crm_state.company
+        # Fail-closed CRM authorization gate using existing authorization primitives
+        is_crm_authorized, crm_denial_reason = self._check_crm_authorization(
+            user=user,
+            allowed_departments=allowed_departments,
+        )
 
-                # 1. Company record
-                comp_content = f"Company: {c.name} | Domain: {c.domain or 'N/A'}"
-                if c.address:
-                    comp_content += f" | Address: {c.address}"
-                if c.annual_revenue is not None:
-                    comp_content += f" | Annual Revenue: ${c.annual_revenue:,.2f}"
-
-                comp_src = FusedEvidenceSource(
-                    stream="OPERATIONAL_CRM",
-                    source_id=f"twenty_company_{c.id}",
-                    title=f"CRM Company: {c.name}",
-                    content=comp_content,
-                    provenance={
-                        "crm_system": "Twenty CRM",
-                        "crm_object": "company",
-                        "crm_record_id": c.id,
-                        "created_at": c.created_at,
-                        "updated_at": c.updated_at,
-                        "retrieved_at": crm_state.retrieval_timestamp.isoformat(),
-                    },
-                    created_at=datetime.fromisoformat(c.updated_at.replace("Z", "+00:00")) if c.updated_at else None,
-                )
-                result.crm_records.append(comp_src)
-
-                # 2. People / Contacts
-                for p in crm_state.people:
-                    p_content = f"Contact: {p.name} ({p.job_title or 'Contact'})"
-                    if p.email:
-                        p_content += f" | Email: {p.email}"
-                    if p.phone:
-                        p_content += f" | Phone: {p.phone}"
-
-                    p_src = FusedEvidenceSource(
-                        stream="OPERATIONAL_CRM",
-                        source_id=f"twenty_person_{p.id}",
-                        title=f"CRM Contact: {p.name}",
-                        content=p_content,
-                        provenance={
-                            "crm_system": "Twenty CRM",
-                            "crm_object": "person",
-                            "crm_record_id": p.id,
-                            "company_id": p.company_id,
-                            "retrieved_at": crm_state.retrieval_timestamp.isoformat(),
-                        },
-                    )
-                    result.crm_records.append(p_src)
-
-                # 3. Opportunities / Pipeline Deals
-                for o in crm_state.opportunities:
-                    val_str = f"${o.amount:,.2f} {o.currency}" if o.amount is not None else "Unspecified"
-                    close_str = f" | Target Close: {o.close_date}" if o.close_date else ""
-                    o_content = f"Deal: {o.name} | Stage: {o.stage} | Value: {val_str}{close_str}"
-
-                    o_src = FusedEvidenceSource(
-                        stream="OPERATIONAL_CRM",
-                        source_id=f"twenty_opportunity_{o.id}",
-                        title=f"CRM Deal: {o.name}",
-                        content=o_content,
-                        provenance={
-                            "crm_system": "Twenty CRM",
-                            "crm_object": "opportunity",
-                            "crm_record_id": o.id,
-                            "stage": o.stage,
-                            "amount": o.amount,
-                            "currency": o.currency,
-                            "close_date": o.close_date,
-                            "updated_at": o.updated_at,
-                            "retrieved_at": crm_state.retrieval_timestamp.isoformat(),
-                        },
-                        created_at=datetime.fromisoformat(o.updated_at.replace("Z", "+00:00")) if o.updated_at else None,
-                    )
-                    result.crm_records.append(o_src)
-
-                result.crm_notice = (
-                    f"Live Twenty CRM record verified for '{c.name}' (ID: {c.id}). "
-                    f"Retrieved {len(crm_state.opportunities)} active deals and {len(crm_state.people)} contacts."
-                )
-            elif crm_state.is_connected:
-                result.crm_status_available = False
-                result.crm_notice = (
-                    f"Twenty CRM is connected, but no matching company record was found for '{company_name}'."
-                )
-            else:
-                result.crm_status_available = False
-                result.crm_notice = (
-                    f"Operational CRM integration is currently unavailable ({crm_state.error_message or 'offline'}). "
-                    "Real-time pipeline state, stage transitions, and external CRM data cannot be verified."
-                )
-        except Exception as crm_ex:
-            logger.warning("CRM fusion failed safely: %s", type(crm_ex).__name__)
+        if not is_crm_authorized:
             result.crm_status_available = False
             result.crm_notice = (
-                f"Operational CRM integration encountered an unexpected error: {type(crm_ex).__name__}."
+                f"Live operational CRM evidence is restricted. "
+                f"{crm_denial_reason or 'Access denied.'}"
             )
+        else:
+            try:
+                crm_state = await self.crm_client.get_live_company_state(
+                    company_name=company_name,
+                    aliases=list(match_terms),
+                )
+                if crm_state.has_crm_records and crm_state.company:
+                    result.crm_status_available = True
+                    c = crm_state.company
+
+                    # 1. Company record
+                    comp_content = f"Company: {c.name} | Domain: {c.domain or 'N/A'}"
+                    if c.address:
+                        comp_content += f" | Address: {c.address}"
+                    if c.annual_revenue is not None:
+                        comp_content += f" | Annual Revenue: ${c.annual_revenue:,.2f}"
+
+                    comp_src = FusedEvidenceSource(
+                        stream="OPERATIONAL_CRM",
+                        source_id=f"twenty_company_{c.id}",
+                        title=f"CRM Company: {c.name}",
+                        content=comp_content,
+                        provenance={
+                            "crm_system": "Twenty CRM",
+                            "crm_object": "company",
+                            "crm_record_id": c.id,
+                            "created_at": c.created_at,
+                            "updated_at": c.updated_at,
+                            "retrieved_at": crm_state.retrieval_timestamp.isoformat(),
+                        },
+                        created_at=datetime.fromisoformat(c.updated_at.replace("Z", "+00:00")) if c.updated_at else None,
+                    )
+                    result.crm_records.append(comp_src)
+
+                    # 2. People / Contacts
+                    for p in crm_state.people:
+                        p_content = f"Contact: {p.name} ({p.job_title or 'Contact'})"
+                        if p.email:
+                            p_content += f" | Email: {p.email}"
+                        if p.phone:
+                            p_content += f" | Phone: {p.phone}"
+
+                        p_src = FusedEvidenceSource(
+                            stream="OPERATIONAL_CRM",
+                            source_id=f"twenty_person_{p.id}",
+                            title=f"CRM Contact: {p.name}",
+                            content=p_content,
+                            provenance={
+                                "crm_system": "Twenty CRM",
+                                "crm_object": "person",
+                                "crm_record_id": p.id,
+                                "company_id": p.company_id,
+                                "retrieved_at": crm_state.retrieval_timestamp.isoformat(),
+                            },
+                        )
+                        result.crm_records.append(p_src)
+
+                    # 3. Opportunities / Pipeline Deals
+                    for o in crm_state.opportunities:
+                        val_str = f"${o.amount:,.2f} {o.currency}" if o.amount is not None else "Unspecified"
+                        close_str = f" | Target Close: {o.close_date}" if o.close_date else ""
+                        o_content = f"Deal: {o.name} | Stage: {o.stage} | Value: {val_str}{close_str}"
+
+                        o_src = FusedEvidenceSource(
+                            stream="OPERATIONAL_CRM",
+                            source_id=f"twenty_opportunity_{o.id}",
+                            title=f"CRM Deal: {o.name}",
+                            content=o_content,
+                            provenance={
+                                "crm_system": "Twenty CRM",
+                                "crm_object": "opportunity",
+                                "crm_record_id": o.id,
+                                "stage": o.stage,
+                                "amount": o.amount,
+                                "currency": o.currency,
+                                "close_date": o.close_date,
+                                "updated_at": o.updated_at,
+                                "retrieved_at": crm_state.retrieval_timestamp.isoformat(),
+                            },
+                            created_at=datetime.fromisoformat(o.updated_at.replace("Z", "+00:00")) if o.updated_at else None,
+                        )
+                        result.crm_records.append(o_src)
+
+                    # Notice formatting with partial-failure & truncation indicators
+                    notice_parts = [
+                        f"Live Twenty CRM record verified for '{c.name}' (ID: {c.id})."
+                    ]
+                    if crm_state.opportunities:
+                        trunc_tag = " [truncated to maximum page budget]" if getattr(crm_state, "opportunities_truncated", False) else ""
+                        notice_parts.append(f"Retrieved {len(crm_state.opportunities)} active deals{trunc_tag}.")
+                    elif getattr(crm_state, "opportunities_error", None):
+                        notice_parts.append(f"Deals could not be retrieved due to error: {crm_state.opportunities_error}.")
+                    else:
+                        notice_parts.append("No active deals recorded.")
+
+                    if crm_state.people:
+                        trunc_tag = " [truncated to maximum page budget]" if getattr(crm_state, "people_truncated", False) else ""
+                        notice_parts.append(f"Retrieved {len(crm_state.people)} contacts{trunc_tag}.")
+                    elif getattr(crm_state, "people_error", None):
+                        notice_parts.append(f"Contacts could not be retrieved due to error: {crm_state.people_error}.")
+                    else:
+                        notice_parts.append("No contacts recorded.")
+
+                    result.crm_notice = " ".join(notice_parts)
+
+                elif getattr(crm_state, "is_ambiguous", False):
+                    result.crm_status_available = False
+                    candidates = getattr(crm_state, "ambiguous_candidates", [])
+                    result.crm_notice = (
+                        f"Multiple CRM companies match '{company_name}': {', '.join(candidates)}."
+                    )
+                elif crm_state.is_connected:
+                    result.crm_status_available = False
+                    result.crm_notice = (
+                        f"Twenty CRM is connected, but no matching company record was found for '{company_name}'."
+                    )
+                else:
+                    result.crm_status_available = False
+                    result.crm_notice = (
+                        f"Operational CRM integration is currently unavailable ({crm_state.error_message or 'offline'}). "
+                        "Real-time pipeline state, stage transitions, and external CRM data cannot be verified."
+                    )
+            except Exception as crm_ex:
+                logger.warning("CRM fusion failed safely: %s", type(crm_ex).__name__)
+                result.crm_status_available = False
+                result.crm_notice = (
+                    f"Operational CRM integration encountered an unexpected error: {type(crm_ex).__name__}."
+                )
 
         # -------------------------------------------------------------
         # Deduplication and Contradiction Detection across Streams
@@ -455,6 +496,40 @@ class MultiSourceEvidenceFusionService:
         result.sources_payload = self._build_sources_payload(result)
 
         return result
+
+    def _check_crm_authorization(
+        self,
+        user: User,
+        allowed_departments: Optional[list[uuid.UUID]],
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Fail-closed CRM authorization gate using existing authorization primitives.
+        1. Inactive user fails closed.
+        2. ADMIN role bypasses (matching repo's existing admin policy).
+        3. Non-admin users require their effective allowed_departments to contain
+           the configured twenty_crm_department_id.
+        4. If twenty_crm_department_id is unconfigured or invalid, non-admin fails closed.
+        5. Workspace-scoped allowed_departments are preserved; global scope is not substituted.
+        """
+        if not getattr(user, "is_active", True):
+            return False, "User account is inactive."
+
+        if getattr(user, "role", None) == "ADMIN":
+            return True, None
+
+        crm_dept_id_str = getattr(settings, "twenty_crm_department_id", None)
+        if not crm_dept_id_str:
+            return False, "CRM access policy is not configured (fail-closed)."
+
+        try:
+            crm_dept_uuid = uuid.UUID(str(crm_dept_id_str).strip())
+        except (ValueError, TypeError, AttributeError):
+            return False, "Invalid CRM department configuration (fail-closed)."
+
+        if allowed_departments is None or crm_dept_uuid not in allowed_departments:
+            return False, "You do not have authorization to view live operational CRM data."
+
+        return True, None
 
     def _detect_conflicts_and_deduplicate(self, result: FusedEvidenceResult) -> None:
         """

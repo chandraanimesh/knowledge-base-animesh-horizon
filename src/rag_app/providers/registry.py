@@ -67,18 +67,26 @@ class ProviderRegistry:
         self._initialized_defaults = True
 
         # 1. LLM
-        def _groq_factory():
+        def _groq_factory(model: str | None = None, **kw: Any):
             from rag_app.providers.adapters.llm.groq import GroqLLMAdapter
-            return GroqLLMAdapter()
+            return GroqLLMAdapter(model=model, **kw)
+
+        def _mock_llm_factory(model: str | None = None, **kw: Any):
+            from rag_app.providers.adapters.llm.mock import MockLLMAdapter
+            return MockLLMAdapter(model=model, **kw)
 
         if "llm" not in self._factories or "groq" not in self._factories["llm"]:
             self.register("llm", "groq", _groq_factory)
             self._defaults["llm"] = "groq"
 
+        if "mock" not in self._factories.get("llm", {}):
+            self.register("llm", "mock", _mock_llm_factory)
+            self.register("llm", "fake", _mock_llm_factory)
+
         # 2. Embedding
-        def _st_factory():
+        def _st_factory(model_name: str | None = None, **kw: Any):
             from rag_app.providers.adapters.embedding.sentence_transformer import SentenceTransformerEmbeddingAdapter
-            return SentenceTransformerEmbeddingAdapter()
+            return SentenceTransformerEmbeddingAdapter(model_name=model_name)
 
         if "embedding" not in self._factories or "sentence_transformer" not in self._factories["embedding"]:
             self.register("embedding", "sentence_transformer", _st_factory)
@@ -86,7 +94,7 @@ class ProviderRegistry:
             self._defaults["embedding"] = "sentence_transformer"
 
         # 3. Document Reader
-        def _doc_reader_factory():
+        def _doc_reader_factory(**kw: Any):
             from rag_app.providers.adapters.document_reader.standard import StandardDocumentReaderAdapter
             return StandardDocumentReaderAdapter()
 
@@ -97,8 +105,10 @@ class ProviderRegistry:
             self._defaults["document_reader"] = "standard"
 
         # 4. Reranker
-        def _reranker_factory():
+        def _reranker_factory(model_name: str | None = None, **kw: Any):
             from rag_app.providers.adapters.reranker.cross_encoder import CrossEncoderRerankerAdapter
+            if model_name:
+                return CrossEncoderRerankerAdapter(model_name=model_name)
             return CrossEncoderRerankerAdapter()
 
         if "reranker" not in self._factories or "cross_encoder" not in self._factories["reranker"]:
@@ -107,7 +117,7 @@ class ProviderRegistry:
             self._defaults["reranker"] = "cross_encoder"
 
         # 5. OCR
-        def _ocr_factory():
+        def _ocr_factory(**kw: Any):
             from rag_app.providers.adapters.ocr.paddleocr import PaddleOCRAdapter
             return PaddleOCRAdapter()
 
@@ -117,13 +127,47 @@ class ProviderRegistry:
             self._defaults["ocr"] = "paddleocr"
 
         # 6. Web
-        def _web_factory():
+        def _web_factory(api_key: str | None = None, api_url: str | None = None, **kw: Any):
             from rag_app.providers.adapters.web.firecrawl import FirecrawlWebAdapter
-            return FirecrawlWebAdapter()
+            return FirecrawlWebAdapter(api_key=api_key, api_url=api_url)
 
         if "web" not in self._factories or "firecrawl" not in self._factories["web"]:
             self.register("web", "firecrawl", _web_factory)
             self._defaults["web"] = "firecrawl"
+
+        def _tavily_factory(api_key: str | None = None, **kw: Any):
+            from rag_app.providers.adapters.web.firecrawl import FirecrawlWebAdapter
+            return FirecrawlWebAdapter(api_key=api_key)
+
+        if "tavily" not in self._factories.get("web", {}):
+            self.register("web", "tavily", _tavily_factory)
+
+        def _tinyfish_factory(api_key: str | None = None, search_url: str | None = None, **kw: Any):
+            from rag_app.providers.adapters.web.tinyfish import TinyFishWebAdapter
+            return TinyFishWebAdapter(api_key=api_key, search_url=search_url)
+
+        if "tinyfish" not in self._factories.get("web", {}):
+            self.register("web", "tinyfish", _tinyfish_factory)
+
+        # 7. Vector Store
+        def _vector_store_factory(**kw: Any):
+            return "postgresql+pgvector"
+
+        if "vector_store" not in self._factories:
+            self.register("vector_store", "pgvector", _vector_store_factory)
+            self.register("vector_store", "postgresql", _vector_store_factory)
+            self._defaults["vector_store"] = "pgvector"
+
+        # Additional LLM & Reranker aliases for UI parity
+        def _unsupported_stub(**kw: Any):
+            raise NotImplementedError("Provider requires external API credentials.")
+
+        for p in ("openai", "anthropic", "gemini"):
+            if p not in self._factories.get("llm", {}):
+                self.register("llm", p, _unsupported_stub)
+
+        if "huggingface" not in self._factories.get("reranker", {}):
+            self.register("reranker", "huggingface", _reranker_factory)
 
     def _get_configured_name(self, capability: str) -> str:
         """
@@ -159,13 +203,14 @@ class ProviderRegistry:
 
         return self._defaults.get(cap, "")
 
-    def get(self, capability: str, name: str | None = None) -> Any:
+    def get(self, capability: str, name: str | None = None, **kwargs: Any) -> Any:
         """
         Resolves and returns a provider instance for the given capability.
 
         Args:
             capability: Capability category ('llm', 'embedding', 'document_reader', etc.)
             name: Optional provider name. If None, resolves from centralized configuration.
+            **kwargs: Optional configuration parameters (e.g. model, temperature).
 
         Returns:
             An instance implementing the capability interface.
@@ -185,7 +230,15 @@ class ProviderRegistry:
                 f"Available providers: {available}"
             )
 
-        # Cache singleton instance
+        # If custom kwargs (like model) are provided, return a fresh configured instance
+        if kwargs:
+            factory = self._factories[norm_cap][target_name]
+            try:
+                return factory(**kwargs)
+            except TypeError:
+                return factory()
+
+        # Cache singleton instance for default zero-arg lookups
         if target_name not in self._instances[norm_cap]:
             factory = self._factories[norm_cap][target_name]
             self._instances[norm_cap][target_name] = factory()
@@ -200,6 +253,15 @@ class ProviderRegistry:
         norm_cap = capability.strip().lower()
         return list(self._factories.get(norm_cap, {}).keys())
 
+    def has_provider(self, capability: str, name: str) -> bool:
+        """
+        Check if a provider is registered for a capability.
+        """
+        self._ensure_default_registrations()
+        norm_cap = capability.strip().lower()
+        norm_name = name.strip().lower()
+        return norm_name in self._factories.get(norm_cap, {})
+
     def clear_cache(self) -> None:
         """
         Clear all cached provider singleton instances.
@@ -212,6 +274,6 @@ class ProviderRegistry:
 provider_registry = ProviderRegistry()
 
 
-def get_provider(capability: str, name: str | None = None) -> Any:
+def get_provider(capability: str, name: str | None = None, **kwargs: Any) -> Any:
     """Convenience access function for provider_registry.get"""
-    return provider_registry.get(capability=capability, name=name)
+    return provider_registry.get(capability=capability, name=name, **kwargs)

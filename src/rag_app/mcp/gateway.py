@@ -93,21 +93,12 @@ class MCPGateway:
                     http_req = get_http_request()
                     if http_req and "authorization" in http_req.headers:
                         resolved_token = http_req.headers["authorization"]
-                    elif http_req and getattr(settings, "env", "dev") == "dev":
-                        # External HTTP client (e.g. ChatGPT 'No authentication') in local dev mode
-                        from rag_app.db.models import User
-                        from rag_app.security.authentication import create_access_token
-                        from sqlalchemy import select
-                        dev_admin = await db_session.scalar(
-                            select(User).where(User.role == "ADMIN", User.is_active == True).limit(1)
-                        )
-                        if dev_admin:
-                            resolved_token = f"Bearer {create_access_token(subject=str(dev_admin.id))}"
                 except Exception:
                     pass
 
             if tool_name == "run_diagnostics" and not resolved_token:
-                # Diagnostics allows non-authenticated health probes
+                # Diagnostics allows a minimal public service-availability probe when unauthenticated.
+                # All detailed database metrics, table counts, and infrastructure internals require authentication.
                 pass
             else:
                 try:

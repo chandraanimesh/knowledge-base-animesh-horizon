@@ -74,6 +74,7 @@ class IngestionService:
         created_by: uuid.UUID | None = None,
         force: bool = False,
         workspace_id: uuid.UUID | None = None,
+        doc_metadata: dict | None = None,
     ) -> IngestResponse:
 
         path = Path(file_path)
@@ -368,6 +369,8 @@ class IngestionService:
             metadata = dict(
                 chunk.metadata
             )
+            if doc_metadata:
+                metadata.update(doc_metadata)
             metadata = sanitize_nul_bytes(metadata)
 
             chunk_data.append(

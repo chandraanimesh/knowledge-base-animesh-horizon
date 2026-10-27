@@ -88,27 +88,8 @@ class MCPFacade:
                 logger.warning(f"MCP Token authentication failed: {exc}")
                 raise ValueError(f"Authentication failed: {exc}")
 
-        # If no auth_token is provided (e.g. local FastMCP caller without header):
-        # Find active admin or first active user
-        admin_user = await session.scalar(
-            select(User).where(User.role == "ADMIN", User.is_active == True).limit(1)
-        )
-        if admin_user:
-            return admin_user
-
-        any_user = await session.scalar(
-            select(User).where(User.is_active == True).limit(1)
-        )
-        if any_user:
-            return any_user
-
-        # Fallback local in-memory user for bootstrapping
-        return User(
-            id=uuid.uuid4(),
-            email="mcp_local@example.com",
-            role="ADMIN",
-            is_active=True,
-        )
+        # Unauthenticated calls must fail closed
+        raise ValueError("Authentication required. Please provide a valid Bearer auth_token.")
 
     async def ingest_document(self, input_data: IngestDocumentInput) -> IngestDocumentResult:
         """

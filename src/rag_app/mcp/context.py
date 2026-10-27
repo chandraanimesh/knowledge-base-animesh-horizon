@@ -119,7 +119,12 @@ async def resolve_mcp_request_context(
         raise MCPAuthenticationError(f"Authentication failed: {exc}")
 
     # Compute authorized scopes based on verified database role
-    scopes = ALL_ADMIN_SCOPES if user.role == "ADMIN" else STANDARD_USER_SCOPES
+    base_scopes = ALL_ADMIN_SCOPES if user.role == "ADMIN" else STANDARD_USER_SCOPES
+    token_scopes = payload.get("scopes")
+    if token_scopes is not None and isinstance(token_scopes, (list, tuple, set)):
+        scopes = base_scopes.intersection(token_scopes)
+    else:
+        scopes = base_scopes
 
     return MCPRequestContext(
         request_id=req_id,

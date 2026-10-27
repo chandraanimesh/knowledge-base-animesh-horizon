@@ -25,11 +25,10 @@ DEFAULT_OUTPUT_RESERVE = 500
 PROACTIVE_COMPRESSION_RATIO = 0.85
 
 
-def estimate_tokens(text: str) -> int:
-    """Deterministic token estimator: len(text) / 4."""
-    if not text:
-        return 0
-    return int(len(text) / 4)
+from rag_app.core.tokenizer import count_text
+
+# Shared model-aware token counter (replaces legacy len/4 heuristic)
+estimate_tokens = count_text
 
 
 class BoundedContextAssembler:

@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field
 from uuid import UUID
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from enum import Enum
 
 class PermissionPreset(str, Enum):
@@ -75,11 +75,123 @@ class UserAccessSummary(BaseModel):
     created_at: datetime
     departments: list[DeptAccessSummary] = []
 
-    class Config:
-        from_attributes = True
+class UserContext(BaseModel):
+    id: UUID
+    email: Optional[str] = None
+    role: str = "USER"
+    is_active: bool = True
+
+    model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_user(cls, user: Any) -> "UserContext":
+        """
+        Creates a detached, immutable UserContext snapshot from an ORM User, dict, or mock.
+
+        Fail-closed security guarantees:
+        - When called on an ORM User, required authorization attributes ('is_active' and 'role')
+          must be already loaded in memory.
+        - If attributes are expired or unloaded, this method fails closed with ValueError rather
+          than triggering implicit database I/O (which causes MissingGreenlet in async contexts)
+          or silently manufacturing permissive default authorization values (such as is_active=True).
+        - Call sites must snapshot UserContext at route/request entry while the authenticated
+          user is fully loaded, before database commits expire ORM session state.
+        """
+        if isinstance(user, cls):
+            return user
+        if user is None:
+            raise ValueError("user cannot be None when creating UserContext")
+
+        user_id = None
+        user_email = None
+        user_role = None
+        user_is_active = None
+
+        sa_state = getattr(user, "_sa_instance_state", None)
+        if sa_state is not None and type(sa_state).__name__ == "InstanceState":
+            is_expired = getattr(sa_state, "expired", False)
+            unloaded = getattr(sa_state, "unloaded", set()) or set()
+            loaded_dict = getattr(sa_state, "dict", {})
+
+            # 1. Identity extraction without triggering lazy-load I/O
+            if "id" in loaded_dict:
+                user_id = loaded_dict["id"]
+            elif sa_state.key and len(sa_state.key) > 1 and sa_state.key[1]:
+                user_id = sa_state.key[1][0]
+            elif "id" not in unloaded and not is_expired:
+                user_id = getattr(user, "id", None)
+
+            if user_id is None:
+                raise ValueError("Cannot establish UserContext: user identity is unavailable or could not be determined")
+
+            # 2. Authorization attributes extraction (fail-closed if expired or unloaded)
+            missing_attrs: list[str] = []
+
+            # Check is_active
+            if "is_active" in loaded_dict:
+                user_is_active = loaded_dict["is_active"]
+            elif "is_active" not in unloaded and not is_expired:
+                user_is_active = getattr(user, "is_active", None)
+
+            if user_is_active is None:
+                missing_attrs.append("is_active")
+
+            # Check role
+            if "role" in loaded_dict:
+                user_role = loaded_dict["role"]
+            elif "role" not in unloaded and not is_expired:
+                user_role = getattr(user, "role", None)
+
+            if user_role is None:
+                missing_attrs.append("role")
+
+            if missing_attrs:
+                raise ValueError(
+                    f"Cannot establish UserContext for user {user_id}: "
+                    f"required authorization attribute(s) {missing_attrs} are expired or unloaded. "
+                    "UserContext must be captured before session commit expires ORM state."
+                )
+
+            # 3. Non-authorization attributes (email)
+            if "email" in loaded_dict:
+                user_email = loaded_dict["email"]
+            elif "email" not in unloaded and not is_expired:
+                user_email = getattr(user, "email", None)
+            else:
+                user_email = None
+
+        else:
+            if isinstance(user, dict):
+                user_id = user.get("id")
+                user_email = user.get("email")
+                user_role = user.get("role")
+                user_is_active = user.get("is_active")
+            else:
+                user_id = getattr(user, "id", None)
+                user_email = getattr(user, "email", None)
+                user_role = getattr(user, "role", None)
+                user_is_active = getattr(user, "is_active", None)
+
+            if user_id is None:
+                raise ValueError("Cannot establish UserContext: missing user id")
+            if user_role is None:
+                raise ValueError("Cannot establish UserContext: missing user role")
+            if user_is_active is None:
+                raise ValueError("Cannot establish UserContext: missing user is_active")
+
+        if isinstance(user_id, str):
+            user_id = UUID(user_id)
+
+        return cls(
+            id=user_id,
+            email=user_email,
+            role=str(user_role),
+            is_active=bool(user_is_active),
+        )
 
 
 # ── Department Management ────────────────────────────────────────────────────
+
 
 class DepartmentCreate(BaseModel):
     code: str = Field(..., min_length=1, max_length=32, description="Uppercase department code e.g. SALES")

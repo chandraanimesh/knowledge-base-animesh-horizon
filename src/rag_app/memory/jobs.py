@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Sequence
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select, or_, and_, update
 
 from rag_app.db.models import MemoryProcessingJob, MemoryItem
@@ -25,8 +26,23 @@ async def create_memory_job(
 ) -> MemoryProcessingJob:
     """
     Creates a durable memory evaluation job / outbox record.
-    The source text is snapshot before interpretation to prevent silent loss.
+    Idempotent per (source_message_id, trigger_kind) when source_message_id is present.
+    Uses PostgreSQL savepoints and unique constraint to safely resolve concurrent insertions.
     """
+    stmt = None
+    if source_message_id is not None:
+        stmt = (
+            select(MemoryProcessingJob)
+            .where(
+                MemoryProcessingJob.source_message_id == source_message_id,
+                MemoryProcessingJob.trigger_kind == trigger_kind,
+            )
+            .limit(1)
+        )
+        existing = (await session.execute(stmt)).scalars().first()
+        if existing:
+            return existing
+
     job = MemoryProcessingJob(
         id=uuid.uuid4(),
         owner_user_id=owner_user_id,
@@ -41,9 +57,27 @@ async def create_memory_job(
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
     )
-    session.add(job)
-    await session.flush()
-    return job
+
+    try:
+        async with session.begin_nested():
+            session.add(job)
+            await session.flush()
+        return job
+    except IntegrityError:
+        # Concurrent worker inserted equivalent (source_message_id, trigger_kind).
+        # Savepoint rolled back cleanly; outer transaction remains usable.
+        if stmt is not None:
+            existing = (await session.execute(stmt)).scalars().first()
+            if existing:
+                return existing
+        raise
+
+
+
+import asyncio
+from rag_app.core.config import get_settings
+from rag_app.core.safety import check_sensitive_request
+from rag_app.db.session import AsyncSessionLocal
 
 
 async def execute_memory_job(
@@ -51,6 +85,7 @@ async def execute_memory_job(
     job_id: uuid.UUID,
     auto_embed: bool = True,
     extractor: Optional[MemoryExtractor] = None,
+    execution_timeout_seconds: float = 15.0,
 ) -> tuple[JobStatus, list[MemoryItem], Optional[str]]:
     """
     Safely and idempotently processes a single memory processing job.
@@ -63,7 +98,6 @@ async def execute_memory_job(
 
     # Idempotency guard: do not re-process completed jobs
     if job.status == JobStatus.SUCCEEDED.value:
-        # Retrieve already materialized items for this job
         stmt = select(MemoryItem).where(MemoryItem.source_job_id == job.id)
         existing = (await session.execute(stmt)).scalars().all()
         return JobStatus.SUCCEEDED, list(existing), None
@@ -82,6 +116,18 @@ async def execute_memory_job(
         text_content = job.source_text_snapshot.strip()
         materialized_items: list[MemoryItem] = []
 
+        # Privacy Guard: Never persist secrets or unsuitable sensitive information
+        safety = check_sensitive_request(text_content, can_view_pii=False)
+        if safety.blocked:
+            job.status = JobStatus.SKIPPED_NOT_MEMORABLE.value
+            job.error_message = "Skipped sensitive information (PII/secrets)"
+            job.source_text_snapshot = "[REDACTED_SENSITIVE_CONTENT]"
+            job.processed_at = now
+            job.locked_at = None
+            job.locked_by = None
+            await session.flush()
+            return JobStatus.SKIPPED_NOT_MEMORABLE, [], job.error_message
+
         # 1. Check if slash command
         if text_content.startswith("/"):
             parsed = parse_memory_command(text_content)
@@ -90,6 +136,8 @@ async def execute_memory_job(
                     job.status = JobStatus.SKIPPED_NOT_MEMORABLE.value
                     job.error_message = parsed.error_message or "Empty command payload"
                     job.processed_at = now
+                    job.locked_at = None
+                    job.locked_by = None
                     await session.flush()
                     return JobStatus.SKIPPED_NOT_MEMORABLE, [], job.error_message
 
@@ -130,7 +178,8 @@ async def execute_memory_job(
                     candidate=candidate,
                     auto_embed=auto_embed,
                 )
-                materialized_items.append(rec)
+                if rec is not None:
+                    materialized_items.append(rec)
 
         # 2. Ordinary conversational turn
         if not materialized_items:
@@ -143,19 +192,25 @@ async def execute_memory_job(
                 limit=50,
             )
 
-            candidates = await mem_extractor.extract_from_conversation(
-                text=text_content,
-                user_id=job.owner_user_id,
-                workspace_id=job.workspace_id or uuid.uuid4(),  # fallback uuid for extraction validator
-                conversation_id=str(job.conversation_id) if job.conversation_id else None,
-                message_id=str(job.source_message_id) if job.source_message_id else None,
-                existing_memories=existing_mems,
+            # Bounded extraction call with strict timeout
+            candidates = await asyncio.wait_for(
+                mem_extractor.extract_from_conversation(
+                    text=text_content,
+                    user_id=job.owner_user_id,
+                    workspace_id=job.workspace_id or uuid.uuid4(),
+                    conversation_id=str(job.conversation_id) if job.conversation_id else None,
+                    message_id=str(job.source_message_id) if job.source_message_id else None,
+                    existing_memories=existing_mems,
+                ),
+                timeout=execution_timeout_seconds,
             )
 
             if not candidates:
                 job.status = JobStatus.SKIPPED_NOT_MEMORABLE.value
                 job.processed_at = now
                 job.updated_at = now
+                job.locked_at = None
+                job.locked_by = None
                 await session.flush()
                 return JobStatus.SKIPPED_NOT_MEMORABLE, [], "No memorable candidates extracted"
 
@@ -167,12 +222,24 @@ async def execute_memory_job(
                     candidate=cand,
                     auto_embed=auto_embed,
                 )
-                materialized_items.append(rec)
+                if rec is not None:
+                    materialized_items.append(rec)
+
+        if not materialized_items:
+            job.status = JobStatus.SKIPPED_NOT_MEMORABLE.value
+            job.error_message = "Skipped: all extracted candidates were forgotten or empty"
+            job.processed_at = datetime.now(timezone.utc)
+            job.updated_at = datetime.now(timezone.utc)
+            job.locked_at = None
+            job.locked_by = None
+            await session.flush()
+            return JobStatus.SKIPPED_NOT_MEMORABLE, [], job.error_message
 
         job.status = JobStatus.SUCCEEDED.value
         job.processed_at = datetime.now(timezone.utc)
         job.updated_at = datetime.now(timezone.utc)
         job.locked_at = None
+        job.locked_by = None
         await session.flush()
         return JobStatus.SUCCEEDED, materialized_items, None
 
@@ -189,6 +256,7 @@ async def execute_memory_job(
         job.last_error_code = exc.__class__.__name__
         job.error_message = str(exc)
         job.locked_at = None
+        job.locked_by = None
         job.updated_at = datetime.now(timezone.utc)
 
         if job.attempt_count >= job.max_attempts:
@@ -204,6 +272,135 @@ async def execute_memory_job(
         return final_status, [], str(exc)
 
 
+async def claim_next_memory_job(
+    session: AsyncSession,
+    worker_id: str = "memory-worker-default",
+    lock_timeout_seconds: int = 180,
+) -> Optional[MemoryProcessingJob]:
+    """
+    Safely claims the next pending, due retry, or abandoned memory job using FOR UPDATE SKIP LOCKED.
+    Respects the ENABLE_CONVERSATIONAL_MEMORY_EXTRACTION feature flag: if disabled,
+    only claims explicit commands, keeping conversational jobs safely queued.
+    """
+    now = datetime.now(timezone.utc)
+    lock_cutoff = now - timedelta(seconds=lock_timeout_seconds)
+    settings = get_settings()
+
+    allowed_triggers = ["explicit_rem", "command_parser"]
+    if getattr(settings, "enable_conversational_memory_extraction", False):
+        allowed_triggers.extend(["conversational_turn", "rule_candidate"])
+
+    stmt = (
+        select(MemoryProcessingJob)
+        .where(
+            MemoryProcessingJob.trigger_kind.in_(allowed_triggers),
+            or_(
+                MemoryProcessingJob.status == JobStatus.PENDING.value,
+                and_(
+                    MemoryProcessingJob.status == JobStatus.RETRY_PENDING.value,
+                    or_(
+                        MemoryProcessingJob.next_attempt_at.is_(None),
+                        MemoryProcessingJob.next_attempt_at <= now,
+                    ),
+                ),
+                and_(
+                    MemoryProcessingJob.status == JobStatus.PROCESSING.value,
+                    MemoryProcessingJob.locked_at < lock_cutoff,
+                ),
+            ),
+            MemoryProcessingJob.attempt_count < MemoryProcessingJob.max_attempts,
+        )
+        .order_by(MemoryProcessingJob.created_at.asc())
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+
+    job = await session.scalar(stmt)
+    if not job:
+        return None
+
+    job.status = JobStatus.PROCESSING.value
+    job.locked_at = now
+    job.locked_by = worker_id
+    job.updated_at = now
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def recover_stale_memory_jobs(
+    session: AsyncSession,
+    lock_timeout_seconds: int = 180,
+) -> int:
+    """
+    Recovers jobs abandoned in PROCESSING status due to unhandled worker crash or timeout.
+    Transitions stale jobs to RETRY_PENDING (or DEAD_LETTER if max_attempts reached).
+    """
+    now = datetime.now(timezone.utc)
+    lock_cutoff = now - timedelta(seconds=lock_timeout_seconds)
+
+    stmt = (
+        select(MemoryProcessingJob)
+        .where(
+            MemoryProcessingJob.status == JobStatus.PROCESSING.value,
+            MemoryProcessingJob.locked_at < lock_cutoff,
+        )
+        .with_for_update(skip_locked=True)
+    )
+    stale_jobs = (await session.execute(stmt)).scalars().all()
+    recovered_count = 0
+
+    for job in stale_jobs:
+        job.locked_at = None
+        job.locked_by = None
+        job.updated_at = now
+        if job.attempt_count >= job.max_attempts:
+            job.status = JobStatus.DEAD_LETTER.value
+        else:
+            job.status = JobStatus.RETRY_PENDING.value
+            job.next_attempt_at = now
+        recovered_count += 1
+
+    if recovered_count > 0:
+        await session.commit()
+        logger.info(
+            "stale_memory_jobs_recovered",
+            extra={"event": "stale_memory_jobs_recovered", "count": recovered_count},
+        )
+
+    return recovered_count
+
+
+async def process_pending_memory_jobs(
+    worker_id: str = "memory-worker-scheduler",
+    max_jobs: int = 10,
+    session_factory: Optional[any] = None,
+    auto_embed: bool = True,
+) -> int:
+    """
+    Processes a batch of eligible memory extraction jobs safely and idempotently.
+    Returns the number of processed jobs.
+    """
+    sf = session_factory or AsyncSessionLocal
+    processed_count = 0
+
+    for _ in range(max_jobs):
+        async with sf() as session:
+            job = await claim_next_memory_job(session, worker_id=worker_id)
+            if not job:
+                break
+
+            await execute_memory_job(
+                session=session,
+                job_id=job.id,
+                auto_embed=auto_embed,
+            )
+            await session.commit()
+            processed_count += 1
+
+    return processed_count
+
+
 async def retry_pending_jobs(
     session: AsyncSession,
     limit: int = 10,
@@ -211,6 +408,7 @@ async def retry_pending_jobs(
 ) -> list[tuple[uuid.UUID, JobStatus]]:
     """
     Finds due retry_pending memory processing jobs and executes them safely.
+    Kept for backward compatibility.
     """
     now = datetime.now(timezone.utc)
     stmt = (
@@ -237,3 +435,82 @@ async def retry_pending_jobs(
         results.append((job.id, status))
 
     return results
+
+
+async def reconcile_missing_conversational_memory_jobs(
+    session: AsyncSession,
+    lookback_hours: int = 24,
+    limit: int = 20,
+) -> int:
+    """
+    Discovers committed user ChatMessages within the lookback window that do not have
+    a corresponding MemoryProcessingJob for 'conversational_turn'.
+    Enqueues the missing job idempotently with PostgreSQL unique index protection.
+    """
+    settings = get_settings()
+    if not getattr(settings, "enable_conversational_memory_extraction", False):
+        return 0
+
+    from rag_app.db.models import ChatMessage, Conversation
+    from rag_app.memory.command_parser import detect_memory_candidate_rules
+    from rag_app.core.safety import check_sensitive_request
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=lookback_hours)
+
+    stmt = (
+        select(ChatMessage, Conversation)
+        .join(Conversation, ChatMessage.conversation_id == Conversation.id)
+        .outerjoin(
+            MemoryProcessingJob,
+            and_(
+                MemoryProcessingJob.source_message_id == ChatMessage.id,
+                MemoryProcessingJob.trigger_kind == "conversational_turn",
+            ),
+        )
+        .where(
+            ChatMessage.role == "user",
+            ChatMessage.created_at >= since,
+            MemoryProcessingJob.id.is_(None),
+        )
+        .order_by(ChatMessage.created_at.asc())
+        .limit(limit)
+    )
+
+    results = (await session.execute(stmt)).all()
+    reconciled_count = 0
+
+    for msg, conv in results:
+        content = (msg.content or "").strip()
+        if content.startswith("/"):
+            continue
+
+        is_cand, is_trans, _ = detect_memory_candidate_rules(content)
+        safety = check_sensitive_request(content, can_view_pii=False)
+
+        if not is_trans and not safety.blocked:
+            try:
+                await create_memory_job(
+                    session=session,
+                    owner_user_id=conv.user_id,
+                    source_text=content,
+                    trigger_kind="conversational_turn",
+                    workspace_id=conv.workspace_id,
+                    source_message_id=msg.id,
+                    conversation_id=conv.id,
+                )
+                reconciled_count += 1
+            except Exception as err:
+                logger.warning(
+                    "reconcile_missing_job_failed",
+                    extra={"event": "reconcile_missing_job_failed", "msg_id": str(msg.id), "error": str(err)},
+                )
+
+    if reconciled_count > 0:
+        await session.commit()
+        logger.info(
+            "reconciled_missing_conversational_jobs",
+            extra={"event": "reconciled_missing_conversational_jobs", "count": reconciled_count},
+        )
+
+    return reconciled_count

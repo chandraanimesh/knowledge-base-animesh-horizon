@@ -1,3 +1,4 @@
+from typing import Any
 from pydantic import BaseModel, Field
 
 
@@ -64,6 +65,7 @@ class RetrievalResponse(BaseModel):
     strategy_trace: dict[str, int] = Field(default_factory=dict)
     chunk_provenance: dict[str, ChunkProvenance] = Field(default_factory=dict)
     chunk_hierarchy: dict[str, ChunkHierarchyMetadata] = Field(default_factory=dict)
+    query_plan: Any | None = Field(default=None, exclude=True)
 
 
 class TokenUsage(BaseModel):
@@ -150,6 +152,9 @@ class ExecutionMetrics(BaseModel):
     final_context_count: int = 0
     context_chunks: int = 0
     context_tokens: int = 0
+    context_budget_status: str | None = None
+    dropped_evidence_count: int = 0
+    compiler_latency_ms: float = 0.0
 
     # Retrieval Quality & Breakdown
     vector_top_k: int | None = None
@@ -200,6 +205,14 @@ class ExecutionMetrics(BaseModel):
 import uuid
 from datetime import datetime
 
+from rag_app.schemas.artifacts import (
+    ArtifactMetadata,
+    CoverageReport,
+    DownloadableArtifactFormat,
+    OutputPreferences,
+    TabularDataset,
+)
+
 
 class GenerateRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -218,6 +231,18 @@ class GenerateRequest(BaseModel):
     target_message_id: str | uuid.UUID | None = Field(
         default=None,
         description="Optional target assistant message ID to visualize or follow up on.",
+    )
+    output_preferences: OutputPreferences | None = Field(
+        default=None,
+        description="Optional explicit output preferences for multi-format RAG (summary, inline JSON/table, download formats).",
+    )
+    execution_mode: str | None = Field(
+        default=None,
+        description="Execution mode: 'fast_path' (default single-shot RAG) or 'adaptive_workflow' (durable DAG planner and grounded writing).",
+    )
+    workflow_idempotency_key: str | None = Field(
+        default=None,
+        description="Optional client idempotency key when triggering adaptive workflow execution.",
     )
 
 
@@ -244,6 +269,11 @@ class GenerateResponse(BaseModel):
     conversation_id: str | None = None
     message_id: str | None = None
     conversation_title: str | None = None
+    coverage: CoverageReport | None = None
+    tabular_dataset: TabularDataset | None = None
+    artifacts: list[ArtifactMetadata] | None = None
+    workflow_run_id: str | None = None
+    workflow_status: str | None = None
 
 
 
@@ -255,6 +285,9 @@ class ChatMessageResponse(BaseModel):
     visualization: dict | None = None
     sources: list[dict] | None = None
     execution_metrics: ExecutionMetrics | dict | None = None
+    coverage: CoverageReport | None = None
+    tabular_dataset: TabularDataset | None = None
+    artifacts: list[ArtifactMetadata] | None = None
     created_at: datetime
 
 
@@ -302,6 +335,14 @@ class CompiledContext(BaseModel):
     chunk_hierarchy: dict[str, ChunkHierarchyMetadata] = Field(default_factory=dict)
     selected_node_ids: list[str] = Field(default_factory=list)
     rendered_context: str | None = None
+    budget_status: str = "NORMAL"  # "NORMAL" | "CONSTRAINED" | "OVERFLOW"
+    selected_evidence: list[Any] = Field(default_factory=list)
+    dropped_reasons: dict[str, str] = Field(default_factory=dict)
+    total_planned_tokens: int = 0
+    available_context_tokens: int = 0
+    compiled_conversation_history: list[dict[str, str]] = Field(default_factory=list)
+    compiled_workspace_threads: list[dict] = Field(default_factory=list)
+    compiled_memories: list[Any] = Field(default_factory=list)
 
 class CompanyFilters(BaseModel):
     company_id: str | None = None
@@ -362,6 +403,10 @@ class QueryPlan(BaseModel):
     evidence_need: EvidenceNeed = EvidenceNeed.PROSE
     conversation_required: bool = False
     reason: str | None = None
+    output_preferences: OutputPreferences = Field(default_factory=OutputPreferences)
+    web_search_needed: bool = False
+    web_search_reason: str | None = None
+    internal_retrieval_needed: bool = True
 
 
 class DocumentChunkInfo(BaseModel):

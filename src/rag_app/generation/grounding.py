@@ -13,9 +13,9 @@ from rag_app.schemas.rag import (
 
 logger = logging.getLogger(__name__)
 
-# Currency / number regex: matches values like $8.42M, $500K, 500,000, 15%, 50ms, etc.
+# Currency / number regex: matches values like $8.42M, ₹12,00,000, 500,000, 15%, 50ms, etc.
 NUMERIC_PATTERN = re.compile(
-    r"(?:\$\s*\d+(?:,\d{3})*(?:\.\d+)?\s*(?:[KkMmBb]|million|billion|thousand)?|\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:%|[KkMmBb]|ms|s|million|billion|thousand)?\b)",
+    r"(?:[₹$€£¥]\s*\d+(?:,\d+)*(?:\.\d+)?\s*(?:[KkMmBb]|million|billion|thousand|lakh|crore)?|\b\d+(?:,\d+)*(?:\.\d+)?\s*(?:%|[KkMmBb]|ms|s|million|billion|thousand|lakh|crore)?\b)",
     re.IGNORECASE,
 )
 
@@ -27,13 +27,22 @@ DATE_PATTERN = re.compile(
 
 
 def _normalize_num_str(s: str) -> str:
-    """Normalize numeric strings for robust matching ($500K -> 500k, 500,000 -> 500000)."""
-    return s.lower().replace("$", "").replace(",", "").replace(" ", "").strip()
+    """Normalize numeric strings for robust matching ($500K -> 500k, ₹12,00,000 -> 1200000)."""
+    return re.sub(r"[₹$,\s€£¥]", "", s.lower()).strip()
 
 
 def _extract_numbers(text: str) -> list[str]:
-    """Extract all distinct numeric and currency tokens from text."""
-    raw = NUMERIC_PATTERN.findall(text)
+    """Extract all distinct numeric and currency tokens from text, ignoring IDs and citations."""
+    # Mask UUIDs, chunk IDs, citation brackets, and JSON keys so hex parts aren't flagged as unsupported business metrics
+    masked = re.sub(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b", " ", text)
+    masked = re.sub(r"\b(?:chunk[_ -]?id|source_chunk_id)[\"':\s]+[0-9a-zA-Z_-]+\b", " ", masked, flags=re.IGNORECASE)
+    masked = re.sub(r"\[(?:chunk|source|ev):\s*[^\]]+\]", " ", masked, flags=re.IGNORECASE)
+    masked = re.sub(r"\[(?:chunk:\s*)?[0-9a-zA-Z_-]+\]", " ", masked)
+    masked = re.sub(r"\b[0-9a-fA-F]{16,64}\b", " ", masked)
+    masked = re.sub(r"\"[a-zA-Z0-9_-]+\"\s*:", " ", masked)
+    masked = re.sub(r"(?:`|\b)[a-zA-Z0-9_\-]+\.(?:pdf|json|csv|docx|xlsx)(?:`|\b)", " ", masked, flags=re.IGNORECASE)
+
+    raw = NUMERIC_PATTERN.findall(masked)
     cleaned = []
     for t in raw:
         t_clean = t.strip(".,!?;:()[]\"' ")
@@ -66,26 +75,32 @@ def _is_number_in_evidence(num_val: str | int | float, evidence_text: str) -> bo
 
             # Sub-1000 represented in thousands (e.g. 920 -> 920k / $920K / 920,000)
             if int_val is not None and 1 <= int_val < 1000:
-                if f"{int_val}k" in norm_ev or f"{int_val}thousand" in norm_ev or f"{int_val}000" in norm_ev or re.search(rf"\b{int_val}k\b|\${int_val}k\b", ev_lower):
+                if f"{int_val}k" in norm_ev or f"{int_val}thousand" in norm_ev or f"{int_val}000" in norm_ev or re.search(rf"\b{int_val}k\b|[₹$€£]{int_val}k\b", ev_lower):
                     return True
 
             # Sub-1000 represented in millions (e.g. 8.42 -> 8.42M / $8.42M)
             if f"{clean_num_str}m" in norm_ev or f"{clean_num_str}million" in norm_ev:
                 return True
 
+            # Indian numbering scales: Lakh (100,000) and Crore (10,000,000)
+            if int_val is not None and 1 <= int_val < 1000:
+                if f"{int_val}lakh" in norm_ev or f"{int_val}lac" in norm_ev or f"{int_val}cr" in norm_ev or f"{int_val}crore" in norm_ev:
+                    return True
+
             # Standard thousands (e.g. 920000 -> 920k / $920K / 0.92M)
             if val_float >= 1000 and val_float % 1000 == 0:
                 k_val = int(val_float / 1000)
-                if f"{k_val}k" in norm_ev or f"{k_val}thousand" in norm_ev or re.search(rf"\b{k_val}k\b|\${k_val}k\b", ev_lower):
+                if f"{k_val}k" in norm_ev or f"{k_val}thousand" in norm_ev or re.search(rf"\b{k_val}k\b|[₹$€£]{k_val}k\b", ev_lower):
                     return True
             if val_float >= 1000000:
                 m_val = f"{val_float / 1000000:g}m"
                 if m_val in norm_ev:
                     return True
 
-            # Check raw digits presence
+            # Check raw digits presence (handles Indian comma grouping e.g. 3,60,000 -> 360000)
             digits = re.sub(r"\D", "", norm_s)
-            if len(digits) >= 2 and digits in re.sub(r"\D", "", evidence_text):
+            ev_digits = re.sub(r"\D", "", evidence_text)
+            if len(digits) >= 2 and digits in ev_digits:
                 return True
     except Exception:
         pass
@@ -256,11 +271,20 @@ class AnswerGroundingEvaluator:
         # ----------------------------------------------------
         # 4. Entity / Terminology Validation
         # ----------------------------------------------------
-        answer_words = re.findall(r"\b[A-Z][a-zA-Z0-9_-]+\b", answer)
+        # Mask artifact filenames, file references, code blocks, and structural report metadata
+        clean_for_entities = re.sub(r"(?:`|\b)[a-zA-Z0-9_\-]+\.(?:pdf|json|csv|docx|xlsx)(?:`|\b)", " ", answer, flags=re.IGNORECASE)
+        clean_for_entities = re.sub(r"(?i)\b(?:downloadable\s+files|pdf\s+report|json\s+file|csv\s+file|docx\s+file)\b", " ", clean_for_entities)
+        clean_for_entities = re.sub(r"```[\s\S]*?```", " ", clean_for_entities)
+
+        answer_words = re.findall(r"\b[A-Z][a-zA-Z0-9_-]+\b", clean_for_entities)
         common_words = {
             "The", "This", "That", "These", "Those", "Here", "What", "When", "Where", "Who", "Why", "How",
             "There", "Worker", "Section", "Table", "Deal", "Failed", "Mandatory", "Audit", "Database", "Version",
-            "Node", "API", "Q1", "Q2", "Q3", "Q4", "SOC2", "ACID", "REST", "JSON", "SQL", "LRU", "RAM", "EMEA"
+            "Node", "API", "Q1", "Q2", "Q3", "Q4", "SOC2", "ACID", "REST", "JSON", "SQL", "LRU", "RAM", "EMEA",
+            "Executive", "Summary", "Metrics", "Total", "Records", "Sum", "Avg", "Average", "Amount", "Notice",
+            "Disclaimer", "Downloadable", "File", "Files", "Report", "Rules", "Policy", "Guidance", "Department",
+            "Status", "Pending", "Approved", "Approval", "Limitation", "Sample", "Evidence", "Census", "Context",
+            "Extracted", "Note", "Specific", "Requirements", "Generated", "Verified", "Downloads", "Available", "Provided"
         }
         for word in answer_words:
             if word not in common_words and word.lower() not in all_evidence_lower and word.lower() not in q_lower:
@@ -520,6 +544,30 @@ class AnswerGroundingEvaluator:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"EVIDENCE CONTEXT:\n{full_context}\n\nUSER QUESTION:\n{query}\n\nGENERATED ANSWER:\n{answer}"},
             ]
+
+            from rag_app.core.tokenizer import count_messages
+            from rag_app.core.config import get_settings
+            settings = get_settings()
+            model_limit = getattr(settings, "model_context_limit", 8192)
+            reserved_output = getattr(settings, "reserved_output_tokens", 500)
+            max_eval_capacity = max(0, model_limit - reserved_output)
+
+            eval_tokens = count_messages(messages, model=getattr(settings, "groq_model", None))
+            if eval_tokens > max_eval_capacity and max_eval_capacity > 0:
+                # Proactively drop optional conversation history from evaluation payload
+                full_context = f"DOCUMENT EVIDENCE:\n{doc_context}".strip()
+                messages[1]["content"] = f"EVIDENCE CONTEXT:\n{full_context}\n\nUSER QUESTION:\n{query}\n\nGENERATED ANSWER:\n{answer}"
+                eval_tokens = count_messages(messages, model=getattr(settings, "groq_model", None))
+                if eval_tokens > max_eval_capacity:
+                    logger.warning(
+                        "grounding_evaluator_budget_exceeded_falling_back_to_deterministic",
+                        extra={
+                            "event": "grounding_evaluator_budget_exceeded",
+                            "eval_tokens": eval_tokens,
+                            "max_eval_capacity": max_eval_capacity,
+                        },
+                    )
+                    return det_result
 
             structured_llm = llm.llm.with_structured_output(
                 AnswerGroundingResult,
