@@ -224,6 +224,25 @@ async def test_rrf_mathematical_formula_and_score_reconciliation():
         c3_expected = 1.2 / 61.0
         assert math.isclose(cand_map[str(c3.id)].hybrid_score, c3_expected, rel_tol=1e-6)
 
+        # Precise Numerical Reconciliation for specific reported cases:
+        # 1. ENG-CHUNK-01 (ranks 1, 1):
+        score_eng01 = calculate_reference_rrf(vec_pos=1, kw_pos=1)
+        assert math.isclose(score_eng01, 2.2 / 61.0, rel_tol=1e-9)
+        assert round(score_eng01, 6) == 0.036066
+
+        # 2. SEC-CHUNK-05 (ranks 1, 2):
+        score_sec05 = calculate_reference_rrf(vec_pos=1, kw_pos=2)
+        assert math.isclose(score_sec05, (1.0 / 61.0) + (1.2 / 62.0), rel_tol=1e-9)
+        assert round(score_sec05, 6) == 0.035748
+
+        # 3. ENG-CHUNK-02 (ranks 2, 3):
+        score_eng02 = calculate_reference_rrf(vec_pos=2, kw_pos=3)
+        assert math.isclose(score_eng02, (1.0 / 62.0) + (1.2 / 63.0), rel_tol=1e-9)
+        assert round(score_eng02, 6) == 0.035177
+
+        # Deduplication proof: 3 distinct chunks input across 4 occurrences -> exactly 3 candidates output
+        assert len(candidates) == 3
+
         # Empty sources handling:
         empty_merged = svc._merge_with_rrf(vector_rows=[], keyword_rows=[])
         assert empty_merged == []

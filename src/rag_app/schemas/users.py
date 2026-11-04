@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from uuid import UUID
 from datetime import datetime
 from typing import Any, Literal, Optional
@@ -36,8 +36,7 @@ class UserResponse(BaseModel):
     created_at: datetime
     deleted_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class DepartmentResponse(BaseModel):
     id: UUID
@@ -47,8 +46,7 @@ class DepartmentResponse(BaseModel):
     created_at: datetime
     deleted_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class PermissionResponse(BaseModel):
     id: UUID
@@ -57,8 +55,7 @@ class PermissionResponse(BaseModel):
     is_active: bool
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DeptAccessSummary(BaseModel):
@@ -242,8 +239,7 @@ class AccessRequestResponse(BaseModel):
     reviewer_email: Optional[str] = None
     review_note: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AccessRequestReview(BaseModel):
@@ -274,8 +270,7 @@ class DocumentAdminResponse(BaseModel):
     status: str
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DocumentResponse(BaseModel):
@@ -296,8 +291,7 @@ class DocumentResponse(BaseModel):
     created_at: datetime
     preview_url: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 
