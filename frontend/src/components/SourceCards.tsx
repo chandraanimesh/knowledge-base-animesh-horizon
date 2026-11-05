@@ -76,9 +76,10 @@ interface SourceCardProps {
   index: number;
   isFocused: boolean;
   onClearFocus?: () => void;
+  onInspectChunk?: (documentId: string, chunkId: string, fileName?: string) => void;
 }
 
-export function SingleSourceCard({ source, index, isFocused, onClearFocus }: SourceCardProps) {
+export function SingleSourceCard({ source, index, isFocused, onClearFocus, onInspectChunk }: SourceCardProps) {
   const cardRef = useRef<HTMLDivElement>(null);
   const [excerptExpanded, setExcerptExpanded] = useState(false);
 
@@ -237,6 +238,30 @@ export function SingleSourceCard({ source, index, isFocused, onClearFocus }: Sou
           </span>
         )}
 
+        {/* Chunk History & Diff inspection button for document chunks */}
+        {source.document_id && source.chunk_id && onInspectChunk && (
+          <button
+            type="button"
+            onClick={() => onInspectChunk(source.document_id!, source.chunk_id!, source.file_name || source.title)}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '4px',
+              color: 'var(--color-teal, #0F766E)',
+              background: 'transparent',
+              border: 'none',
+              padding: '2px 4px',
+              cursor: 'pointer',
+              fontSize: '11px',
+              fontWeight: 600,
+              marginLeft: hasValidLink ? '0' : 'auto',
+            }}
+            title="Inspect chunk version history, diffs, and curation lifecycle"
+          >
+            <span>📜 History & Diff</span>
+          </button>
+        )}
+
         {/* Valid HTTP/HTTPS external link */}
         {hasValidLink && (
           <a
@@ -320,6 +345,7 @@ export interface SourceCardsProps {
   chunks?: RetrievedChunk[] | null;
   focusedCitation?: string | null;
   onClearFocusedCitation?: () => void;
+  onInspectChunk?: (documentId: string, chunkId: string, fileName?: string) => void;
   initiallyExpanded?: boolean;
   className?: string;
   style?: React.CSSProperties;
@@ -331,6 +357,7 @@ export const SourceCards: React.FC<SourceCardsProps> = ({
   chunks,
   focusedCitation,
   onClearFocusedCitation,
+  onInspectChunk,
   initiallyExpanded = false,
   className,
   style,
@@ -462,6 +489,7 @@ export const SourceCards: React.FC<SourceCardsProps> = ({
               index={idx}
               isFocused={checkIsFocused(source, idx)}
               onClearFocus={onClearFocusedCitation}
+              onInspectChunk={onInspectChunk}
             />
           ))}
         </div>

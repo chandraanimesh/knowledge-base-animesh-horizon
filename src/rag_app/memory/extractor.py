@@ -57,6 +57,18 @@ class ExtractedMemoryFact(BaseModel):
     valid_duration_days: Optional[int] = Field(default=None, description="Optional validity duration in days for dynamic memory.")
     is_explicit_update: bool = Field(default=False, description="True if the user is explicitly updating, correcting, or replacing an existing fact or preference.")
 
+    @property
+    def is_episodic(self) -> bool:
+        return (self.memory_type or "").upper() == "EPISODIC"
+
+    @property
+    def is_semantic(self) -> bool:
+        return (self.memory_type or "").upper() in ("SEMANTIC", "STATIC")
+
+    @property
+    def is_procedural(self) -> bool:
+        return (self.memory_type or "").upper() == "PROCEDURAL"
+
 
 class ConversationMemoryExtractionResult(BaseModel):
     """Collection of extracted memory items from conversation."""
@@ -178,7 +190,9 @@ class MemoryExtractor:
                     continue
 
                 mem_type_str = (fact.memory_type or "DYNAMIC").strip().upper()
-                if mem_type_str in ("STATIC", "SEMANTIC"):
+                if mem_type_str == "SEMANTIC":
+                    mem_type = MemoryType.SEMANTIC
+                elif mem_type_str == "STATIC":
                     mem_type = MemoryType.STATIC
                 elif mem_type_str == "PROCEDURAL":
                     mem_type = MemoryType.PROCEDURAL

@@ -14,7 +14,8 @@ from __future__ import annotations
 import os
 
 # Guarantee tests execute strictly against confirmed disposable database rag_disposable_test
-os.environ["DATABASE_URL"] = "postgresql+asyncpg://rag:rag@127.0.0.1:5433/rag_disposable_test"
+if "DATABASE_URL" not in os.environ:
+    os.environ["DATABASE_URL"] = "postgresql+asyncpg://rag:rag@127.0.0.1:5433/rag_disposable_test"
 from datetime import datetime, timedelta, timezone
 from typing import Any
 import uuid
@@ -419,3 +420,79 @@ async def test_workflow_approval_cross_workspace_forbidden(setup_approval_contex
             headers=ctx["other_headers"],
         )
         assert post_res.status_code == 403, post_res.text
+
+
+@pytest.mark.asyncio
+async def test_workflow_approval_expired_ticket_rejected(setup_approval_context):
+    """
+    Phase 4C Security: Expired approval ticket is rejected and transitioned to EXPIRED.
+    """
+    ctx = setup_approval_context
+    draft_content = "Draft with expired approval ticket."
+
+    async with AsyncSessionLocal() as session:
+        run, approval = await _create_awaiting_approval_run(session, ctx, draft_content)
+        # Force expiration timestamp into the past
+        approval.expires_at = datetime.now(timezone.utc) - timedelta(minutes=15)
+        await session.commit()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post(
+            f"/api/v1/workflows/runs/{run.id}/approval",
+            json={
+                "decision": "APPROVED",
+                "draft_hash": compute_canonical_draft_hash(draft_content),
+            },
+            headers=ctx["headers"],
+        )
+        assert res.status_code == 403, res.text
+        assert "expired" in res.json()["detail"].lower()
+
+    async with AsyncSessionLocal() as session:
+        db_run = await session.get(WorkflowRun, run.id)
+        assert db_run.status == "EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_workflow_approval_already_consumed_rejected(setup_approval_context):
+    """
+    Phase 4C Security: Single-use consumption safeguard - already completed or consumed tickets cannot be re-approved.
+    """
+    ctx = setup_approval_context
+    draft_content = "Memo for single-use test."
+
+    async with AsyncSessionLocal() as session:
+        run, approval = await _create_awaiting_approval_run(session, ctx, draft_content)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with (
+            patch("rag_app.crm.twenty_mcp_client.TwentyMCPClient.create_note", new_callable=AsyncMock) as mock_crm,
+            patch("rag_app.crm.twenty_mcp_client.TwentyMCPClient.create_note_target_for_company", new_callable=AsyncMock) as mock_target,
+        ):
+            mock_crm.return_value = "note-first-pass"
+            mock_target.return_value = "target-first-pass"
+
+            # 1. First approval succeeds
+            first_res = await client.post(
+                f"/api/v1/workflows/runs/{run.id}/approval",
+                json={
+                    "decision": "APPROVED",
+                    "draft_hash": compute_canonical_draft_hash(draft_content),
+                },
+                headers=ctx["headers"],
+            )
+            assert first_res.status_code == 200
+
+            # 2. Duplicate submission must be rejected (cannot consume twice)
+            second_res = await client.post(
+                f"/api/v1/workflows/runs/{run.id}/approval",
+                json={
+                    "decision": "APPROVED",
+                    "draft_hash": compute_canonical_draft_hash(draft_content),
+                },
+                headers=ctx["headers"],
+            )
+            assert second_res.status_code == 400
+            assert "AWAITING_APPROVAL" in second_res.json()["detail"]

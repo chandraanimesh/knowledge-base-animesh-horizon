@@ -421,20 +421,36 @@ class ConversationService:
             if latest_asst_id:
                 artifacts_by_msg.setdefault(latest_asst_id, []).extend(unassigned_artifacts)
 
-        messages_resp = [
-            ChatMessageResponse(
-                id=str(msg.id),
-                conversation_id=str(msg.conversation_id),
-                role=msg.role,
-                content=msg.content,
-                visualization=msg.visualization,
-                sources=msg.sources,
-                execution_metrics=msg.execution_metrics,
-                artifacts=artifacts_by_msg.get(str(msg.id)),
-                created_at=msg.created_at,
+        messages_resp = []
+        for msg in conv.messages:
+            m_metrics = msg.execution_metrics if isinstance(msg.execution_metrics, dict) else (
+                msg.execution_metrics.model_dump() if hasattr(msg.execution_metrics, "model_dump") else {}
+            ) or {}
+            r_mode = m_metrics.get("routing_mode")
+            r_reason = m_metrics.get("routing_reason")
+            r_run_id = m_metrics.get("workflow_run_id")
+
+            # Fallback for historical messages: if execution metrics exist on assistant message, mark as FAST_RAG
+            if not r_mode and msg.role == "assistant" and (m_metrics.get("stages") or m_metrics.get("planned_strategies") or m_metrics.get("total_latency_ms")):
+                r_mode = "FAST_RAG"
+                r_reason = "Single-shot direct knowledge retrieval and grounded answer synthesis."
+
+            messages_resp.append(
+                ChatMessageResponse(
+                    id=str(msg.id),
+                    conversation_id=str(msg.conversation_id),
+                    role=msg.role,
+                    content=msg.content,
+                    visualization=msg.visualization,
+                    sources=msg.sources,
+                    execution_metrics=msg.execution_metrics,
+                    routing_mode=r_mode,
+                    routing_reason=r_reason,
+                    workflow_run_id=r_run_id,
+                    artifacts=artifacts_by_msg.get(str(msg.id)),
+                    created_at=msg.created_at,
+                )
             )
-            for msg in conv.messages
-        ]
 
         return ConversationDetailResponse(
             id=str(conv.id),

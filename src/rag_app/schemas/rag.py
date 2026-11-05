@@ -8,6 +8,8 @@ class IngestResponse(BaseModel):
     document_id: str | None = None
     chunks_created: int = 0
     reason: str | None = None
+    failed_chunks: int = 0
+    toxic_chunks_isolated: list[dict] | None = None
 
 
 class RetrievedChunk(BaseModel):
@@ -26,6 +28,8 @@ class RetrievedChunk(BaseModel):
     hierarchical_position: int | None = None
     node_id: str | None = None
     page_number: int | None = None
+    has_errata: bool = False
+    errata_notes: list[str] | None = None
 
 
 class GraphEdgeProvenance(BaseModel):
@@ -198,6 +202,11 @@ class ExecutionMetrics(BaseModel):
     streaming: bool = False
     failure_categories: list[FailureCategory] = Field(default_factory=list)
 
+    # Adaptive Routing & Orchestration
+    routing_mode: str | None = None
+    routing_reason: str | None = None
+    workflow_run_id: str | None = None
+
     # Legacy & Stage Metrics
     stages: ExecutionStages = Field(default_factory=ExecutionStages)
 
@@ -274,6 +283,8 @@ class GenerateResponse(BaseModel):
     artifacts: list[ArtifactMetadata] | None = None
     workflow_run_id: str | None = None
     workflow_status: str | None = None
+    routing_mode: str | None = None
+    routing_reason: str | None = None
 
 
 
@@ -289,6 +300,9 @@ class ChatMessageResponse(BaseModel):
     tabular_dataset: TabularDataset | None = None
     artifacts: list[ArtifactMetadata] | None = None
     created_at: datetime
+    routing_mode: str | None = None
+    routing_reason: str | None = None
+    workflow_run_id: str | None = None
 
 
 class ConversationResponse(BaseModel):

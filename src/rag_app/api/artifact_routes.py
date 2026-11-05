@@ -18,6 +18,7 @@ from rag_app.reports.registry import renderer_registry
 from rag_app.reports.storage import ArtifactStorageService
 from rag_app.schemas.artifacts import (
     ArtifactMetadata,
+    ArtifactPreviewResponse,
     DownloadableArtifactFormat,
     TabularDataset,
 )
@@ -212,6 +213,87 @@ async def download_artifact(
         media_type=artifact.mime_type,
         filename=artifact.safe_filename,
     )
+
+
+@router.get("/{artifact_id}/preview", response_model=ArtifactPreviewResponse)
+async def preview_artifact(
+    artifact_id: uuid.UUID,
+    user: CurrentUser,
+    session: DbSession,
+    max_chars: int = Query(50000, ge=100, le=200000),
+) -> ArtifactPreviewResponse:
+    """
+    Authenticated preview endpoint for execution and report artifacts.
+    Enforces authorization, dynamic permissions, path traversal guard,
+    and cryptographic SHA-256 integrity verification.
+    """
+    artifact = await session.get(GeneratedArtifact, artifact_id)
+    if not artifact:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact {artifact_id} not found.",
+        )
+
+    await _verify_artifact_access(artifact, user, session)
+
+    now = datetime.now(timezone.utc)
+    if artifact.expires_at and artifact.expires_at < now:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Artifact has expired. Please use the regenerate endpoint.",
+        )
+
+    storage = ArtifactStorageService()
+    try:
+        raw_bytes = storage.read_artifact(artifact.storage_path)
+    except (FileNotFoundError, ValueError) as err:
+        logger.error(f"Failed to read artifact binary on disk: {err}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact file is missing or inaccessible.",
+        )
+
+    import hashlib
+    actual_hash = hashlib.sha256(raw_bytes).hexdigest()
+    if artifact.checksum_sha256 and actual_hash != artifact.checksum_sha256:
+        logger.error(f"Integrity check failed for artifact {artifact_id}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Integrity check failed: Artifact content hash mismatch.",
+        )
+
+    fmt_lower = (artifact.format or "").lower().lstrip(".")
+    is_binary = fmt_lower in ("pdf", "docx", "xlsx", "zip", "bin", "png", "jpg", "jpeg")
+
+    if is_binary:
+        content = f"[Binary artifact: {artifact.safe_filename} ({artifact.byte_size} bytes, format: {fmt_lower.upper()}). Please download to view full document.]"
+        is_truncated = False
+    else:
+        try:
+            full_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            full_text = raw_bytes.decode("latin-1", errors="replace")
+
+        if len(full_text) > max_chars:
+            content = full_text[:max_chars] + f"\n\n[TRUNCATED: Exceeded preview limit of {max_chars} characters]"
+            is_truncated = True
+        else:
+            content = full_text
+            is_truncated = False
+
+    return ArtifactPreviewResponse(
+        artifact_id=artifact.id,
+        title=artifact.title,
+        format=artifact.format,
+        mime_type=artifact.mime_type,
+        content=content,
+        byte_size=artifact.byte_size,
+        checksum_sha256=actual_hash,
+        is_truncated=is_truncated,
+        is_binary=is_binary,
+        expires_at=artifact.expires_at,
+    )
+
 
 
 @router.post("/{artifact_id}/regenerate", response_model=ArtifactMetadata)

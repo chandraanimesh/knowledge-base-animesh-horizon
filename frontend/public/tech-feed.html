@@ -1,0 +1,878 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TechPulse — Daily Intelligence Feed</title>
+  <meta name="description" content="Your daily autonomous tech intelligence briefing — powered by real-time web search, grounded summaries and verified citations." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── Reset & Base ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg-deep:     #070a12;
+      --bg-mid:      #0d1120;
+      --glass-bg:    rgba(255,255,255,0.035);
+      --glass-hover: rgba(255,255,255,0.07);
+      --glass-border: rgba(255,255,255,0.10);
+      --glass-border-top: rgba(255,255,255,0.18);
+
+      --accent-ai:      #6366f1;
+      --accent-systems: #06b6d4;
+      --accent-security:#f59e0b;
+      --accent-tools:   #10b981;
+      --accent-research:#a78bfa;
+      --accent-industry:#f43f5e;
+
+      --text-primary:   #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted:     #475569;
+      --text-accent:    #818cf8;
+
+      --glow-ai:       0 0 60px rgba(99,102,241,0.15);
+      --glow-cyan:     0 0 60px rgba(6,182,212,0.12);
+
+      --radius-card: 16px;
+      --radius-pill: 999px;
+
+      --font-sans: 'Inter', system-ui, sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background-color: var(--bg-deep);
+      color: var(--text-primary);
+      min-height: 100vh;
+      overflow-x: hidden;
+      position: relative;
+    }
+
+    /* ── Ambient Background Orbs ── */
+    .ambient {
+      position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden;
+    }
+    .orb {
+      position: absolute; border-radius: 50%;
+      filter: blur(120px); opacity: 0.18;
+      animation: floatOrb 20s ease-in-out infinite alternate;
+    }
+    .orb-1 { width: 600px; height: 600px; background: #6366f1; top: -200px; left: -100px; animation-duration: 18s; }
+    .orb-2 { width: 500px; height: 500px; background: #06b6d4; top: 30%; right: -150px; animation-duration: 24s; animation-delay: -6s; }
+    .orb-3 { width: 400px; height: 400px; background: #8b5cf6; bottom: -100px; left: 40%; animation-duration: 21s; animation-delay: -12s; }
+    @keyframes floatOrb {
+      0%   { transform: translate(0,0) scale(1); }
+      100% { transform: translate(30px, 40px) scale(1.08); }
+    }
+
+    /* ── Layout ── */
+    .app-shell { position: relative; z-index: 1; }
+
+    /* ── Header ── */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(7,10,18,0.85);
+      backdrop-filter: blur(24px) saturate(180%);
+      border-bottom: 1px solid var(--glass-border);
+      padding: 0 2rem;
+    }
+    .header-inner {
+      max-width: 1400px; margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      height: 64px; gap: 1.5rem;
+    }
+    .logo {
+      display: flex; align-items: center; gap: 10px;
+      text-decoration: none; color: inherit;
+    }
+    .logo-icon {
+      width: 32px; height: 32px; border-radius: 8px;
+      background: linear-gradient(135deg, #6366f1, #06b6d4);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px; font-weight: 800; color: #fff;
+      box-shadow: 0 0 16px rgba(99,102,241,0.5);
+    }
+    .logo-text {
+      font-size: 1.1rem; font-weight: 700;
+      background: linear-gradient(90deg, #f1f5f9, #94a3b8);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .logo-tag {
+      font-size: 0.65rem; font-weight: 600; color: var(--accent-ai);
+      background: rgba(99,102,241,0.12); border: 1px solid rgba(99,102,241,0.25);
+      padding: 2px 8px; border-radius: var(--radius-pill);
+      font-family: var(--font-mono); letter-spacing: 0.05em;
+    }
+    .header-actions { display: flex; align-items: center; gap: 0.75rem; }
+    .live-badge {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 0.72rem; font-weight: 600; color: #10b981;
+      background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.25);
+      padding: 4px 12px; border-radius: var(--radius-pill);
+    }
+    .live-dot {
+      width: 7px; height: 7px; border-radius: 50%; background: #10b981;
+      animation: pulse-dot 1.8s ease-in-out infinite;
+    }
+    @keyframes pulse-dot {
+      0%,100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: 0.4; transform: scale(0.7); }
+    }
+    .header-btn {
+      background: var(--glass-bg); border: 1px solid var(--glass-border);
+      color: var(--text-secondary); font-size: 0.82rem; font-weight: 500;
+      padding: 6px 14px; border-radius: var(--radius-pill); cursor: pointer;
+      transition: all 0.2s; font-family: var(--font-sans);
+    }
+    .header-btn:hover { background: var(--glass-hover); color: var(--text-primary); border-color: rgba(255,255,255,0.18); }
+    .schedule-btn {
+      background: linear-gradient(135deg, #6366f1, #4f46e5);
+      border: none; color: #fff; font-size: 0.82rem; font-weight: 600;
+      padding: 7px 16px; border-radius: var(--radius-pill); cursor: pointer;
+      transition: all 0.25s; font-family: var(--font-sans);
+      box-shadow: 0 0 20px rgba(99,102,241,0.35);
+    }
+    .schedule-btn:hover { transform: translateY(-1px); box-shadow: 0 0 28px rgba(99,102,241,0.55); }
+
+    /* ── Main ── */
+    main { max-width: 1400px; margin: 0 auto; padding: 2rem; }
+
+    /* ── Top Bar ── */
+    .top-bar {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 1.5rem; flex-wrap: wrap; gap: 1rem;
+    }
+    .page-title {
+      font-size: 1.5rem; font-weight: 800; letter-spacing: -0.02em;
+      background: linear-gradient(135deg, #f1f5f9 40%, #818cf8);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .page-subtitle { font-size: 0.82rem; color: var(--text-muted); margin-top: 2px; }
+    .last-updated {
+      font-size: 0.75rem; color: var(--text-muted); font-family: var(--font-mono);
+      background: var(--glass-bg); border: 1px solid var(--glass-border);
+      padding: 6px 12px; border-radius: var(--radius-pill);
+    }
+    .last-updated span { color: var(--accent-ai); }
+
+    /* ── Category Filter Tabs ── */
+    .filter-bar {
+      display: flex; gap: 0.5rem; margin-bottom: 2rem;
+      overflow-x: auto; padding-bottom: 4px;
+      scrollbar-width: none;
+    }
+    .filter-bar::-webkit-scrollbar { display: none; }
+    .filter-pill {
+      white-space: nowrap; font-size: 0.8rem; font-weight: 500;
+      padding: 6px 16px; border-radius: var(--radius-pill); cursor: pointer;
+      transition: all 0.2s; border: 1px solid var(--glass-border);
+      background: var(--glass-bg); color: var(--text-secondary);
+      font-family: var(--font-sans);
+    }
+    .filter-pill:hover { border-color: rgba(255,255,255,0.18); color: var(--text-primary); }
+    .filter-pill.active {
+      background: rgba(99,102,241,0.15); border-color: rgba(99,102,241,0.5);
+      color: #818cf8; font-weight: 600;
+    }
+    .filter-pill[data-cat="systems"].active  { background: rgba(6,182,212,0.12); border-color: rgba(6,182,212,0.45); color: #06b6d4; }
+    .filter-pill[data-cat="security"].active { background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.45); color: #f59e0b; }
+    .filter-pill[data-cat="tools"].active    { background: rgba(16,185,129,0.12); border-color: rgba(16,185,129,0.45); color: #10b981; }
+    .filter-pill[data-cat="research"].active { background: rgba(167,139,250,0.12); border-color: rgba(167,139,250,0.45); color: #a78bfa; }
+    .filter-pill[data-cat="industry"].active { background: rgba(244,63,94,0.12); border-color: rgba(244,63,94,0.45); color: #f43f5e; }
+
+    /* ── Stats Strip ── */
+    .stats-strip {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    .stat-card {
+      background: var(--glass-bg); border: 1px solid var(--glass-border);
+      border-top-color: var(--glass-border-top);
+      border-radius: var(--radius-card); padding: 1rem 1.25rem;
+      transition: all 0.25s;
+    }
+    .stat-card:hover { background: var(--glass-hover); transform: translateY(-2px); }
+    .stat-label { font-size: 0.73rem; color: var(--text-muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+    .stat-value { font-size: 1.6rem; font-weight: 800; font-family: var(--font-mono); }
+    .stat-sub { font-size: 0.72rem; color: var(--text-muted); margin-top: 4px; }
+    .stat-up   { color: #10b981; }
+    .stat-ai   { color: var(--accent-ai); }
+    .stat-cyan { color: var(--accent-systems); }
+    .stat-amber { color: var(--accent-security); }
+
+    /* ── Bento Grid ── */
+    .bento-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: auto;
+      gap: 1.25rem;
+    }
+
+    /* ── Card Base ── */
+    .card {
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-top-color: var(--glass-border-top);
+      border-radius: var(--radius-card);
+      padding: 1.5rem;
+      position: relative; overflow: hidden;
+      transition: all 0.3s cubic-bezier(0.4,0,0.2,1);
+      cursor: pointer; display: flex; flex-direction: column; gap: 1rem;
+    }
+    .card::before {
+      content: ''; position: absolute; inset: 0; border-radius: var(--radius-card);
+      background: radial-gradient(ellipse at top left, rgba(255,255,255,0.04) 0%, transparent 60%);
+      pointer-events: none;
+    }
+    .card:hover {
+      background: var(--glass-hover);
+      border-color: rgba(255,255,255,0.16);
+      transform: translateY(-3px);
+      box-shadow: 0 20px 40px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.06);
+    }
+
+    /* ── Hero Card (spans 2 cols) ── */
+    .card-hero {
+      grid-column: span 2;
+      background: linear-gradient(135deg, rgba(99,102,241,0.08), rgba(6,182,212,0.05));
+      border-color: rgba(99,102,241,0.25);
+      padding: 2rem;
+    }
+    .card-hero:hover { border-color: rgba(99,102,241,0.45); box-shadow: var(--glow-ai), 0 20px 40px rgba(0,0,0,0.4); }
+    .card-hero .card-title { font-size: 1.25rem; }
+
+    /* ── Tall Card (spans 2 rows) ── */
+    .card-tall { grid-row: span 2; }
+
+    /* ── Category Chip ── */
+    .chip {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 0.68rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.07em; padding: 3px 10px; border-radius: var(--radius-pill);
+      border: 1px solid;
+    }
+    .chip-dot { width: 5px; height: 5px; border-radius: 50%; }
+    .chip-ai       { color: #818cf8; background: rgba(99,102,241,0.12); border-color: rgba(99,102,241,0.3); }
+    .chip-ai .chip-dot       { background: #6366f1; }
+    .chip-systems  { color: #06b6d4; background: rgba(6,182,212,0.10); border-color: rgba(6,182,212,0.3); }
+    .chip-systems .chip-dot  { background: #06b6d4; }
+    .chip-security { color: #f59e0b; background: rgba(245,158,11,0.10); border-color: rgba(245,158,11,0.3); }
+    .chip-security .chip-dot { background: #f59e0b; }
+    .chip-tools    { color: #10b981; background: rgba(16,185,129,0.10); border-color: rgba(16,185,129,0.3); }
+    .chip-tools .chip-dot    { background: #10b981; }
+    .chip-research { color: #a78bfa; background: rgba(167,139,250,0.10); border-color: rgba(167,139,250,0.3); }
+    .chip-research .chip-dot { background: #a78bfa; }
+    .chip-industry { color: #f43f5e; background: rgba(244,63,94,0.10); border-color: rgba(244,63,94,0.3); }
+    .chip-industry .chip-dot { background: #f43f5e; }
+
+    /* ── Card Content ── */
+    .card-meta { display: flex; align-items: center; justify-content: space-between; }
+    .card-time { font-size: 0.72rem; color: var(--text-muted); font-family: var(--font-mono); }
+    .card-title {
+      font-size: 1rem; font-weight: 700; line-height: 1.45;
+      color: var(--text-primary); letter-spacing: -0.01em;
+    }
+    .card-body { font-size: 0.85rem; line-height: 1.7; color: var(--text-secondary); flex: 1; }
+    .card-body strong { color: var(--text-primary); font-weight: 600; }
+
+    /* ── Highlight quote ── */
+    .quote-block {
+      border-left: 3px solid var(--accent-ai);
+      padding: 0.75rem 1rem;
+      background: rgba(99,102,241,0.06);
+      border-radius: 0 8px 8px 0;
+      font-size: 0.83rem; color: var(--text-secondary); font-style: italic;
+      margin: 0.5rem 0;
+    }
+
+    /* ── Key Points ── */
+    .key-points { display: flex; flex-direction: column; gap: 0.5rem; }
+    .key-point {
+      display: flex; align-items: flex-start; gap: 8px;
+      font-size: 0.82rem; color: var(--text-secondary); line-height: 1.5;
+    }
+    .key-point-dot {
+      width: 6px; height: 6px; border-radius: 50%; background: var(--accent-ai);
+      margin-top: 6px; flex-shrink: 0;
+    }
+    .key-point-dot.cyan   { background: var(--accent-systems); }
+    .key-point-dot.amber  { background: var(--accent-security); }
+    .key-point-dot.green  { background: var(--accent-tools); }
+    .key-point-dot.purple { background: var(--accent-research); }
+
+    /* ── Citation strip ── */
+    .citations {
+      display: flex; align-items: center; gap: 0.5rem;
+      flex-wrap: wrap; padding-top: 0.75rem;
+      border-top: 1px solid rgba(255,255,255,0.05);
+    }
+    .citation-label { font-size: 0.68rem; color: var(--text-muted); font-weight: 500; }
+    .citation-badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 0.7rem; padding: 3px 9px; border-radius: var(--radius-pill);
+      background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
+      color: var(--text-secondary); transition: all 0.2s; text-decoration: none;
+    }
+    .citation-badge:hover { background: rgba(255,255,255,0.1); color: var(--text-primary); border-color: rgba(255,255,255,0.18); }
+    .favicon { width: 12px; height: 12px; border-radius: 3px; background: #1e293b; }
+
+    /* ── Trending sidebar card ── */
+    .trend-list { display: flex; flex-direction: column; gap: 0; }
+    .trend-item {
+      display: flex; align-items: flex-start; gap: 0.85rem;
+      padding: 0.9rem 0; border-bottom: 1px solid rgba(255,255,255,0.04);
+      transition: all 0.2s;
+    }
+    .trend-item:last-child { border-bottom: none; padding-bottom: 0; }
+    .trend-item:hover .trend-title { color: var(--text-primary); }
+    .trend-rank {
+      font-size: 1.2rem; font-weight: 800; color: var(--text-muted);
+      font-family: var(--font-mono); min-width: 24px; line-height: 1;
+      margin-top: 1px;
+    }
+    .trend-rank.hot { color: #f43f5e; }
+    .trend-title { font-size: 0.83rem; font-weight: 500; color: var(--text-secondary); line-height: 1.4; }
+    .trend-meta { font-size: 0.7rem; color: var(--text-muted); margin-top: 3px; font-family: var(--font-mono); }
+
+    /* ── Code snippet card ── */
+    .code-block {
+      background: rgba(0,0,0,0.35); border-radius: 8px; padding: 1rem;
+      font-family: var(--font-mono); font-size: 0.75rem; line-height: 1.6;
+      border: 1px solid rgba(255,255,255,0.06); overflow-x: auto;
+    }
+    .code-keyword { color: #c792ea; }
+    .code-string  { color: #c3e88d; }
+    .code-comment { color: #546e7a; }
+    .code-func    { color: #82aaff; }
+    .code-num     { color: #f78c6c; }
+
+    /* ── Scheduled Task Mini-card ── */
+    .sched-item {
+      display: flex; align-items: center; gap: 0.85rem;
+      padding: 0.85rem; border-radius: 10px;
+      background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06);
+      transition: all 0.2s; margin-bottom: 0.6rem;
+    }
+    .sched-item:last-child { margin-bottom: 0; }
+    .sched-item:hover { background: rgba(255,255,255,0.05); }
+    .sched-icon {
+      width: 34px; height: 34px; border-radius: 8px; display: flex;
+      align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0;
+    }
+    .sched-info { flex: 1; min-width: 0; }
+    .sched-title { font-size: 0.82rem; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sched-next  { font-size: 0.7rem; color: var(--text-muted); margin-top: 2px; font-family: var(--font-mono); }
+    .sched-status {
+      font-size: 0.65rem; font-weight: 600; padding: 3px 9px;
+      border-radius: var(--radius-pill); white-space: nowrap;
+    }
+    .sched-active { background: rgba(16,185,129,0.12); color: #10b981; border: 1px solid rgba(16,185,129,0.25); }
+    .sched-paused { background: rgba(245,158,11,0.10); color: #f59e0b; border: 1px solid rgba(245,158,11,0.25); }
+
+    /* ── Progress bar ── */
+    .progress-bar {
+      height: 3px; background: rgba(255,255,255,0.07); border-radius: 999px;
+      overflow: hidden; margin-top: 4px;
+    }
+    .progress-fill {
+      height: 100%; border-radius: 999px;
+      background: linear-gradient(90deg, #6366f1, #06b6d4);
+      animation: progressPulse 3s ease-in-out infinite alternate;
+    }
+    @keyframes progressPulse { 0% { opacity: 0.7; } 100% { opacity: 1; } }
+
+    /* ── New badge ── */
+    .new-badge {
+      font-size: 0.62rem; font-weight: 700; padding: 2px 7px;
+      background: linear-gradient(135deg, #6366f1, #06b6d4);
+      color: #fff; border-radius: var(--radius-pill); letter-spacing: 0.04em;
+      animation: shimmer 2s ease-in-out infinite;
+    }
+    @keyframes shimmer {
+      0%, 100% { opacity: 1; } 50% { opacity: 0.75; }
+    }
+
+    /* ── Section headings ── */
+    .section-heading {
+      font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 1rem;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .section-heading::after {
+      content: ''; flex: 1; height: 1px; background: rgba(255,255,255,0.06);
+    }
+
+    /* ── Refresh Indicator ── */
+    .refresh-ring {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 0.72rem; color: var(--text-muted); font-family: var(--font-mono);
+    }
+    .spinner {
+      width: 14px; height: 14px; border: 2px solid rgba(99,102,241,0.2);
+      border-top-color: #6366f1; border-radius: 50%;
+      animation: spin 1.5s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Tooltip ── */
+    [data-tip] { position: relative; }
+    [data-tip]:hover::after {
+      content: attr(data-tip);
+      position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+      background: #1e293b; color: var(--text-secondary);
+      font-size: 0.7rem; padding: 5px 10px; border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.1); white-space: nowrap;
+      pointer-events: none; z-index: 999;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 1024px) {
+      .bento-grid { grid-template-columns: repeat(2, 1fr); }
+      .card-hero { grid-column: span 2; }
+      .stats-strip { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 640px) {
+      main { padding: 1rem; }
+      .bento-grid { grid-template-columns: 1fr; }
+      .card-hero { grid-column: span 1; }
+      .card-tall { grid-row: span 1; }
+      .stats-strip { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    /* ── Skeleton loading animation ── */
+    .skeleton {
+      background: linear-gradient(90deg, rgba(255,255,255,0.04) 25%, rgba(255,255,255,0.08) 50%, rgba(255,255,255,0.04) 75%);
+      background-size: 200% 100%; border-radius: 6px;
+      animation: skeleton-shimmer 1.5s ease-in-out infinite;
+    }
+    @keyframes skeleton-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+    /* ── Scroll fade-in ── */
+    .fade-in {
+      opacity: 0; transform: translateY(18px);
+      animation: fadeUp 0.5s ease forwards;
+    }
+    @keyframes fadeUp { to { opacity: 1; transform: translateY(0); } }
+    .d1 { animation-delay: 0.05s; } .d2 { animation-delay: 0.12s; }
+    .d3 { animation-delay: 0.18s; } .d4 { animation-delay: 0.24s; }
+    .d5 { animation-delay: 0.30s; } .d6 { animation-delay: 0.36s; }
+    .d7 { animation-delay: 0.42s; } .d8 { animation-delay: 0.48s; }
+  </style>
+</head>
+<body>
+<div class="ambient">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+</div>
+
+<div class="app-shell">
+
+  <!-- ── HEADER ── -->
+  <header>
+    <div class="header-inner">
+      <a href="#" class="logo">
+        <div class="logo-icon">T</div>
+        <span class="logo-text">TechPulse</span>
+        <span class="logo-tag">BETA</span>
+      </a>
+
+      <div class="header-actions">
+        <div class="live-badge"><span class="live-dot"></span> Live Feed</div>
+        <div class="refresh-ring" id="refresh-status">
+          <div class="spinner"></div>
+          <span id="refresh-text">Fetching updates...</span>
+        </div>
+        <button class="header-btn" id="manage-btn">⚡ Manage Schedules</button>
+        <button class="schedule-btn" id="new-schedule-btn">＋ New Schedule</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── MAIN ── -->
+  <main>
+
+    <!-- Top Bar -->
+    <div class="top-bar">
+      <div>
+        <div class="page-title">Tech Intelligence Brief</div>
+        <div class="page-subtitle">Autonomous daily digest — grounded, verified, cited</div>
+      </div>
+      <div class="last-updated">
+        Last fetched: <span id="fetch-time">Today, 9:00 AM IST</span>
+        &nbsp;·&nbsp; <span id="article-count">24 new articles</span>
+      </div>
+    </div>
+
+    <!-- Category Filter -->
+    <div class="filter-bar" id="filter-bar">
+      <button class="filter-pill active" data-cat="all">🌐 All</button>
+      <button class="filter-pill" data-cat="ai">🧠 AI & Agents</button>
+      <button class="filter-pill" data-cat="systems">⚙️ Systems</button>
+      <button class="filter-pill" data-cat="security">🔐 Security</button>
+      <button class="filter-pill" data-cat="tools">🛠 Dev Tools</button>
+      <button class="filter-pill" data-cat="research">🔬 Research</button>
+      <button class="filter-pill" data-cat="industry">📊 Industry</button>
+    </div>
+
+    <!-- Stats Strip -->
+    <div class="stats-strip fade-in d1">
+      <div class="stat-card">
+        <div class="stat-label">Articles Processed</div>
+        <div class="stat-value stat-ai" id="stat-articles">24</div>
+        <div class="stat-sub">↑ 6 more than yesterday</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Sources Verified</div>
+        <div class="stat-value stat-cyan" id="stat-sources">11</div>
+        <div class="stat-sub">ArXiv, GitHub, TechCrunch +8</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">New This Week</div>
+        <div class="stat-value stat-up" id="stat-new">142</div>
+        <div class="stat-sub">Unique developments tracked</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Hallucination Rate</div>
+        <div class="stat-value stat-amber">0.0%</div>
+        <div class="stat-sub">All claims source-grounded</div>
+        <div class="progress-bar"><div class="progress-fill" style="width:100%"></div></div>
+      </div>
+    </div>
+
+    <!-- ── BENTO GRID ── -->
+    <div class="bento-grid" id="feed-grid">
+
+      <!-- HERO CARD: Major AI Story -->
+      <div class="card card-hero fade-in d2" data-category="ai">
+        <div class="card-meta">
+          <span class="chip chip-ai"><span class="chip-dot"></span> AI & Agents</span>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span class="new-badge">NEW</span>
+            <span class="card-time">09:04 AM</span>
+          </div>
+        </div>
+        <div>
+          <div class="card-title">OpenAI's "Operator" Framework Enables Fully Autonomous Multi-Agent Task Chains with Sandboxed Execution</div>
+        </div>
+        <div class="card-body">
+          The Operator framework introduces a <strong>declarative DAG-based orchestration model</strong> where sub-agents can be spawned, chained, and validated without human intervention at each step. Early benchmarks show <strong>3.4× throughput improvement</strong> over single-agent loops on GAIA enterprise tasks.
+          <div class="quote-block">"Operator provides the first formally specified isolation boundary between planner and executor agents, closing a long-standing security gap in autonomous system design." — OpenAI Research Blog</div>
+        </div>
+        <div class="key-points">
+          <div class="key-point"><span class="key-point-dot"></span><span><strong>Sandboxed Execution:</strong> Each sub-agent runs in an isolated environment with restricted tool access</span></div>
+          <div class="key-point"><span class="key-point-dot cyan"></span><span><strong>Checkpoint Approval:</strong> Human confirmation gates available at configurable DAG nodes</span></div>
+          <div class="key-point"><span class="key-point-dot green"></span><span><strong>Cost Bounding:</strong> Token and time budgets enforced per sub-agent, preventing runaway inference</span></div>
+        </div>
+        <div class="citations">
+          <span class="citation-label">Sources:</span>
+          <a class="citation-badge" href="#" data-tip="openai.com/research">
+            <img class="favicon" src="https://www.google.com/s2/favicons?domain=openai.com&sz=16" alt=""/>
+            openai.com
+          </a>
+          <a class="citation-badge" href="#" data-tip="arxiv.org/abs/...">
+            <img class="favicon" src="https://www.google.com/s2/favicons?domain=arxiv.org&sz=16" alt=""/>
+            ArXiv 2026.10182
+          </a>
+          <a class="citation-badge" href="#" data-tip="theverge.com">
+            <img class="favicon" src="https://www.google.com/s2/favicons?domain=theverge.com&sz=16" alt=""/>
+            The Verge
+          </a>
+        </div>
+      </div>
+
+      <!-- TALL CARD: Trending Topics Sidebar -->
+      <div class="card card-tall fade-in d3" data-category="all">
+        <div class="section-heading">🔥 Trending Today</div>
+        <div class="trend-list">
+          <div class="trend-item">
+            <div class="trend-rank hot">1</div>
+            <div>
+              <div class="trend-title">Operator Multi-Agent Framework</div>
+              <div class="trend-meta">AI · 847 mentions</div>
+            </div>
+          </div>
+          <div class="trend-item">
+            <div class="trend-rank" style="color:#f59e0b">2</div>
+            <div>
+              <div class="trend-title">Rust async runtime Tokio 2.0 drops</div>
+              <div class="trend-meta">Systems · 612 mentions</div>
+            </div>
+          </div>
+          <div class="trend-item">
+            <div class="trend-rank" style="color:#6366f1">3</div>
+            <div>
+              <div class="trend-title">LangGraph v0.4 ReAct loop improvements</div>
+              <div class="trend-meta">AI Tools · 498 mentions</div>
+            </div>
+          </div>
+          <div class="trend-item">
+            <div class="trend-rank">4</div>
+            <div>
+              <div class="trend-title">NIST Post-Quantum Crypto final standards</div>
+              <div class="trend-meta">Security · 344 mentions</div>
+            </div>
+          </div>
+          <div class="trend-item">
+            <div class="trend-rank">5</div>
+            <div>
+              <div class="trend-title">Weaviate hybrid search BM25+dense index</div>
+              <div class="trend-meta">Dev Tools · 291 mentions</div>
+            </div>
+          </div>
+          <div class="trend-item">
+            <div class="trend-rank">6</div>
+            <div>
+              <div class="trend-title">EU AI Act enforcement timeline update</div>
+              <div class="trend-meta">Industry · 268 mentions</div>
+            </div>
+          </div>
+          <div class="trend-item">
+            <div class="trend-rank">7</div>
+            <div>
+              <div class="trend-title">Gemini 2.5 Ultra reasoning benchmark</div>
+              <div class="trend-meta">AI · 245 mentions</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-heading" style="margin-top:0.5rem;">📅 Active Schedules</div>
+        <div>
+          <div class="sched-item">
+            <div class="sched-icon" style="background:rgba(99,102,241,0.15)">🧠</div>
+            <div class="sched-info">
+              <div class="sched-title">AI Agent Updates</div>
+              <div class="sched-next">Next: Tomorrow 9:00 AM IST</div>
+            </div>
+            <span class="sched-status sched-active">ACTIVE</span>
+          </div>
+          <div class="sched-item">
+            <div class="sched-icon" style="background:rgba(6,182,212,0.12)">⚙️</div>
+            <div class="sched-info">
+              <div class="sched-title">Systems & Infra</div>
+              <div class="sched-next">Next: Tomorrow 8:00 AM IST</div>
+            </div>
+            <span class="sched-status sched-active">ACTIVE</span>
+          </div>
+          <div class="sched-item">
+            <div class="sched-icon" style="background:rgba(245,158,11,0.10)">🔐</div>
+            <div class="sched-info">
+              <div class="sched-title">CVE Security Feed</div>
+              <div class="sched-next">Next: Friday 10:00 AM IST</div>
+            </div>
+            <span class="sched-status sched-paused">PAUSED</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- CARD: Systems -->
+      <div class="card fade-in d4" data-category="systems">
+        <div class="card-meta">
+          <span class="chip chip-systems"><span class="chip-dot"></span> Systems</span>
+          <span class="card-time">08:47 AM</span>
+        </div>
+        <div class="card-title">Tokio 2.0: Rust async runtime now ships with built-in structured concurrency and task cancellation trees</div>
+        <div class="card-body">
+          The landmark Tokio 2.0 release eliminates the most common source of async bugs in Rust: <strong>implicit task leaks on cancellation</strong>. New JoinSet API provides structured concurrency with guaranteed cleanup semantics.
+        </div>
+        <div class="key-points">
+          <div class="key-point"><span class="key-point-dot cyan"></span><span>JoinSet v2 with cancellation propagation</span></div>
+          <div class="key-point"><span class="key-point-dot cyan"></span><span>15% throughput improvement in I/O-bound workloads</span></div>
+        </div>
+        <div class="citations">
+          <span class="citation-label">Sources:</span>
+          <a class="citation-badge" href="#"><img class="favicon" src="https://www.google.com/s2/favicons?domain=tokio.rs&sz=16" alt=""/> tokio.rs</a>
+          <a class="citation-badge" href="#"><img class="favicon" src="https://www.google.com/s2/favicons?domain=github.com&sz=16" alt=""/> GitHub Release</a>
+        </div>
+      </div>
+
+      <!-- CARD: Security -->
+      <div class="card fade-in d5" data-category="security">
+        <div class="card-meta">
+          <span class="chip chip-security"><span class="chip-dot"></span> Security</span>
+          <span class="card-time">09:12 AM</span>
+        </div>
+        <div class="card-title">NIST Publishes Final FIPS 204 & 205 — Post-Quantum Cryptography Standards Now Enforceable</div>
+        <div class="card-body">
+          NIST's finalized post-quantum standards (<strong>ML-KEM & ML-DSA</strong>) are now ready for mandatory adoption. Federal agencies have a 12-month migration window. OpenSSL 3.4 adds native support in today's patch.
+        </div>
+        <div class="key-points">
+          <div class="key-point"><span class="key-point-dot amber"></span><span>CRYSTALS-Kyber (ML-KEM) for key encapsulation</span></div>
+          <div class="key-point"><span class="key-point-dot amber"></span><span>12-month federal compliance deadline starts today</span></div>
+        </div>
+        <div class="citations">
+          <span class="citation-label">Sources:</span>
+          <a class="citation-badge" href="#"><img class="favicon" src="https://www.google.com/s2/favicons?domain=nist.gov&sz=16" alt=""/> nist.gov</a>
+          <a class="citation-badge" href="#"><img class="favicon" src="https://www.google.com/s2/favicons?domain=openssl.org&sz=16" alt=""/> OpenSSL Blog</a>
+        </div>
+      </div>
+
+      <!-- CARD: Research/Code snippet -->
+      <div class="card fade-in d6" data-category="research">
+        <div class="card-meta">
+          <span class="chip chip-research"><span class="chip-dot"></span> Research</span>
+          <span class="card-time">07:33 AM</span>
+        </div>
+        <div class="card-title">GAIA Benchmark v3: New Evaluation Suite for Grounded, Tool-Using Autonomous Agents</div>
+        <div class="card-body">
+          Key snippet from paper — defining the grounding contract for evaluation:
+        </div>
+        <div class="code-block">
+<span class="code-comment"># GAIA v3 — Agent Grounding Score (AGS)</span>
+<span class="code-keyword">def</span> <span class="code-func">compute_ags</span>(answer, sources):
+  citations = extract_citations(answer)
+  <span class="code-keyword">if not</span> citations:
+    <span class="code-keyword">return</span> <span class="code-num">0.0</span>
+  grounded = [c <span class="code-keyword">for</span> c <span class="code-keyword">in</span> citations
+              <span class="code-keyword">if</span> verify_in_source(c, sources)]
+  <span class="code-keyword">return</span> <span class="code-func">len</span>(grounded) / <span class="code-func">len</span>(citations)
+</div>
+        <div class="citations">
+          <span class="citation-label">Sources:</span>
+          <a class="citation-badge" href="#"><img class="favicon" src="https://www.google.com/s2/favicons?domain=arxiv.org&sz=16" alt=""/> ArXiv 2026.09871</a>
+        </div>
+      </div>
+
+      <!-- CARD: Dev Tools -->
+      <div class="card fade-in d7" data-category="tools">
+        <div class="card-meta">
+          <span class="chip chip-tools"><span class="chip-dot"></span> Dev Tools</span>
+          <span class="card-time">08:20 AM</span>
+        </div>
+        <div class="card-title">LangGraph v0.4: Native Parallel Branch Execution, Retry Policies & Streaming Checkpoints</div>
+        <div class="card-body">
+          LangGraph now supports <strong>true parallel DAG node execution</strong> with configurable retry policies and streaming checkpoints — enabling interrupted workflows to resume from the last successful node without re-executing earlier branches.
+        </div>
+        <div class="key-points">
+          <div class="key-point"><span class="key-point-dot green"></span><span>Parallel branch execution with barrier synchronization</span></div>
+          <div class="key-point"><span class="key-point-dot green"></span><span>Streaming checkpoints via Redis / SQLite backends</span></div>
+          <div class="key-point"><span class="key-point-dot green"></span><span>Migration guide from 0.3 available in docs</span></div>
+        </div>
+        <div class="citations">
+          <span class="citation-label">Sources:</span>
+          <a class="citation-badge" href="#"><img class="favicon" src="https://www.google.com/s2/favicons?domain=github.com&sz=16" alt=""/> langchain-ai/langgraph</a>
+          <a class="citation-badge" href="#"><img class="favicon" src="https://www.google.com/s2/favicons?domain=langchain.com&sz=16" alt=""/> Changelog</a>
+        </div>
+      </div>
+
+      <!-- CARD: Industry -->
+      <div class="card fade-in d8" data-category="industry">
+        <div class="card-meta">
+          <span class="chip chip-industry"><span class="chip-dot"></span> Industry</span>
+          <span class="card-time">09:31 AM</span>
+        </div>
+        <div class="card-title">EU AI Act Article 13 Compliance: Transparency Requirements Now Apply to General-Purpose AI Systems</div>
+        <div class="card-body">
+          Starting today, GPAI providers serving EU markets must publish <strong>technical documentation</strong>, training data summaries, and capability evaluations to the AI Office. Non-compliance: fines up to <strong>€15M or 3% of global turnover</strong>.
+        </div>
+        <div class="key-points">
+          <div class="key-point"><span class="key-point-dot" style="background:#f43f5e"></span><span>Training data transparency: Mandatory for GPAI</span></div>
+          <div class="key-point"><span class="key-point-dot" style="background:#f43f5e"></span><span>€15M maximum fine for non-disclosure</span></div>
+        </div>
+        <div class="citations">
+          <span class="citation-label">Sources:</span>
+          <a class="citation-badge" href="#"><img class="favicon" src="https://www.google.com/s2/favicons?domain=ec.europa.eu&sz=16" alt=""/> EU Commission</a>
+          <a class="citation-badge" href="#"><img class="favicon" src="https://www.google.com/s2/favicons?domain=techcrunch.com&sz=16" alt=""/> TechCrunch</a>
+        </div>
+      </div>
+
+    </div><!-- /bento-grid -->
+
+  </main>
+</div>
+
+<!-- ── MODALS ── -->
+<div id="schedule-modal" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,0.75);backdrop-filter:blur(8px);display:none;align-items:center;justify-content:center;">
+  <div style="background:#0d1120;border:1px solid rgba(255,255,255,0.12);border-radius:20px;padding:2rem;max-width:460px;width:90%;position:relative;">
+    <div style="font-size:1.1rem;font-weight:700;color:#f1f5f9;margin-bottom:0.25rem;">＋ Schedule New Topic</div>
+    <div style="font-size:0.8rem;color:#64748b;margin-bottom:1.5rem;">Describe your topic and cadence in plain language</div>
+    <textarea id="schedule-input" placeholder='e.g. "Every weekday at 9 AM, fetch the latest breakthroughs in AI agent frameworks and send me a summary"'
+      style="width:100%;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:1rem;color:#f1f5f9;font-size:0.85rem;font-family:Inter,sans-serif;resize:none;height:110px;outline:none;line-height:1.6;"></textarea>
+    <div style="display:flex;gap:0.75rem;margin-top:1rem;">
+      <button onclick="confirmSchedule()" style="flex:1;background:linear-gradient(135deg,#6366f1,#4f46e5);border:none;color:#fff;font-weight:600;padding:10px;border-radius:10px;cursor:pointer;font-family:Inter,sans-serif;font-size:0.88rem;">⚡ Confirm Schedule</button>
+      <button onclick="closeModal()" style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;font-weight:500;padding:10px 18px;border-radius:10px;cursor:pointer;font-family:Inter,sans-serif;font-size:0.88rem;">Cancel</button>
+    </div>
+    <div id="confirm-msg" style="display:none;margin-top:1rem;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.25);border-radius:8px;padding:0.75rem;font-size:0.8rem;color:#10b981;">
+      ✅ Schedule confirmed! Next run: Tomorrow at 9:00 AM IST
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── Refresh status ──
+  setTimeout(() => {
+    document.getElementById('refresh-text').textContent = 'Updated just now';
+    document.querySelector('.spinner').style.animationPlayState = 'paused';
+    document.querySelector('.spinner').style.border = '2px solid rgba(16,185,129,0.3)';
+    document.querySelector('.spinner').style.borderTopColor = '#10b981';
+  }, 2800);
+
+  // ── Live clock ──
+  function updateTime() {
+    const now = new Date();
+    const t = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
+    const d = now.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Asia/Kolkata' });
+    document.getElementById('fetch-time').textContent = `${d}, ${t} IST`;
+  }
+  updateTime(); setInterval(updateTime, 10000);
+
+  // ── Count-up animation ──
+  function countUp(el, target, duration = 1200) {
+    let start = 0; const step = target / (duration / 16);
+    const timer = setInterval(() => {
+      start = Math.min(start + step, target);
+      el.textContent = Math.floor(start);
+      if (start >= target) clearInterval(timer);
+    }, 16);
+  }
+  window.addEventListener('DOMContentLoaded', () => {
+    setTimeout(() => {
+      countUp(document.getElementById('stat-articles'), 24);
+      countUp(document.getElementById('stat-sources'), 11);
+      countUp(document.getElementById('stat-new'), 142);
+    }, 300);
+  });
+
+  // ── Category Filter ──
+  document.getElementById('filter-bar').addEventListener('click', (e) => {
+    const pill = e.target.closest('.filter-pill');
+    if (!pill) return;
+    document.querySelectorAll('.filter-pill').forEach(p => p.classList.remove('active'));
+    pill.classList.add('active');
+    const cat = pill.dataset.cat;
+    document.querySelectorAll('.card[data-category]').forEach(card => {
+      card.style.transition = 'opacity 0.25s, transform 0.25s';
+      if (cat === 'all' || card.dataset.category === cat) {
+        card.style.opacity = '1'; card.style.transform = '';
+        card.style.pointerEvents = '';
+      } else {
+        card.style.opacity = '0.2'; card.style.transform = 'scale(0.97)';
+        card.style.pointerEvents = 'none';
+      }
+    });
+  });
+
+  // ── Schedule Modal ──
+  const modal = document.getElementById('schedule-modal');
+  document.getElementById('new-schedule-btn').addEventListener('click', () => {
+    modal.style.display = 'flex';
+    document.getElementById('confirm-msg').style.display = 'none';
+    document.getElementById('schedule-input').value = '';
+  });
+  function closeModal() { modal.style.display = 'none'; }
+  function confirmSchedule() {
+    const val = document.getElementById('schedule-input').value.trim();
+    if (!val) return;
+    document.getElementById('confirm-msg').style.display = 'block';
+    setTimeout(closeModal, 2500);
+  }
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+</script>
+</body>
+</html>

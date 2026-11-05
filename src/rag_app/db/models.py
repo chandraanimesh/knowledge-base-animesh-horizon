@@ -1,8 +1,9 @@
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Enum, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID,JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
@@ -256,6 +257,20 @@ class DocumentChunk(Base):
         String, 
         index=True
     ) # index=True zaruri hai fast search ke liye
+    current_version: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+        nullable=False,
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        nullable=False,
+    )
+    document_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
     __table_args__ = (
         UniqueConstraint(
             "document_id",
@@ -299,6 +314,16 @@ class User(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True
+    )
+    registration_status: Mapped[str] = mapped_column(
+        String(20),
+        CheckConstraint("registration_status IN ('PENDING', 'APPROVED', 'REJECTED')", name="ck_user_registration_status"),
+        default="APPROVED",
+        nullable=False,
+    )
+    profile_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
     )
 
     __table_args__ = (
@@ -3045,6 +3070,22 @@ class WorkflowRun(Base):
         Text,
         nullable=False,
     )
+    workflow_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflow_definitions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    workflow_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflow_versions.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    provider_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
     # Budget limits & real-time accounting
     max_tokens_budget: Mapped[int] = mapped_column(Integer, nullable=False, default=25000)
@@ -3114,9 +3155,20 @@ class WorkflowRun(Base):
     artifacts: Mapped[list["GeneratedArtifact"]] = relationship(
         back_populates="workflow_run",
     )
+    workflow: Mapped["WorkflowDefinition | None"] = relationship(
+        foreign_keys="[WorkflowRun.workflow_id]",
+    )
+    workflow_version: Mapped["WorkflowVersion | None"] = relationship(
+        foreign_keys="[WorkflowRun.workflow_version_id]",
+    )
     approvals: Mapped[list["CRMWriteBackApproval"]] = relationship(
         back_populates="workflow_run",
     )
+    @validates("provider_snapshot")
+    def validate_provider_snapshot(self, key, value):
+        if getattr(self, "provider_snapshot", None) is not None and value != self.provider_snapshot:
+            raise ValueError("ImmutableRuntimeSnapshotError: Runtime provider snapshot cannot be mutated once initialized.")
+        return value
 
     __table_args__ = (
         CheckConstraint(
@@ -3272,3 +3324,406 @@ class WorkflowTask(Base):
     )
 
 
+
+
+class WorkflowDefinition(Base):
+    __tablename__ = "workflow_definitions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="RESTRICT"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    active_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    workspace: Mapped["Workspace"] = relationship()
+    created_by: Mapped["User"] = relationship()
+    versions: Mapped[list["WorkflowVersion"]] = relationship(back_populates="workflow", cascade="all, delete-orphan", foreign_keys="[WorkflowVersion.workflow_id]")
+
+
+class WorkflowVersion(Base):
+    __tablename__ = "workflow_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workflow_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("workflow_definitions.id", ondelete="CASCADE"), nullable=False, index=True)
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), CheckConstraint("status IN ('DRAFT', 'ACTIVE', 'ARCHIVED')", name="ck_workflow_version_status"), default="DRAFT", nullable=False)
+    trigger_spec: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    steps_spec: Mapped[list[Any]] = mapped_column(JSONB, default=list, nullable=False)
+    canvas_layout: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=dict, nullable=True)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_by_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    workflow: Mapped["WorkflowDefinition"] = relationship(back_populates="versions", foreign_keys=[workflow_id])
+    created_by: Mapped["User"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("workflow_id", "version_number", name="uq_workflow_versions_wf_version"),
+        Index("ix_workflow_versions_wf_status", "workflow_id", "status"),
+    )
+
+
+class WorkflowTriggerEvent(Base):
+    __tablename__ = "workflow_trigger_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    event_source: Mapped[str] = mapped_column(String(50), nullable=False)
+    event_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    workflow_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("workflow_definitions.id", ondelete="CASCADE"), nullable=False, index=True)
+    workflow_version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("workflow_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(50),
+        CheckConstraint("status IN ('PENDING', 'PROCESSING', 'DISPATCHED', 'FAILED')", name="ck_workflow_trigger_event_status"),
+        default="PENDING",
+        nullable=False,
+        index=True,
+    )
+    workflow_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WorkflowScheduleState(Base):
+    __tablename__ = "workflow_schedule_states"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workflow_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("workflow_definitions.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
+    last_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_window_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    misfire_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="IDLE", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class MemoryPrivacyPolicy(Base):
+    __tablename__ = "memory_privacy_policies"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scope_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    memory_collection_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    memory_extraction_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    memory_dreaming_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    memory_retrieval_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    auto_expiration_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    user_deletion_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    profile_scrubbing_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    memory_export_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    user_can_pause: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("scope_type IN ('TENANT', 'WORKSPACE', 'USER')", name="ck_memory_privacy_scope_type"),
+        UniqueConstraint("scope_type", "scope_id", name="uq_memory_privacy_policies_scope"),
+        Index("ix_memory_privacy_policies_scope_type", "scope_type"),
+        Index("ix_memory_privacy_policies_scope_id", "scope_id"),
+    )
+
+
+class MemoryTombstone(Base):
+    __tablename__ = "memory_tombstones"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    canonical_key: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(String(50), default="FORGET", nullable=False)
+    section: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    key: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    user: Mapped["User"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "canonical_key", name="uq_memory_tombstones_user_key"),
+        Index("ix_memory_tombstones_user_id", "user_id"),
+        Index("ix_memory_tombstones_canonical_key", "canonical_key"),
+    )
+
+
+class MemoryPrivacyAuditEvent(Base):
+    __tablename__ = "memory_privacy_audit_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True)
+    department_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"), nullable=True)
+    action: Mapped[str] = mapped_column(String(50), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="SUCCESS", nullable=False)
+    metadata_: Mapped[dict[str, Any] | None] = mapped_column("metadata_", JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('POLICY_UPDATE', 'MEMORY_PAUSE', 'MEMORY_RESUME', 'MEMORY_FORGET', 'MEMORY_DELETE_ALL', 'PROFILE_SCRUB', 'RETENTION_SWEEP', 'MEMORY_EXPORT')",
+            name="ck_memory_privacy_audit_action",
+        ),
+        CheckConstraint("status IN ('SUCCESS', 'FAILED')", name="ck_memory_privacy_audit_status"),
+        Index("ix_memory_privacy_audit_events_user_id", "user_id"),
+        Index("ix_memory_privacy_audit_events_workspace_id", "workspace_id"),
+        Index("ix_memory_privacy_audit_events_department_id", "department_id"),
+        Index("ix_memory_privacy_audit_events_action", "action"),
+        Index("ix_memory_privacy_audit_events_created_at", "created_at"),
+    )
+
+
+class MemoryRelationship(Base):
+    __tablename__ = "memory_relationships"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    target_memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    relationship_type: Mapped[str] = mapped_column(
+        String(50),
+        CheckConstraint("relationship_type IN ('DUPLICATE', 'COMPLEMENTS', 'SUPERSEDES', 'CONTRADICTS', 'RELATED', 'UNRESOLVED')", name="ck_memory_relationship_type"),
+        nullable=False,
+        index=True,
+    )
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, server_default=text("'{}'::jsonb"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    source_memory: Mapped["MemoryItem"] = relationship(foreign_keys=[source_memory_id])
+    target_memory: Mapped["MemoryItem"] = relationship(foreign_keys=[target_memory_id])
+
+    __table_args__ = (
+        Index("ix_memory_relationships_source_target", "source_memory_id", "target_memory_id"),
+    )
+
+
+class MemoryDreamingRun(Base):
+    __tablename__ = "memory_dreaming_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True)
+    trigger_type: Mapped[str] = mapped_column(String(50), default="SCHEDULED", nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(50),
+        CheckConstraint("status IN ('PENDING', 'RUNNING', 'COMPLETED', 'PARTIALLY_COMPLETED', 'FAILED', 'CANCELLED', 'SKIPPED_POLICY_PAUSED')", name="ck_memory_dreaming_run_status"),
+        default="PENDING",
+        nullable=False,
+        index=True,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    memories_inspected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    memories_skipped: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    duplicates_detected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    conflicts_detected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    new_memories_created: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    memories_superseded: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    profile_updated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_usage: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    checkpoint_data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    duration_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_memory_dreaming_runs_user_status", "user_id", "status"),
+    )
+
+
+class MemoryEvalMetric(Base):
+    __tablename__ = "memory_eval_metrics"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    eval_run_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    scenario_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    metric_category: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    metrics_json: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    passed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_memory_eval_metrics_run_category", "eval_run_id", "metric_category"),
+    )
+
+
+class DocumentChunkVersion(Base):
+    __tablename__ = "document_chunk_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    chunk_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("document_chunks.id", ondelete="CASCADE"), nullable=False, index=True)
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    text_before: Mapped[str] = mapped_column(Text, nullable=False)
+    text_after: Mapped[str] = mapped_column(Text, nullable=False)
+    diff_patch: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_snapshot: Mapped[list[float]] = mapped_column(Vector(384), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False)
+    embedding_dim: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    edited_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    edit_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    is_rollback: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    reverted_from_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    chunk: Mapped["DocumentChunk"] = relationship()
+    editor: Mapped["User | None"] = relationship(foreign_keys=[edited_by])
+
+    __table_args__ = (
+        UniqueConstraint("chunk_id", "version_number", name="uq_chunk_version_number"),
+        Index("ix_chunk_versions_created_at", "created_at"),
+    )
+
+
+class DocumentVersion(Base):
+    __tablename__ = "document_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    version_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    parent_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("document_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    source_content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    extraction_config_version: Mapped[str] = mapped_column(String(50), default="v1", nullable=False)
+    chunking_config_version: Mapped[str] = mapped_column(String(50), default="v1", nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(100), default="sentence-transformers/all-MiniLM-L6-v2", nullable=False)
+    embedding_dim: Mapped[int] = mapped_column(Integer, default=384, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(30),
+        CheckConstraint("status IN ('DETECTED', 'PROCESSING', 'SHADOW_VALIDATION', 'PENDING_APPROVAL', 'PUBLISHED', 'FAILED', 'SUPERSEDED', 'ROLLED_BACK')", name="ck_document_version_status"),
+        default="DETECTED",
+        nullable=False,
+        index=True,
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    change_summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    metadata_: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB, nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    document: Mapped["Document"] = relationship(foreign_keys=[document_id])
+
+    __table_args__ = (
+        UniqueConstraint("document_id", "version_number", name="uq_doc_version_number"),
+    )
+
+
+class DocumentPageVersion(Base):
+    __tablename__ = "document_page_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("document_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    raw_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    structural_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        CheckConstraint("status IN ('UNCHANGED', 'MODIFIED', 'ADDED', 'DELETED', 'MOVED', 'SPLIT', 'MERGED', 'UNKNOWN')", name="ck_doc_page_version_status"),
+        default="ADDED",
+        nullable=False,
+    )
+    reused_from_page_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("document_page_versions.id", ondelete="SET NULL"), nullable=True)
+    mapping_confidence: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    metadata_: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class DocumentVersionChunk(Base):
+    __tablename__ = "document_version_chunks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("document_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    chunk_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("document_chunks.id", ondelete="CASCADE"), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_reused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    reused_from_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("document_versions.id", ondelete="SET NULL"), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("document_version_id", "chunk_id", name="uq_doc_version_chunk"),
+    )
+
+
+class KnowledgeDependency(Base):
+    __tablename__ = "knowledge_dependencies"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("document_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    page_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("document_page_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    chunk_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("document_chunks.id", ondelete="CASCADE"), nullable=True, index=True)
+    knowledge_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    relationship_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_relationships.id", ondelete="SET NULL"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(30),
+        CheckConstraint("status IN ('ACTIVE', 'STALE', 'PENDING_REVALIDATION', 'SUPERSEDED', 'REVOKED', 'ARCHIVED')", name="ck_knowledge_dependency_status"),
+        default="ACTIVE",
+        nullable=False,
+    )
+    invalidation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class ShadowIngestionReport(Base):
+    __tablename__ = "shadow_ingestion_reports"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("document_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    comparison_status: Mapped[str] = mapped_column(
+        String(30),
+        CheckConstraint("comparison_status IN ('EXACT_MATCH', 'ACCEPTABLE_DIFFERENCE', 'MATERIAL_DIFFERENCE', 'FAILED')", name="ck_shadow_comparison_status"),
+        nullable=False,
+    )
+    exact_matches: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    reused_chunks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    new_chunks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    deleted_chunks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    modified_chunks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    divergence_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    validation_passed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class DocumentNote(Base):
+    __tablename__ = "document_notes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    author_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    correction_text: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approval_status: Mapped[str] = mapped_column(
+        String(20),
+        CheckConstraint("approval_status IN ('PENDING', 'APPROVED', 'REJECTED')", name="ck_document_notes_approval_status"),
+        default="APPROVED",
+        nullable=False,
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    effective_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    document: Mapped["Document"] = relationship()
+    author: Mapped["User | None"] = relationship(foreign_keys=[author_user_id])
+
+    __table_args__ = (
+        Index("ix_document_notes_doc_active", "document_id", "is_active", "approval_status"),
+    )

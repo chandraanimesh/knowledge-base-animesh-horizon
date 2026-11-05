@@ -6,6 +6,40 @@ export interface IngestResponse {
   document_id?: string;
   chunks_created: number;
   reason?: string;
+  failed_chunks?: number;
+  toxic_chunks_isolated?: Array<{
+    chunk_index: number;
+    text_preview: string;
+    classification: string;
+    error: string;
+  }>;
+}
+
+export interface CheckHashResponse {
+  exists: boolean;
+  document_id?: string;
+  file_name?: string;
+  scope?: string;
+}
+
+export async function computeFileSHA256(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+export async function checkDocumentHash(
+  hash: string,
+  departmentCode: string,
+  token: string,
+  workspaceId?: string
+): Promise<CheckHashResponse> {
+  let url = `/documents/check-hash?hash=${encodeURIComponent(hash)}&department_code=${encodeURIComponent(departmentCode)}`;
+  if (workspaceId) {
+    url += `&workspace_id=${encodeURIComponent(workspaceId)}`;
+  }
+  return apiClient<CheckHashResponse>(url, { method: 'GET' }, token);
 }
 
 export interface DocumentMetadataPayload {
@@ -173,6 +207,107 @@ export async function setDocumentPermissions(
   }, token);
 }
 
+export interface DocumentVersionItem {
+  id: string;
+  document_id: string;
+  version_number: number;
+  parent_version_id?: string | null;
+  source_content_hash: string;
+  extraction_config_version: string;
+  chunking_config_version: string;
+  embedding_model: string;
+  embedding_dim: number;
+  status: 'DETECTED' | 'PROCESSING' | 'SHADOW_VALIDATION' | 'PENDING_APPROVAL' | 'PUBLISHED' | 'FAILED' | 'SUPERSEDED' | 'ROLLED_BACK';
+  is_active: boolean;
+  change_summary?: Record<string, any> | null;
+  created_at: string;
+  published_at?: string | null;
+  rolled_back_at?: string | null;
+}
+
+export interface DocumentVersionListResponse {
+  document_id: string;
+  current_version_id?: string | null;
+  versions: DocumentVersionItem[];
+}
+
+export interface ShadowReportResponse {
+  id: string;
+  document_version_id: string;
+  comparison_status: 'EXACT_MATCH' | 'ACCEPTABLE_DIFFERENCE' | 'MATERIAL_DIFFERENCE' | 'FAILED';
+  can_publish: boolean;
+  reasons?: string[] | null;
+  page_diff_summary?: Record<string, any> | null;
+  chunk_diff_summary?: Record<string, any> | null;
+  embedding_diff_summary?: Record<string, any> | null;
+  knowledge_diff_summary?: Record<string, any> | null;
+  retrieval_diff_summary?: Record<string, any> | null;
+  created_at: string;
+}
+
+export async function listDocumentVersions(
+  documentId: string,
+  token: string
+): Promise<DocumentVersionListResponse> {
+  return apiClient<DocumentVersionListResponse>(
+    `/api/documents/${encodeURIComponent(documentId)}/versions`,
+    { method: 'GET' },
+    token
+  );
+}
+
+export async function getDocumentVersion(
+  documentId: string,
+  versionId: string,
+  token: string
+): Promise<DocumentVersionItem> {
+  return apiClient<DocumentVersionItem>(
+    `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}`,
+    { method: 'GET' },
+    token
+  );
+}
+
+export async function getShadowReport(
+  documentId: string,
+  versionId: string,
+  token: string
+): Promise<ShadowReportResponse> {
+  return apiClient<ShadowReportResponse>(
+    `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}/shadow-report`,
+    { method: 'GET' },
+    token
+  );
+}
+
+export async function publishDocumentVersion(
+  documentId: string,
+  versionId: string,
+  token: string
+): Promise<{ success: boolean; version_id: string; status: string; published_at?: string }> {
+  return apiClient<{ success: boolean; version_id: string; status: string; published_at?: string }>(
+    `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}/publish`,
+    { method: 'POST' },
+    token
+  );
+}
+
+export async function rollbackDocumentVersion(
+  documentId: string,
+  versionId: string,
+  targetVersionId: string,
+  token: string
+): Promise<{ success: boolean; document_id: string; rolled_back_version_id: string; active_version_id: string; status: string }> {
+  return apiClient<{ success: boolean; document_id: string; rolled_back_version_id: string; active_version_id: string; status: string }>(
+    `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}/rollback`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ target_version_id: targetVersionId }),
+    },
+    token
+  );
+}
+
 export const documentApi = {
   uploadDocument,
   updateDocumentDepartment,
@@ -181,6 +316,11 @@ export const documentApi = {
   grantDocumentPermission,
   revokeDocumentPermission,
   setDocumentPermissions,
+  listDocumentVersions,
+  getDocumentVersion,
+  getShadowReport,
+  publishDocumentVersion,
+  rollbackDocumentVersion,
 };
 
 

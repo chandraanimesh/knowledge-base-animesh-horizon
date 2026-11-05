@@ -4,8 +4,13 @@ const isHttps = typeof window !== 'undefined' && window.location.protocol === 'h
 const API_BASE_URL = (isHttps && rawApiUrl.startsWith('http://')) ? '' : rawApiUrl;
 
 export class ApiError extends Error {
-  constructor(public message: string, public status: number, public data?: any) {
+  status: number;
+  data?: any;
+
+  constructor(message: string, status: number, data?: any) {
     super(message);
+    this.status = status;
+    this.data = data;
     this.name = 'ApiError';
   }
 }
@@ -31,15 +36,16 @@ export async function apiClient<T>(
   const url = `${API_BASE_URL}${endpoint}`;
   const response = await fetch(url, { ...options, headers });
 
+  const rawText = await response.text();
   let data: any;
   try {
-    data = await response.json();
-  } catch (e) {
-    data = await response.text();
+    data = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    data = rawText;
   }
 
   if (!response.ok) {
-    const detail = data?.detail || typeof data === 'string' ? data : `HTTP ${response.status}`;
+    const detail = data?.detail || (typeof data === 'string' && data.trim().length > 0 ? data : `HTTP ${response.status}`);
     const errorMessage = typeof detail === 'string' ? detail : JSON.stringify(detail);
     throw new ApiError(errorMessage, response.status, data);
   }

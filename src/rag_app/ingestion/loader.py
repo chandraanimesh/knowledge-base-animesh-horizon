@@ -314,6 +314,34 @@ def _load_docx(
             )
         )
         
+    # Feature 11: Extract embedded media (images, diagrams, workflow strips) from word/media/
+    try:
+        from rag_app.ingestion.docx_media import extract_docx_media
+        media_items = extract_docx_media(path)
+        for media in media_items:
+            elements.append(
+                DocumentElement(
+                    text=media.text_representation,
+                    source_path=str(path),
+                    file_name=path.name,
+                    file_type=".docx",
+                    element_type="IMAGE",
+                    page_number=None,
+                    metadata={
+                        "source": str(path),
+                        "parser": "docx_media_extractor",
+                        "media_file_name": media.file_name,
+                        "media_sha256": media.sha256,
+                        "media_size": media.byte_size,
+                        "media_format": media.format,
+                        "width": media.width,
+                        "height": media.height,
+                    },
+                )
+            )
+    except Exception as m_err:
+        logger.warning(f"DOCX media extraction skipped for {path.name}: {m_err}")
+
     return elements
 
 

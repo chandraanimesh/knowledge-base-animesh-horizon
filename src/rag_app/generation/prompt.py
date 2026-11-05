@@ -153,6 +153,7 @@ def build_rag_messages(
     conversation_history: list[dict[str, str]] | None = None,
     workspace_thread_context: list[dict] | None = None,
     personal_memories: Any | None = None,
+    user_profile: dict | None = None,
 ) -> list[dict[str, str]]:
     user_content = ""
 
@@ -177,6 +178,21 @@ def build_rag_messages(
                 c_stripped = raw_c.replace("[User Personal Preferences & Context]", "").strip()
                 if c_stripped:
                     mem_lines.append(c_stripped)
+
+    # 1B. Living User Profile
+    if user_profile and isinstance(user_profile, dict):
+        profile_lines = []
+        if user_profile.get("user_preferences"):
+            prefs = user_profile["user_preferences"]
+            profile_lines.append("Preferences: " + ", ".join(f"{k}: {v}" for k, v in prefs.items()))
+        if user_profile.get("work_context"):
+            wc = user_profile["work_context"]
+            profile_lines.append("Work Context: " + ", ".join(f"{k}: {v}" for k, v in wc.items()))
+        if user_profile.get("stable_technical_preferences"):
+            stp = user_profile["stable_technical_preferences"]
+            profile_lines.append("Technical Preferences: " + ", ".join(f"{k}: {v}" for k, v in stp.items()))
+        if profile_lines:
+            user_content += "Living User Profile:\n" + "\n".join(f"- {l}" for l in profile_lines) + "\n\n"
 
     if mem_lines:
         # Enforce strict memory-context token budget (max ~300 tokens / 1200 characters)

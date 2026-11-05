@@ -210,6 +210,36 @@ export async function testProviderConnection(
   );
 }
 
+export interface WorkspaceApiKeySetRequest {
+  capability: string;
+  provider: string;
+  api_key: string;
+  env_var_name?: string | null;
+}
+
+export interface WorkspaceApiKeySetResponse {
+  success: boolean;
+  capability: string;
+  provider: string;
+  env_var_name: string;
+  message: string;
+}
+
+export async function setWorkspaceApiKey(
+  token: string,
+  workspaceId: string,
+  data: WorkspaceApiKeySetRequest
+): Promise<WorkspaceApiKeySetResponse> {
+  return apiClient<WorkspaceApiKeySetResponse>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/set-api-key`,
+    {
+      method: 'POST',
+      body: JSON.stringify(data),
+    },
+    token
+  );
+}
+
 export const workspaceApi = {
   listWorkspaces,
   getWorkspace,
@@ -224,5 +254,6 @@ export const workspaceApi = {
   upsertWorkspaceProviderProfile,
   getProviderCapabilities,
   testProviderConnection,
+  setWorkspaceApiKey,
 };
 

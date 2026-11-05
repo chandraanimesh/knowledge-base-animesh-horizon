@@ -81,12 +81,56 @@ export interface ExecutionMetrics {
   repair_triggered?: boolean
   regeneration_triggered?: boolean
   safe_limitation_triggered?: boolean
+  routing_mode?: string | null
+  routing_reason?: string | null
+  workflow_run_id?: string | null
+  workflow_status?: string | null
   stages?: ExecutionStages
 }
 
 interface Props {
   metrics: ExecutionMetrics
+  routingMode?: string | null
+  routingReason?: string | null
+  workflowRunId?: string | null
+  workflowStatus?: string | null
+  onOpenCanvas?: (runId: string) => void
   onClose: () => void
+}
+
+function getRoutingBadge(mode?: string | null) {
+  const normalized = (mode || '').toUpperCase()
+  if (normalized === 'FAST_RAG' || normalized === 'FAST_PATH') {
+    return {
+      label: 'Fast RAG',
+      icon: '⚡',
+      bg: '#F0F9FF',
+      text: '#0369A1',
+      border: '#BAE6FD',
+      desc: 'Single-shot direct knowledge retrieval and grounded answer synthesis.'
+    }
+  }
+  if (normalized === 'CONTEXTUAL') {
+    return {
+      label: 'Contextual',
+      icon: '🧠',
+      bg: '#FAF5FF',
+      text: '#7E22CE',
+      border: '#E9D5FF',
+      desc: 'Multi-source retrieval fusing internal documents, personal memory, and living profile context.'
+    }
+  }
+  if (normalized === 'ADAPTIVE_PLAN' || normalized === 'ADAPTIVE_WORKFLOW' || normalized === 'WORKFLOW') {
+    return {
+      label: 'Adaptive Plan',
+      icon: '🔀',
+      bg: '#ECFDF5',
+      text: '#047857',
+      border: '#A7F3D0',
+      desc: 'Multi-step autonomous task planning, capability routing, and dependency DAG execution.'
+    }
+  }
+  return null
 }
 
 function formatDuration(ms: number | undefined | null): string {
@@ -95,8 +139,26 @@ function formatDuration(ms: number | undefined | null): string {
   return `${(ms / 1000).toFixed(2)} s`
 }
 
-export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => {
+export const ExecutionMetricsModal: React.FC<Props> = ({
+  metrics,
+  routingMode,
+  routingReason,
+  workflowRunId,
+  workflowStatus,
+  onOpenCanvas,
+  onClose,
+}) => {
   const [showRaw, setShowRaw] = useState(false)
+
+  const rawMode = routingMode || metrics.routing_mode || (workflowRunId || metrics.workflow_run_id ? 'ADAPTIVE_PLAN' : null)
+  const effectiveMode = rawMode || 'FAST_RAG'
+  const effectiveReason = routingReason || metrics.routing_reason || (
+    effectiveMode === 'FAST_RAG'
+      ? 'Single-shot direct knowledge retrieval and grounded answer synthesis.'
+      : null
+  )
+  const effectiveRunId = workflowRunId || metrics.workflow_run_id || null
+  const routingInfo = getRoutingBadge(effectiveMode)
 
   const totalTokens = metrics.total_tokens || metrics.llm_usage?.total_tokens || 0
   const inputTokens = metrics.input_tokens || metrics.llm_usage?.input_tokens || 0
@@ -173,9 +235,30 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
               ⚡
             </div>
             <div>
-              <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 700, color: '#0F172A' }}>
-                Query Execution Inspector
-              </h3>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 700, color: '#0F172A' }}>
+                  Query Execution Inspector
+                </h3>
+                {routingInfo && (
+                  <span
+                    style={{
+                      fontSize: '11px',
+                      fontWeight: 600,
+                      color: routingInfo.text,
+                      background: routingInfo.bg,
+                      border: `1px solid ${routingInfo.border}`,
+                      padding: '1px 8px',
+                      borderRadius: '4px',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                    }}
+                  >
+                    <span>{routingInfo.icon}</span>
+                    <span>{routingInfo.label}</span>
+                  </span>
+                )}
+              </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '2px' }}>
                 {metrics.provider && (
                   <span style={{ fontSize: '11px', fontWeight: 600, color: '#0284C7', background: '#E0F2FE', padding: '1px 6px', borderRadius: '4px' }}>
@@ -224,6 +307,92 @@ export const ExecutionMetricsModal: React.FC<Props> = ({ metrics, onClose }) => 
 
         {/* Scrollable Content */}
         <div style={{ padding: '20px 24px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          {/* Row 0: Adaptive Routing & Execution Path Banner */}
+          {(routingInfo || effectiveMode) && (
+            <div
+              style={{
+                background: routingInfo ? routingInfo.bg : '#F8FAFC',
+                border: `1px solid ${routingInfo ? routingInfo.border : '#E2E8F0'}`,
+                borderRadius: '12px',
+                padding: '12px 16px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '12px',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: 1 }}>
+                <div
+                  style={{
+                    fontSize: '20px',
+                    width: '36px',
+                    height: '36px',
+                    borderRadius: '8px',
+                    background: '#FFFFFF',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
+                    border: `1px solid ${routingInfo ? routingInfo.border : '#E2E8F0'}`,
+                  }}
+                >
+                  {routingInfo?.icon || '✦'}
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ fontSize: '12.5px', fontWeight: 700, color: routingInfo ? routingInfo.text : '#1E293B' }}>
+                      Execution Mode: {routingInfo?.label || effectiveMode}
+                    </span>
+                    <span
+                      style={{
+                        fontSize: '9.5px',
+                        fontWeight: 600,
+                        color: '#64748B',
+                        background: '#FFFFFF',
+                        border: '1px solid #CBD5E1',
+                        padding: '1px 6px',
+                        borderRadius: '3px',
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.04em',
+                      }}
+                    >
+                      Adaptive Router
+                    </span>
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#475569', marginTop: '2px', lineHeight: 1.4 }}>
+                    {effectiveReason || routingInfo?.desc || 'Autonomous query execution routing path applied for this response.'}
+                  </div>
+                </div>
+              </div>
+
+              {effectiveRunId && onOpenCanvas && (
+                <button
+                  onClick={() => onOpenCanvas(effectiveRunId)}
+                  title="Inspect DAG tasks in Execution Canvas"
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    padding: '6px 14px',
+                    fontSize: '11.5px',
+                    fontWeight: 600,
+                    color: '#FFFFFF',
+                    background: 'linear-gradient(135deg, #059669 0%, #047857 100%)',
+                    border: 'none',
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    boxShadow: '0 1px 3px rgba(4, 120, 87, 0.3)',
+                    whiteSpace: 'nowrap',
+                    transition: 'all 0.15s ease',
+                  }}
+                >
+                  <span>🔀</span>
+                  <span>Open Execution Canvas</span>
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Row 1: Key Metrics Cards */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px' }}>
             {/* LLM Calls */}

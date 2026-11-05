@@ -1,4 +1,4 @@
-import { apiClient } from './client';
+import { apiClient } from './client.ts';
 
 export type WorkflowStatus =
   | 'PENDING'
@@ -24,6 +24,9 @@ export interface WorkflowTaskResponse {
   error_message?: string | null;
   tokens_spent: number;
   provider_calls: number;
+  retry_count?: number;
+  max_retries?: number;
+  locked_by?: string | null;
   created_at: string;
   updated_at: string;
   completed_at?: string | null;
@@ -35,6 +38,8 @@ export interface WorkflowRunResponse {
   workspace_id?: string | null;
   department_id?: string | null;
   conversation_id?: string | null;
+  workflow_id?: string | null;
+  workflow_version_id?: string | null;
   scope_type: 'GLOBAL' | 'WORKSPACE';
   status: WorkflowStatus;
   idempotency_key?: string | null;
@@ -69,6 +74,12 @@ export interface WorkflowRunResponse {
   approval_id?: string | null;
   intended_action?: string | null;
   target_record_id?: string | null;
+  approval_status?: string | null;
+  approval_expires_at?: string | null;
+  approval_requested_by?: string | null;
+  target_object?: string | null;
+  is_test?: boolean;
+  execution_mode?: 'TEST' | 'PRODUCTION';
 }
 
 export interface WorkflowApprovalRequest {
@@ -88,6 +99,29 @@ export interface WorkflowApprovalResponse {
   writeback_result?: Record<string, any> | null;
 }
 
+export async function listWorkflowRuns(
+  token: string,
+  params: {
+    workflow_id?: string;
+    workspace_id?: string;
+    limit?: number;
+    skip?: number;
+  } = {}
+): Promise<WorkflowRunResponse[]> {
+  const query = new URLSearchParams();
+  if (params.workflow_id) query.set('workflow_id', params.workflow_id);
+  if (params.workspace_id) query.set('workspace_id', params.workspace_id);
+  if (params.limit) query.set('limit', String(params.limit));
+  if (params.skip) query.set('skip', String(params.skip));
+
+  const qs = query.toString();
+  return apiClient<WorkflowRunResponse[]>(
+    `/api/v1/workflows/runs${qs ? `?${qs}` : ''}`,
+    { method: 'GET' },
+    token
+  );
+}
+
 export async function getWorkflowRun(runId: string, token: string): Promise<WorkflowRunResponse> {
   return apiClient<WorkflowRunResponse>(`/api/v1/workflows/runs/${runId}`, {
     method: 'GET',
@@ -104,3 +138,31 @@ export async function submitWorkflowApproval(
     body: JSON.stringify(payload),
   }, token);
 }
+
+export interface WorkflowTestRunRequest {
+  inputs: Record<string, any>;
+  budget_limits?: {
+    max_tokens?: number;
+    max_provider_calls?: number;
+    wall_clock_timeout_seconds?: number;
+  };
+  idempotency_key?: string;
+}
+
+export async function executeWorkflowTestRun(
+  workspaceId: string,
+  workflowId: string,
+  versionId: string,
+  payload: WorkflowTestRunRequest,
+  token: string
+): Promise<WorkflowRunResponse> {
+  return apiClient<WorkflowRunResponse>(
+    `/api/v1/workflows/definitions/${workflowId}/versions/${versionId}/test?workspace_id=${workspaceId}`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+    token
+  );
+}
+

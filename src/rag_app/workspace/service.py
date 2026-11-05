@@ -21,6 +21,8 @@ from rag_app.schemas.workspace import (
     WorkspaceProviderProfileResponse,
     ProviderTestConnectionRequest,
     ProviderTestConnectionResponse,
+    WorkspaceApiKeySetRequest,
+    WorkspaceApiKeySetResponse,
 )
 from rag_app.security.authorization import authorize, get_allowed_departments
 
@@ -894,27 +896,55 @@ class WorkspaceService:
                         latency_ms=latency_ms,
                         details={"configured": True, "model": groq_adapter.model},
                     )
-                elif provider_name == "openai":
+                elif provider_name in ("openai", "custom", "openai_compatible", "deepseek", "openrouter", "ollama"):
                     import os
-                    api_key = os.getenv("OPENAI_API_KEY")
+                    api_key = None
+                    if payload.credential_ref:
+                        api_key = os.getenv(payload.credential_ref)
                     if not api_key:
+                        if provider_name == "openai":
+                            api_key = os.getenv("OPENAI_API_KEY")
+                        elif provider_name == "deepseek":
+                            api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+                        elif provider_name == "openrouter":
+                            api_key = os.getenv("OPENROUTER_API_KEY")
+                        elif provider_name in ("custom", "openai_compatible"):
+                            api_key = os.getenv("CUSTOM_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+                    base_url = None
+                    if payload.extra_config and isinstance(payload.extra_config, dict):
+                        base_url = payload.extra_config.get("base_url")
+
+                    is_local = (base_url and ("localhost" in base_url or "127.0.0.1" in base_url)) or provider_name == "ollama"
+                    if not api_key and not is_local:
+                        ref_display = payload.credential_ref or f"{provider_name.upper()}_API_KEY"
                         return ProviderTestConnectionResponse(
                             success=False,
                             capability=capability,
                             provider=provider_name,
                             model=payload.model or "gpt-4o",
-                            message="OPENAI_API_KEY is not configured on server. Provider cannot connect.",
+                            message=f"{ref_display} is not configured on server. Use 'Enter API Key' to save it.",
                             details={"configured": False},
                         )
+
+                    model_name = payload.model or ("deepseek-chat" if provider_name == "deepseek" else "gpt-4o")
+                    adapter = get_provider(
+                        "llm",
+                        provider_name,
+                        model=model_name,
+                        api_key=api_key or "local",
+                        base_url=base_url,
+                    )
+                    adapter.count_tokens([{"role": "user", "content": "ping"}])
                     latency_ms = round((time.perf_counter() - start) * 1000, 2)
                     return ProviderTestConnectionResponse(
                         success=True,
                         capability=capability,
                         provider=provider_name,
-                        model=payload.model or "gpt-4o",
-                        message="OpenAI API key configured and reachable.",
+                        model=model_name,
+                        message=f"{provider_name.capitalize()} provider verified with model '{model_name}'.",
                         latency_ms=latency_ms,
-                        details={"configured": True},
+                        details={"configured": True, "model": model_name, "base_url": getattr(adapter, "base_url", None)},
                     )
                 elif provider_name in ("anthropic", "gemini"):
                     env_key = f"{provider_name.upper()}_API_KEY"
@@ -1127,3 +1157,92 @@ class WorkspaceService:
                 message=f"Connection test failed: {err_msg}",
                 latency_ms=latency_ms,
             )
+
+    async def set_workspace_api_key(
+        self,
+        user: User,
+        workspace_id: uuid.UUID,
+        payload: WorkspaceApiKeySetRequest,
+    ) -> WorkspaceApiKeySetResponse:
+        """
+        Saves a raw provider API key directly to the server environment and updates the
+        workspace provider profile credential reference, avoiding manual .env edits.
+        """
+        import os
+        import re
+
+        ws = await self._get_active_workspace(workspace_id)
+        await self._check_workspace_provider_access(user, ws, require_write=True)
+
+        capability = payload.capability.strip().lower()
+        provider = payload.provider.strip().lower()
+        raw_key = payload.api_key.strip()
+        if not raw_key:
+            raise HTTPException(status_code=400, detail="API key cannot be empty.")
+
+        if payload.env_var_name and payload.env_var_name.strip():
+            env_name = payload.env_var_name.strip()
+        else:
+            default_names = {
+                "openai": "OPENAI_API_KEY",
+                "groq": "GROQ_API_KEY",
+                "deepseek": "DEEPSEEK_API_KEY",
+                "openrouter": "OPENROUTER_API_KEY",
+                "custom": "CUSTOM_LLM_API_KEY",
+                "openai_compatible": "CUSTOM_LLM_API_KEY",
+                "tavily": "TAVILY_API_KEY",
+                "firecrawl": "FIRECRAWL_API_KEY",
+                "tinyfish": "TINYFISH_API_KEY",
+            }
+            env_name = default_names.get(provider, f"{provider.upper()}_API_KEY")
+
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]{1,63}$", env_name):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid environment variable name '{env_name}'. Must contain only letters, numbers, and underscores.",
+            )
+
+        # 1. Update in-memory server environment
+        os.environ[env_name] = raw_key
+
+        # 2. Persist to .env file
+        try:
+            env_path = ".env"
+            lines = []
+            found = False
+            if os.path.exists(env_path):
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip().startswith(f"{env_name}="):
+                            lines.append(f"{env_name}={raw_key}\n")
+                            found = True
+                        else:
+                            lines.append(line)
+            if not found:
+                lines.append(f"{env_name}={raw_key}\n")
+
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception as e:
+            logger.warning(f"Could not persist secret to .env file: {e}")
+
+        # 3. Update WorkspaceProviderProfile credential reference in DB
+        profile = await self.session.scalar(
+            select(WorkspaceProviderProfile).where(
+                WorkspaceProviderProfile.workspace_id == workspace_id
+            )
+        )
+        if profile is not None:
+            if capability == "llm":
+                profile.llm_credential_ref = env_name
+            elif capability == "web":
+                profile.web_credential_ref = env_name
+            await self.session.flush()
+
+        return WorkspaceApiKeySetResponse(
+            success=True,
+            capability=capability,
+            provider=provider,
+            env_var_name=env_name,
+            message=f"API key for '{provider}' saved successfully to server environment as '{env_name}'.",
+        )

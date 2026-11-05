@@ -43,10 +43,10 @@ class DurableReconciliationScheduler:
 
     def __init__(
         self,
-        interval_seconds: int = 900,
+        interval_seconds: int = 60,
         session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
     ):
-        self.interval_seconds = max(10, interval_seconds)
+        self.interval_seconds = max(5, interval_seconds)
         self.session_factory = session_factory or AsyncSessionLocal
         self._task: Optional[asyncio.Task] = None
         self._is_running = False
@@ -167,6 +167,50 @@ class DurableReconciliationScheduler:
                 extra={"event": "crm_sync_scheduler_error", "error": str(crm_err)},
             )
 
+        # 6. Workflow Trigger Outbox recovery & scheduled workflows execution
+        recovered_trigger_events = 0
+        scheduled_workflows_executed = 0
+        try:
+            from rag_app.orchestration.trigger_service import WorkflowTriggerService
+            async with sf() as session:
+                trigger_svc = WorkflowTriggerService(session)
+                recovered_trigger_events = await trigger_svc.recover_pending_outbox_events(limit=10)
+                scheduled_workflows_executed = await trigger_svc.process_scheduled_workflows()
+        except Exception as trig_err:
+            logger.error(
+                "scheduler_workflow_triggers_error",
+                extra={"event": "workflow_triggers_scheduler_error", "error": str(trig_err)},
+            )
+
+        # 7. Memory Dreaming periodic background consolidation
+        dreamed_users = 0
+        try:
+            from rag_app.memory.dreaming import run_memory_dreaming
+            from rag_app.db.models import MemoryItem
+            from sqlalchemy import select, distinct
+            active_user_ids = []
+            async with sf() as session:
+                active_user_ids = (await session.execute(
+                    select(distinct(MemoryItem.user_id)).where(MemoryItem.status == "ACTIVE")
+                )).scalars().all()
+
+            for uid in active_user_ids:
+                try:
+                    async with sf() as user_session:
+                        d_res = await run_memory_dreaming(uid, user_session, threshold=3)
+                        if d_res.get("clusters_consolidated", 0) > 0:
+                            dreamed_users += 1
+                except Exception as u_err:
+                    logger.debug(
+                        "scheduler_user_dreaming_skipped",
+                        extra={"event": "user_dreaming_skipped", "user_id": str(uid), "error": str(u_err)},
+                    )
+        except Exception as dream_err:
+            logger.error(
+                "scheduler_memory_dreaming_error",
+                extra={"event": "memory_dreaming_scheduler_error", "error": str(dream_err)},
+            )
+
         duration = round(time.perf_counter() - start, 2)
         metrics = {
             "recovered_jobs": recovered_jobs,
@@ -178,6 +222,9 @@ class DurableReconciliationScheduler:
             "processed_memory_jobs": processed_mem_jobs,
             "recovered_crm_sync_jobs": recovered_crm_sync_jobs,
             "retried_crm_records": retried_crm_records,
+            "recovered_trigger_events": recovered_trigger_events,
+            "scheduled_workflows_executed": scheduled_workflows_executed,
+            "dreamed_users": dreamed_users,
             "duration_seconds": duration,
         }
 
@@ -220,9 +267,15 @@ class DurableReconciliationScheduler:
 _global_scheduler: Optional[DurableReconciliationScheduler] = None
 
 
-def get_reconciliation_scheduler(interval_seconds: int = 900) -> DurableReconciliationScheduler:
+def get_reconciliation_scheduler(interval_seconds: Optional[int] = None) -> DurableReconciliationScheduler:
     """Returns singleton scheduler instance."""
     global _global_scheduler
     if _global_scheduler is None:
+        if interval_seconds is None:
+            try:
+                from rag_app.core.config import settings
+                interval_seconds = getattr(settings, "scheduler_interval_seconds", 60)
+            except Exception:
+                interval_seconds = 60
         _global_scheduler = DurableReconciliationScheduler(interval_seconds=interval_seconds)
     return _global_scheduler

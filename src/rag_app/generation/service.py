@@ -245,6 +245,7 @@ class GenerationService:
                         raise RuntimeError("Security violation: Unauthorized chunk detected in final context.")
 
             context = rendered_context if rendered_context is not None else format_docs(chunks, chunk_hierarchy=chunk_hierarchy)
+            user_profile = getattr(user, "profile_json", None) if user else None
             messages = build_rag_messages(
                 context=context,
                 question=query,
@@ -253,6 +254,7 @@ class GenerationService:
                 conversation_history=conversation_history,
                 workspace_thread_context=workspace_thread_context,
                 personal_memories=personal_memories,
+                user_profile=user_profile,
             )
 
             # Revalidate final assembled prompt tokens against model context limit

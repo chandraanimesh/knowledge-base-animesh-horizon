@@ -1106,11 +1106,12 @@ class CRMSyncService:
 
     async def handle_webhook_event(
         self,
-        payload: dict[str, Any] | bytes,
+        payload: dict[str, Any] | list[Any] | bytes,
         signature_header: Optional[str] = None,
         secret: Any = _UNSET,
         department_id: Optional[uuid.UUID | str] = None,
         event_id: Optional[str] = None,
+        timestamp: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Processes an incoming Twenty CRM webhook payload with HMAC-SHA256 signature verification.
@@ -1138,17 +1139,114 @@ class CRMSyncService:
                 parsed_payload = json.loads(raw_bytes.decode("utf-8"))
             except Exception as e:
                 raise ValueError(f"Malformed JSON payload: {e}")
-        elif isinstance(payload, dict):
+        elif isinstance(payload, (dict, list)):
             raw_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             parsed_payload = payload
         else:
-            raise ValueError("Payload must be raw bytes or a dictionary.")
+            raise ValueError("Payload must be raw bytes or a dictionary/list.")
 
         # Constant-time HMAC-SHA256 verification
+        # Format 1: Direct raw bytes HMAC (standard test suites)
         expected_sig = hmac.new(webhook_secret.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
         sig_to_check = signature_header.replace("sha256=", "").strip()
-        if not hmac.compare_digest(expected_sig, sig_to_check):
+        is_valid = hmac.compare_digest(expected_sig, sig_to_check)
+
+        # Format 2: Twenty CRM official timestamped format: HMAC-SHA256 of `${timestamp}:${raw_bytes}`
+        if not is_valid and timestamp:
+            try:
+                raw_str = raw_bytes.decode("utf-8")
+                expected_sig_ts = hmac.new(
+                    webhook_secret.encode("utf-8"),
+                    f"{timestamp}:{raw_str}".encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
+                is_valid = hmac.compare_digest(expected_sig_ts, sig_to_check)
+            except Exception:
+                pass
+
+        if not is_valid:
             raise ValueError("Invalid webhook HMAC-SHA256 signature.")
+
+        # Timestamp freshness enforcement (Area C: SEC-06)
+        # Validate timestamp age against UTC with bounded clock skew (default 300s / 5 min)
+        if timestamp is not None and str(timestamp).strip():
+            ts_str = str(timestamp).strip()
+            try:
+                if ts_str.isdigit():
+                    ts_seconds = float(ts_str) / 1000.0 if len(ts_str) >= 12 else float(ts_str)
+                elif "T" in ts_str:
+                    ts_seconds = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                else:
+                    ts_seconds = float(ts_str)
+            except Exception as te:
+                raise ValueError(f"Malformed webhook timestamp '{timestamp}': {te}")
+
+            now_seconds = datetime.now(timezone.utc).timestamp()
+            drift = now_seconds - ts_seconds
+            max_skew = 300.0
+            if drift > max_skew:
+                raise ValueError(
+                    f"Webhook timestamp expired: event is {drift:.1f}s old (maximum allowable skew is {max_skew:.0f}s)."
+                )
+            if drift < -60.0:
+                raise ValueError(
+                    f"Webhook timestamp is in the future: {-drift:.1f}s ahead of server clock."
+                )
+
+        # Handle list payloads if wrapped
+        if isinstance(parsed_payload, list):
+            parsed_payload = parsed_payload[0] if (len(parsed_payload) > 0 and isinstance(parsed_payload[0], dict)) else {}
+
+        # Multi-Tenant Department & Workspace Routing (Area B)
+        # 1. Inspect cryptographically signed webhook identity
+        webhook_id = parsed_payload.get("webhookId") if isinstance(parsed_payload, dict) else None
+        target_department_to_sync = None
+        target_workspace_to_sync = None
+
+        mappings = settings.get_twenty_webhook_mappings() if hasattr(settings, "get_twenty_webhook_mappings") else {}
+
+        if webhook_id:
+            mapping_entry = mappings.get(str(webhook_id))
+            if not mapping_entry:
+                # Unauthorized or unregistered webhook ID: fail closed
+                raise ValueError(
+                    f"Unauthorized or unregistered webhook identity '{webhook_id}'. Routing identity cannot be verified."
+                )
+
+            if isinstance(mapping_entry, dict):
+                target_department_to_sync = mapping_entry.get("department_id")
+                target_workspace_to_sync = mapping_entry.get("workspace_id")
+            else:
+                target_department_to_sync = mapping_entry
+
+            # Cryptographic query parameter tamper verification:
+            # If an unsigned query parameter `department_id` is passed, it MUST match the server-side authorized mapping
+            if department_id:
+                is_match = False
+                if str(department_id).strip().lower() == str(target_department_to_sync).strip().lower():
+                    is_match = True
+                else:
+                    try:
+                        mapped_dept = await self._resolve_department(target_department_to_sync)
+                        query_dept = await self._resolve_department(department_id)
+                        if mapped_dept.id == query_dept.id:
+                            is_match = True
+                    except Exception:
+                        is_match = False
+
+                if not is_match:
+                    raise ValueError(
+                        f"Query parameter department_id '{department_id}' does not match "
+                        f"server-side authorization mapping for webhook '{webhook_id}'."
+                    )
+        elif department_id:
+            # No signed webhook identity in body: only permitted in dev/test fixtures
+            env = getattr(settings, "environment", "development").lower()
+            if env not in ("test", "testing", "dev", "development"):
+                raise ValueError(
+                    "Missing signed webhook identity; client-supplied query parameter routing is forbidden in production."
+                )
+            target_department_to_sync = department_id
 
         # Replay protection & deduplication
         resolved_event_id = (
@@ -1158,7 +1256,8 @@ class CRMSyncService:
             or parsed_payload.get("deliveryId")
         )
         event_name = (
-            parsed_payload.get("event")
+            parsed_payload.get("eventName")
+            or parsed_payload.get("event")
             or parsed_payload.get("operation")
             or parsed_payload.get("action")
             or parsed_payload.get("type")
@@ -1215,10 +1314,12 @@ class CRMSyncService:
             return {"status": "ignored", "reason": "Record not found in ledger"}
 
         # Created or updated event
-        if department_id:
+        if target_department_to_sync:
+            resolved_dept = await self._resolve_department(target_department_to_sync)
             resp = await self.sync_company_by_id(
                 company_id=record_id,
-                department_id=department_id,
+                department_id=resolved_dept.id,
+                workspace_id=target_workspace_to_sync,
             )
             return {
                 "status": "processed",

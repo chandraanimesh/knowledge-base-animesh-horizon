@@ -60,9 +60,16 @@ import {
   useUploadQueue,
 } from './UploadQueueReview'
 import { ExecutionMetricsModal, ExecutionMetrics } from './ExecutionMetricsModal'
+import ChunkHistoryModal from './ChunkHistoryModal'
+import { WorkflowStudioView } from './workflowStudio/WorkflowStudioView'
+import { MemoryPrivacyModal } from './MemoryPrivacyModal'
+import { MemoryExecutionInspector } from './MemoryExecutionInspector'
+import { WorkflowRunProgressCard } from './WorkflowRunProgressCard'
+import { ChatRoutingModeBadge } from './ChatRoutingModeBadge'
+import { ExecutionCanvasModal } from './ExecutionCanvasModal'
 
-type GlobalNavView = 'chat' | 'documents' | 'knowledge' | 'admin' | 'departments' | 'requests' | 'settings'
-type WorkspaceTab = 'threads' | 'documents' | 'knowledge' | 'members' | 'provider'
+type GlobalNavView = 'chat' | 'documents' | 'knowledge' | 'workflows' | 'admin' | 'departments' | 'requests' | 'settings'
+type WorkspaceTab = 'threads' | 'documents' | 'knowledge' | 'workflows' | 'members' | 'provider'
 
 interface AnythingLLMAppProps {
   token: string
@@ -122,9 +129,34 @@ export default function AnythingLLMApp({
   const [threads, setThreads] = useState<ConversationItem[]>([])
   const [activeThreadId, setActiveThreadId] = useState<string | null>(propActiveThreadId || null)
   const [loadingThreads, setLoadingThreads] = useState(false)
-  const [messages, setMessages] = useState<Array<{ id: string; role: 'user' | 'assistant' | 'system'; content: string; visualization?: VisualizationSpec | null; sources?: any[]; execution_metrics?: ExecutionMetrics | null; artifacts?: ArtifactMetadata[]; coverage?: CoverageReport | null }>>([])
-  const [selectedMetrics, setSelectedMetrics] = useState<ExecutionMetrics | null>(null)
+  const [messages, setMessages] = useState<Array<{
+    id: string;
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+    visualization?: VisualizationSpec | null;
+    sources?: any[];
+    execution_metrics?: ExecutionMetrics | null;
+    artifacts?: ArtifactMetadata[];
+    coverage?: CoverageReport | null;
+    workflow_run_id?: string | null;
+    workflow_status?: string | null;
+    routing_mode?: string | null;
+    routing_reason?: string | null;
+  }>>([])
+  const [selectedMetricsData, setSelectedMetricsData] = useState<{
+    metrics: ExecutionMetrics;
+    routing_mode?: string | null;
+    routing_reason?: string | null;
+    workflow_run_id?: string | null;
+    workflow_status?: string | null;
+  } | null>(null)
+  const [selectedExecutionCanvasRunId, setSelectedExecutionCanvasRunId] = useState<string | null>(null)
   const [focusedCitationByMsg, setFocusedCitationByMsg] = useState<Record<string, string | null>>({})
+  const [selectedInspectChunk, setSelectedInspectChunk] = useState<{
+    documentId: string;
+    chunkId: string;
+    fileName?: string;
+  } | null>(null)
 
   // Documents State
   const [documents, setDocuments] = useState<DocumentListItem[]>([])
@@ -154,6 +186,8 @@ export default function AnythingLLMApp({
   const [settingsModalWs, setSettingsModalWs] = useState<WorkspaceItem | null>(null)
   const [membersModalWs, setMembersModalWs] = useState<WorkspaceItem | null>(null)
   const [showSettingsModal, setShowSettingsModal] = useState(false)
+  const [showMemoryPrivacyModal, setShowMemoryPrivacyModal] = useState(false)
+  const [showMemoryInspector, setShowMemoryInspector] = useState(false)
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false)
   const [isLoggingOut, setIsLoggingOut] = useState(false)
 
@@ -502,6 +536,10 @@ export default function AnythingLLMApp({
             execution_metrics: m.execution_metrics || null,
             artifacts: m.artifacts,
             coverage: m.coverage,
+            workflow_run_id: m.workflow_run_id || null,
+            workflow_status: m.workflow_status || null,
+            routing_mode: m.routing_mode || null,
+            routing_reason: m.routing_reason || null,
           }))
           setMessages(deduplicateMessages(loaded))
         }
@@ -619,7 +657,7 @@ export default function AnythingLLMApp({
           workspace_id: activeWorkspace?.id || undefined,
           action: actionVal,
           target_message_id: targetMsgId,
-          execution_mode: 'fast_path',
+          execution_mode: isTypingVisualize ? 'fast_path' : undefined,
         },
         token
       )
@@ -644,6 +682,10 @@ export default function AnythingLLMApp({
         execution_metrics: response.execution_metrics || null,
         artifacts: response.artifacts,
         coverage: response.coverage,
+        workflow_run_id: response.workflow_run_id || null,
+        workflow_status: response.workflow_status || null,
+        routing_mode: response.routing_mode || null,
+        routing_reason: response.routing_reason || null,
       }
       setMessages((prev) => deduplicateMessages([...prev, assistantMsg]))
 
@@ -910,10 +952,11 @@ export default function AnythingLLMApp({
     <div
       style={{
         display: 'flex',
-        width: '100vw',
-        height: '100vh',
+        width: '100%',
+        height: '100%',
         overflow: 'hidden',
-        background: '#FFFFFF',
+        overscrollBehavior: 'none',
+        background: (activeWsTab === 'workflows' || currentNavView === 'workflows') ? '#f0f0eb' : '#FFFFFF',
         fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
         color: '#252525',
       }}
@@ -949,7 +992,7 @@ export default function AnythingLLMApp({
             width: `${sidebarWidth}px`,
             minWidth: `${sidebarWidth}px`,
             maxWidth: `${sidebarWidth}px`,
-            height: '100vh',
+            height: '100%',
             background: '#F7F7F7',
             borderRight: '1px solid #E5E5E5',
             display: 'flex',
@@ -1115,6 +1158,18 @@ export default function AnythingLLMApp({
                     <line x1="16.5" y1="7.5" x2="14" y2="10" />
                     <line x1="7.5" y1="16.5" x2="10" y2="14" />
                     <line x1="16.5" y1="16.5" x2="14" y2="14" />
+                  </svg>
+                ),
+              },
+              {
+                id: 'workflows',
+                label: 'Workflows',
+                icon: (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="3" y="3" width="6" height="6" rx="1" />
+                    <rect x="15" y="15" width="6" height="6" rx="1" />
+                    <rect x="15" y="3" width="6" height="6" rx="1" />
+                    <path d="M6 9v6a3 3 0 0 0 3 3h6" />
                   </svg>
                 ),
               },
@@ -1681,7 +1736,7 @@ export default function AnythingLLMApp({
           style={{
             width: '6px',
             cursor: 'col-resize',
-            height: '100vh',
+            height: '100%',
             position: 'relative',
             zIndex: 30,
             background: isResizingSidebar ? '#3B82F6' : 'transparent',
@@ -1709,12 +1764,15 @@ export default function AnythingLLMApp({
       <main
         style={{
           flex: 1,
-          height: '100vh',
-          background: '#FFFFFF',
+          height: '100%',
+          width: '100%',
+          background: (activeWsTab === 'workflows' || currentNavView === 'workflows') ? '#f0f0eb' : '#FFFFFF',
           display: 'flex',
           flexDirection: 'column',
           position: 'relative',
           overflow: 'hidden',
+          overscrollBehavior: 'none',
+          minHeight: 0,
         }}
       >
         {/* Top Header Bar */}
@@ -1807,10 +1865,10 @@ export default function AnythingLLMApp({
             )}
           </div>
 
-          {/* Workspace Tabs (Threads | Documents | Knowledge | Members | Provider) */}
+          {/* Workspace Tabs (Threads | Documents | Knowledge | Workflows | Members | Provider) */}
           {activeWorkspace && (
             <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-              {(['threads', 'documents', 'knowledge', 'members', 'provider'] as WorkspaceTab[]).map((tab) => {
+              {(['threads', 'documents', 'knowledge', 'workflows', 'members', 'provider'] as WorkspaceTab[]).map((tab) => {
                 const isTabActive = activeWsTab === tab
                 return (
                   <button
@@ -1829,21 +1887,22 @@ export default function AnythingLLMApp({
                       transition: 'all 0.1s ease',
                     }}
                   >
-                    {tab === 'threads' ? 'Chat / Threads' : tab === 'provider' ? 'Provider Config' : tab}
+                    {tab === 'threads' ? 'Chat / Threads' : tab === 'provider' ? 'Provider Config' : tab === 'workflows' ? 'Visual Studio' : tab}
                   </button>
                 )
               })}
             </div>
           )}
 
-          {/* Top-Right Control (Settings Button) */}
+          {/* Top-Right Control */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
             <span style={{ fontSize: '10.5px', color: '#9CA3AF', fontFamily: 'monospace' }}>
               qwen/qwen3.5-9b
             </span>
             <button
               onClick={() => {
-                if (activeWorkspace) setSettingsModalWs(activeWorkspace)
+                setCurrentNavView('settings')
+                setActiveWsTab('provider')
               }}
               title="Workspace configuration"
               style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: '4px', color: '#6B7280', display: 'flex' }}
@@ -1872,6 +1931,26 @@ export default function AnythingLLMApp({
               isOwnerOrAdmin={currentUser?.role === 'ADMIN'}
               onToast={showToast}
               onBackToChat={() => setCurrentNavView('chat')}
+            />
+          </div>
+        ) : (activeWsTab === 'workflows' || currentNavView === 'workflows') ? (
+          <div
+            style={{
+              flex: 1,
+              display: 'flex',
+              flexDirection: 'column',
+              height: '100%',
+              width: '100%',
+              overflow: 'hidden',
+              minHeight: 0,
+              background: '#f0f0eb',
+              overscrollBehavior: 'none',
+            }}
+          >
+            <WorkflowStudioView
+              workspaceId={activeWorkspace?.id || workspaces[0]?.id || ''}
+              token={token}
+              userRole={currentUser?.role === 'ADMIN' ? 'ADMIN' : (activeWorkspace?.current_user_role || 'EDITOR')}
             />
           </div>
         ) : (
@@ -2044,11 +2123,24 @@ export default function AnythingLLMApp({
                               <span style={{ fontSize: '11.5px', fontWeight: 600, color: '#1E3A8A' }}>
                                 {activeWorkspace ? `${activeWorkspace.name} Assistant` : 'Workspace Assistant'}
                               </span>
+                              <ChatRoutingModeBadge
+                                mode={m.routing_mode}
+                                reason={m.routing_reason}
+                                workflowRunId={m.workflow_run_id}
+                                workflowStatus={m.workflow_status}
+                                onOpenCanvas={(runId) => setSelectedExecutionCanvasRunId(runId)}
+                              />
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                               {m.execution_metrics && (
                                 <button
-                                  onClick={() => setSelectedMetrics(m.execution_metrics || null)}
+                                  onClick={() => setSelectedMetricsData({
+                                    metrics: m.execution_metrics!,
+                                    routing_mode: m.routing_mode || (m.execution_metrics as any)?.routing_mode || null,
+                                    routing_reason: m.routing_reason || (m.execution_metrics as any)?.routing_reason || null,
+                                    workflow_run_id: m.workflow_run_id || (m.execution_metrics as any)?.workflow_run_id || null,
+                                    workflow_status: m.workflow_status || (m.execution_metrics as any)?.workflow_status || null,
+                                  })}
                                   title="View query retrieval steps, LLM calls, and token metrics"
                                   style={{
                                     display: 'inline-flex',
@@ -2112,6 +2204,14 @@ export default function AnythingLLMApp({
                               </div>
                             )}
                             {m.coverage && <CoverageNotice coverage={m.coverage} />}
+                            {m.workflow_run_id && (
+                              <WorkflowRunProgressCard
+                                runId={m.workflow_run_id}
+                                token={token}
+                                initialStatus={m.workflow_status}
+                                onOpenCanvas={(runId) => setSelectedExecutionCanvasRunId(runId)}
+                              />
+                            )}
                             {m.artifacts && m.artifacts.length > 0 && (
                               <ArtifactList
                                 artifacts={m.artifacts}
@@ -2138,6 +2238,9 @@ export default function AnythingLLMApp({
                                 focusedCitation={focusedCitationByMsg[m.id]}
                                 onClearFocusedCitation={() =>
                                   setFocusedCitationByMsg((prev) => ({ ...prev, [m.id]: null }))
+                                }
+                                onInspectChunk={(docId, chkId, fn) =>
+                                  setSelectedInspectChunk({ documentId: docId, chunkId: chkId, fileName: fn })
                                 }
                               />
                             )}
@@ -2391,6 +2494,7 @@ export default function AnythingLLMApp({
             </div>
           )}
 
+
           {/* TAB 4: MEMBERS & ROLES */}
           {activeWsTab === 'members' && activeWorkspace && (
             <div style={{ maxWidth: '820px', margin: '0 auto' }}>
@@ -2437,7 +2541,7 @@ export default function AnythingLLMApp({
                   </div>
                 </div>
                 <button
-                  onClick={() => setSettingsModalWs(activeWorkspace)}
+                  onClick={() => setCurrentNavView('settings')}
                   style={{ padding: '6px 12px', borderRadius: '6px', background: '#1E293B', color: '#FFFFFF', border: 'none', fontSize: '11.5px', cursor: 'pointer' }}
                 >
                   Edit Provider Settings
@@ -3393,6 +3497,70 @@ export default function AnythingLLMApp({
                     </button>
                   </div>
                 )}
+
+                {/* Memory & Privacy Controls */}
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '10px 12px',
+                    background: '#FFFFFF',
+                    border: '1px solid #E5E7EB',
+                    borderRadius: '8px',
+                  }}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                    <span style={{ fontSize: '12.5px', fontWeight: 600, color: '#1F2937' }}>
+                      Memory &amp; Privacy Controls
+                    </span>
+                    <span style={{ fontSize: '11px', color: '#6B7280' }}>
+                      Manage personal memories, pause recording, export data, scrub profile attributes, and view audit history.
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowSettingsModal(false)
+                        setShowMemoryPrivacyModal(true)
+                      }}
+                      style={{
+                        padding: '6px 12px',
+                        borderRadius: '6px',
+                        background: '#FFFFFF',
+                        color: '#374151',
+                        border: '1px solid #D1D5DB',
+                        fontSize: '11.5px',
+                        fontWeight: 500,
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      Privacy &amp; Retention
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowSettingsModal(false)
+                        setShowMemoryInspector(true)
+                      }}
+                      style={{
+                        padding: '6px 12px',
+                        borderRadius: '6px',
+                        background: '#111827',
+                        color: '#FFFFFF',
+                        border: '1px solid #111827',
+                        fontSize: '11.5px',
+                        fontWeight: 500,
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      Execution Inspector
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -3543,12 +3711,51 @@ export default function AnythingLLMApp({
           </div>
         </div>
       )}
-      {selectedMetrics && (
+      {selectedMetricsData && (
         <ExecutionMetricsModal
-          metrics={selectedMetrics}
-          onClose={() => setSelectedMetrics(null)}
+          metrics={selectedMetricsData.metrics}
+          routingMode={selectedMetricsData.routing_mode}
+          routingReason={selectedMetricsData.routing_reason}
+          workflowRunId={selectedMetricsData.workflow_run_id}
+          workflowStatus={selectedMetricsData.workflow_status}
+          onOpenCanvas={(runId) => {
+            setSelectedMetricsData(null)
+            setSelectedExecutionCanvasRunId(runId)
+          }}
+          onClose={() => setSelectedMetricsData(null)}
         />
       )}
+      {selectedExecutionCanvasRunId && (
+        <ExecutionCanvasModal
+          runId={selectedExecutionCanvasRunId}
+          token={token}
+          onClose={() => setSelectedExecutionCanvasRunId(null)}
+        />
+      )}
+      {selectedInspectChunk && (
+        <ChunkHistoryModal
+          documentId={selectedInspectChunk.documentId}
+          chunkId={selectedInspectChunk.chunkId}
+          fileName={selectedInspectChunk.fileName}
+          token={token}
+          userRole={currentUser?.role === 'ADMIN' ? 'ADMIN' : 'EDITOR'}
+          onClose={() => setSelectedInspectChunk(null)}
+          onChunkUpdated={() => {
+            showToast('success', 'Chunk updated successfully.')
+          }}
+        />
+      )}
+      <MemoryPrivacyModal
+        isOpen={showMemoryPrivacyModal}
+        onClose={() => setShowMemoryPrivacyModal(false)}
+        token={token}
+        workspaceId={activeWorkspace?.id}
+      />
+      <MemoryExecutionInspector
+        isOpen={showMemoryInspector}
+        onClose={() => setShowMemoryInspector(false)}
+        token={token}
+      />
     </div>
   )
 }

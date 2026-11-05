@@ -11,6 +11,7 @@ interface WorkflowRunProgressCardProps {
   token: string;
   initialStatus?: string | null;
   onWorkflowComplete?: (finalRun: WorkflowRunResponse) => void;
+  onOpenCanvas?: (runId: string) => void;
 }
 
 const TERMINAL_STATUSES: Set<WorkflowStatus> = new Set([
@@ -26,6 +27,7 @@ export function WorkflowRunProgressCard({
   token,
   initialStatus,
   onWorkflowComplete,
+  onOpenCanvas,
 }: WorkflowRunProgressCardProps) {
   const [run, setRun] = useState<WorkflowRunResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -166,9 +168,33 @@ export function WorkflowRunProgressCard({
             {currentStatus}
           </span>
         </div>
-        <span style={{ fontSize: '11px', color: 'var(--color-ink-muted)', fontFamily: 'var(--font-mono)' }}>
-          ID: {runId.slice(0, 8)}…
-        </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {onOpenCanvas && (
+            <button
+              onClick={() => onOpenCanvas(runId)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '4px',
+                padding: '2px 8px',
+                fontSize: '11px',
+                fontWeight: 600,
+                color: '#0284c7',
+                background: '#f0f9ff',
+                border: '1px solid #bae6fd',
+                borderRadius: '4px',
+                cursor: 'pointer',
+              }}
+              title="Open full interactive Execution Canvas with DAG visualization"
+            >
+              <span>📊</span>
+              <span>View Canvas</span>
+            </button>
+          )}
+          <span style={{ fontSize: '11px', color: 'var(--color-ink-muted)', fontFamily: 'var(--font-mono)' }}>
+            ID: {runId.slice(0, 8)}…
+          </span>
+        </div>
       </div>
 
       {error && (

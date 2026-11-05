@@ -162,3 +162,18 @@ class ProviderTestConnectionResponse(BaseModel):
     message: str
     latency_ms: Optional[float] = None
     details: Optional[Dict[str, Any]] = None
+
+
+class WorkspaceApiKeySetRequest(BaseModel):
+    capability: str = Field(default="llm", description="'llm' or 'web'")
+    provider: str = Field(..., description="Provider name (e.g. 'openai', 'deepseek', 'openrouter', 'custom', 'tavily')")
+    api_key: str = Field(..., min_length=1, max_length=512, description="API key to store in server environment")
+    env_var_name: Optional[str] = Field(None, max_length=64, description="Optional custom environment variable name")
+
+
+class WorkspaceApiKeySetResponse(BaseModel):
+    success: bool
+    capability: str
+    provider: str
+    env_var_name: str
+    message: str

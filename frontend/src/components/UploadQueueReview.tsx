@@ -9,7 +9,7 @@
  */
 
 import React, { useState, useRef, useCallback } from 'react'
-import { uploadDocument } from '../api/documents'
+import { uploadDocument, computeFileSHA256, checkDocumentHash } from '../api/documents'
 import {
   QueuedFileItem,
   UploadQueueStatus,
@@ -1246,6 +1246,32 @@ export function useUploadQueue() {
           const itemMeta = metadataMap?.[item.id] || item.metadata
 
           try {
+            // Client-side SHA-256 pre-flight deduplication check
+            try {
+              const fileHash = await computeFileSHA256(item.file)
+              const hashCheck = await checkDocumentHash(fileHash, departmentCode, token, workspaceId)
+              if (hashCheck.exists) {
+                successCount++
+                setQueue((prev) =>
+                  prev.map((q) =>
+                    q.id === item.id
+                      ? {
+                          ...q,
+                          status: 'completed',
+                          chunksCreated: 0,
+                          skipped: true,
+                          errorMessage: `Pre-check: Already indexed in ${hashCheck.scope || 'department'}. Upload bypassed.`,
+                        }
+                      : q
+                  )
+                )
+                continue
+              }
+            } catch (hashErr) {
+              // Non-blocking: If hash pre-check fails (e.g. offline/network), proceed to normal upload
+              console.warn('Hash pre-check failed, continuing with normal upload:', hashErr)
+            }
+
             const resp = await uploadDocument(
               item.file,
               departmentCode,
@@ -1352,6 +1378,30 @@ export function useUploadQueue() {
       )
 
       try {
+        try {
+          const fileHash = await computeFileSHA256(target.file)
+          const hashCheck = await checkDocumentHash(fileHash, departmentCode, token, workspaceId)
+          if (hashCheck.exists) {
+            setQueue((prev) =>
+              prev.map((q) =>
+                q.id === id
+                  ? {
+                      ...q,
+                      status: 'completed',
+                      chunksCreated: 0,
+                      skipped: true,
+                      errorMessage: `Pre-check: Already indexed in ${hashCheck.scope || 'department'}. Upload bypassed.`,
+                    }
+                  : q
+              )
+            )
+            onCompleted?.()
+            return
+          }
+        } catch (hashErr) {
+          console.warn('Hash pre-check failed, continuing with normal upload:', hashErr)
+        }
+
         const resp = await uploadDocument(
           target.file,
           departmentCode,

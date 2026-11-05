@@ -153,8 +153,18 @@ class WorkflowService:
                 )
                 return existing_run, False
 
-        # 2. Create new WorkflowRun
+        # 2. Create new WorkflowRun with immutable runtime snapshot (Phase 5E)
         limits = request.budget_limits or BudgetLimits()
+        from rag_app.orchestration.runtime_snapshot import capture_runtime_snapshot
+        snapshot = await capture_runtime_snapshot(
+            session=self.session,
+            workspace_id=request.workspace_id,
+            workflow_id=None,
+            workflow_version_id=None,
+            steps_spec=None,
+            trigger_payload={"query": request.query},
+        )
+
         new_run = WorkflowRun(
             user_id=user.id,
             workspace_id=request.workspace_id,
@@ -168,6 +178,7 @@ class WorkflowService:
             max_tokens_budget=limits.max_tokens,
             max_provider_calls_budget=limits.max_provider_calls,
             wall_clock_timeout_seconds=limits.wall_clock_timeout_seconds,
+            provider_snapshot=snapshot,
         )
 
         self.session.add(new_run)
@@ -619,45 +630,48 @@ class WorkflowService:
         # Route write-back execution through WorkspaceMCPConnectionService if workspace MCP is available
         writeback_result = None
         if run.workspace_id:
-            from rag_app.db.models import WorkspaceMCPConnection
-            from rag_app.mcp.connection_service import WorkspaceMCPConnectionService
+            try:
+                from rag_app.db.models import WorkspaceMCPConnection
+                from rag_app.mcp.connection_service import WorkspaceMCPConnectionService
 
-            conn_stmt = select(WorkspaceMCPConnection).where(
-                WorkspaceMCPConnection.workspace_id == run.workspace_id,
-                WorkspaceMCPConnection.is_enabled == True,
-            )
-            conns = (await self.session.scalars(conn_stmt)).all()
-            twenty_conn = next(
-                (c for c in conns if "twenty" in c.name.lower() or "crm" in c.name.lower()),
-                conns[0] if conns else None,
-            )
-            if twenty_conn and "create_one_note" in (twenty_conn.enabled_tools or []):
-                mcp_service = WorkspaceMCPConnectionService(self.session)
-                idempotency_key = f"wf-{run.id}-{approval.id}"
-                tool_args = {
-                    "title": f"Workflow Synthesis: {run.initial_query[:50]}",
-                    "bodyV2": {"markdown": stored_draft},
-                    "targetCompanyId": approval.external_record_id,
-                }
-                mcp_res = await mcp_service.invoke_workspace_tool(
-                    user=user,
-                    workspace_id=run.workspace_id,
-                    connection_id=twenty_conn.id,
-                    tool_name="create_one_note",
-                    arguments=tool_args,
-                    idempotency_key=idempotency_key,
-                    approval_ticket_id=approval.id,
-                    run_id=run.id,
+                conn_stmt = select(WorkspaceMCPConnection).where(
+                    WorkspaceMCPConnection.workspace_id == run.workspace_id,
+                    WorkspaceMCPConnection.is_enabled == True,
                 )
-                writeback_result = {
-                    "status": "COMPLETED",
-                    "idempotency_key": idempotency_key,
-                    "crm_note_id": (mcp_res.structured_content or {}).get("id") or "mcp-note-created",
-                    "note_title": tool_args["title"],
-                    "is_duplicate_replay": (mcp_res.structured_content or {}).get("is_replay", False),
-                    "approval_id": str(approval.id),
-                    "mcp_operation_id": (mcp_res.structured_content or {}).get("operation_id"),
-                }
+                conns = (await self.session.scalars(conn_stmt)).all()
+                twenty_conn = next(
+                    (c for c in conns if "twenty" in c.name.lower() or "crm" in c.name.lower()),
+                    conns[0] if conns else None,
+                )
+                if twenty_conn and "create_one_note" in (twenty_conn.enabled_tools or []):
+                    mcp_service = WorkspaceMCPConnectionService(self.session)
+                    idempotency_key = f"wf-{run.id}-{approval.id}"
+                    tool_args = {
+                        "title": f"Workflow Synthesis: {run.initial_query[:50]}",
+                        "bodyV2": {"markdown": stored_draft},
+                        "targetCompanyId": approval.external_record_id,
+                    }
+                    mcp_res = await mcp_service.invoke_workspace_tool(
+                        user=user,
+                        workspace_id=run.workspace_id,
+                        connection_id=twenty_conn.id,
+                        tool_name="create_one_note",
+                        arguments=tool_args,
+                        idempotency_key=idempotency_key,
+                        approval_ticket_id=approval.id,
+                        run_id=run.id,
+                    )
+                    writeback_result = {
+                        "status": "COMPLETED",
+                        "idempotency_key": idempotency_key,
+                        "crm_note_id": (mcp_res.structured_content or {}).get("id") or "mcp-note-created",
+                        "note_title": tool_args["title"],
+                        "is_duplicate_replay": (mcp_res.structured_content or {}).get("is_replay", False),
+                        "approval_id": str(approval.id),
+                        "mcp_operation_id": (mcp_res.structured_content or {}).get("operation_id"),
+                    }
+            except Exception as e:
+                logger.warning(f"Workspace MCP connection check failed, falling back to CRM sync service: {e}")
 
         # Fallback to legacy CRMSyncService if workspace MCP connection not configured
         if writeback_result is None:

@@ -285,47 +285,28 @@ class IngestionService:
                 )
 
         # ======================================================
-        # 9. BATCH EMBEDDING
+        # 9. RESILIENT BATCH EMBEDDING WITH TOXIC CHUNK RECOVERY
         # ======================================================
 
         embedding_ms = 0.0
+        failed_chunks_list = []
         if texts_to_embed:
             t0 = time.perf_counter()
+            from rag_app.ingestion.resilient_embedder import resilient_batch_embed
 
-            batch_size = 100
+            resilient_result = await resilient_batch_embed(
+                texts=texts_to_embed,
+                embed_fn=self.embedding_provider.embed_texts,
+            )
 
-            new_embeddings = []
-
-            for start in range(
-                0,
-                len(texts_to_embed),
-                batch_size,
-            ):
-
-                batch = texts_to_embed[
-                    start:start + batch_size
-                ]
-
-                batch_embeddings = (
-                    await self.embedding_provider.embed_texts(
-                        batch
-                    )
-                )
-
-                new_embeddings.extend(
-                    batch_embeddings
-                )
-
-            for index, embedding in zip(
+            for orig_idx, emb in zip(
                 indices_to_embed,
-                new_embeddings,
+                resilient_result.embeddings,
                 strict=True,
             ):
+                final_embeddings[orig_idx] = emb
 
-                final_embeddings[index] = (
-                    embedding
-                )
-            
+            failed_chunks_list = resilient_result.failed_chunks
             embedding_ms = round((time.perf_counter() - t0) * 1000, 2)
 
         # ======================================================
@@ -349,6 +330,17 @@ class IngestionService:
         await self.session.flush()
 
         # ======================================================
+        # 10B. STRUCTURED DATA PARQUET CONVERSION (DUCKDB)
+        # ======================================================
+        if path.suffix.lower() == ".csv":
+            try:
+                from rag_app.analytics.duckdb_service import DuckDBAnalyticsService
+                analytics_svc = DuckDBAnalyticsService()
+                await asyncio.to_thread(analytics_svc.convert_csv_to_parquet, path, document.id)
+            except Exception as parquet_err:
+                logger.warning(f"Failed to generate companion Parquet dataset for {path.name}: {parquet_err}")
+
+        # ======================================================
         # 11. BULK CHUNK INSERT
         # ======================================================
 
@@ -362,9 +354,15 @@ class IngestionService:
         ):
 
             if embedding is None:
-                raise RuntimeError(
-                    "Missing embedding for chunk"
+                logger.warning(
+                    "isolated_toxic_chunk_dropped",
+                    extra={
+                        "event": "isolated_toxic_chunk_dropped",
+                        "file_name": path.name,
+                        "chunk_index": chunk.chunk_index,
+                    },
                 )
+                continue
 
             metadata = dict(
                 chunk.metadata
@@ -491,11 +489,23 @@ class IngestionService:
         bm25 = GlobalBM25Index.get_instance()
         await bm25.build(self.session)
 
+        toxic_serialized = [
+            {
+                "chunk_index": fc.chunk_index,
+                "text_preview": fc.text_preview,
+                "classification": fc.error_classification,
+                "error": fc.error_message,
+            }
+            for fc in failed_chunks_list
+        ]
+
         return IngestResponse(
             file_name=path.name,
             skipped=False,
             document_id=str(document.id),
-            chunks_created=len(chunks),
+            chunks_created=len(chunk_data),
+            failed_chunks=len(failed_chunks_list),
+            toxic_chunks_isolated=toxic_serialized if toxic_serialized else None,
         )
 
     async def ingest_files(

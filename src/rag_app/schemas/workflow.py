@@ -44,6 +44,8 @@ class TaskType(str, Enum):
     GROUNDING = "GROUNDING"
     SYNTHESIS = "SYNTHESIS"
     EXECUTION = "EXECUTION"
+    IF_ELSE = "IF_ELSE"
+    APPROVAL_GATE = "APPROVAL_GATE"
 
 
 def compute_canonical_request_hash(
@@ -144,6 +146,8 @@ class WorkflowRunResponse(BaseModel):
     workspace_id: Optional[UUID] = None
     department_id: Optional[UUID] = None
     conversation_id: Optional[UUID] = None
+    workflow_id: Optional[UUID] = None
+    workflow_version_id: Optional[UUID] = None
     scope_type: ScopeType
     thread_id: Optional[str] = None
     status: WorkflowStatus
@@ -173,6 +177,13 @@ class WorkflowRunResponse(BaseModel):
     approval_id: Optional[UUID] = None
     intended_action: Optional[str] = None
     target_record_id: Optional[str] = None
+    approval_status: Optional[str] = None
+    approval_expires_at: Optional[datetime] = None
+    approval_requested_by: Optional[UUID] = None
+    target_object: Optional[str] = None
+    is_test: bool = Field(default=False, description="Whether this execution was run in TEST mode")
+    execution_mode: str = Field(default="PRODUCTION", description="'TEST' or 'PRODUCTION'")
+    provider_snapshot: Optional[dict[str, Any]] = Field(default=None, description="Immutable runtime configuration snapshot captured at run initialization")
 
 
 class WorkflowApprovalRequest(BaseModel):
@@ -212,6 +223,10 @@ class ExecutionTask(BaseModel):
     estimated_provider_calls: int = Field(default=1, ge=0, le=50, description="Estimated external provider calls")
     timeout_seconds: int = Field(default=60, ge=1, le=1800, description="Task execution timeout in seconds")
     is_read_only: bool = Field(default=True, description="Whether the task has no external side effects and can be safely parallelized")
+    capability_id: Optional[str] = Field(default=None, description="Resolved capability identifier in CapabilityRegistry")
+    expected_output_schema: dict[str, Any] = Field(default_factory=dict, description="Expected schema descriptor for task output")
+    side_effect_level: str = Field(default="READ_ONLY", description="Side effect level (READ_ONLY, EXTERNAL_READ, DRAFT, WRITE, HIGH_IMPACT)")
+    required_permissions: list[str] = Field(default_factory=list, description="Permissions required to execute this task")
 
 
 class AdaptiveTaskPlan(BaseModel):

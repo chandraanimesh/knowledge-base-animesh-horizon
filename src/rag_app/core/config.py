@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Any
 
 from pydantic import Field, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -56,7 +57,12 @@ class Settings(BaseSettings):
     web_research_target_pages: int = 2
     web_research_max_scrapes: int = 4
     web_research_max_candidates_per_domain: int = 1
-    enable_conversational_memory_extraction: bool = False
+    enable_conversational_memory_extraction: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("enable_conversational_memory_extraction", "ENABLE_CONVERSATIONAL_MEMORY_EXTRACTION"),
+    )
+    dreaming_consolidation_threshold: int = 5
+    enable_self_registration: bool = True
     unsafe_bypass_security_preprocessing: bool = False
     stirling_pdf_url: str | None = None
     stirling_api_key: str | None = None
@@ -88,6 +94,18 @@ class Settings(BaseSettings):
     twenty_crm_department_id: str | None = None
     twenty_webhook_secret: str | None = None
     twenty_webhook_max_bytes: int = 1024 * 1024  # 1 MB safe default
+    twenty_webhook_mappings: str | dict[str, Any] | None = None
+
+    def get_twenty_webhook_mappings(self) -> dict[str, Any]:
+        if not self.twenty_webhook_mappings:
+            return {}
+        if isinstance(self.twenty_webhook_mappings, dict):
+            return self.twenty_webhook_mappings
+        try:
+            import json
+            return json.loads(str(self.twenty_webhook_mappings).strip())
+        except Exception:
+            return {}
 
     # Multi-format artifact storage and retention settings
     artifact_storage_dir: str = "storage/artifacts"
@@ -101,6 +119,27 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("app_encryption_key", "APP_ENCRYPTION_KEY"),
         description="Dedicated Fernet key or comma-separated keys for MultiFernet rotation. Never derived from JWT_SECRET.",
     )
+
+    # Durable background scheduler interval in seconds (default: 60s for minute-level cron responsiveness)
+    scheduler_interval_seconds: int = Field(
+        default=60,
+        ge=5,
+        le=3600,
+        validation_alias=AliasChoices("scheduler_interval_seconds", "SCHEDULER_INTERVAL_SECONDS"),
+        description="Background reconciliation and workflow trigger scheduler loop interval in seconds.",
+    )
+
+    # Adaptive Agent Runtime Settings (Milestone 10)
+    adaptive_max_planner_calls: int = 3
+    adaptive_max_plan_iterations: int = 3
+    adaptive_max_tasks: int = 15
+    adaptive_max_parallel_tasks: int = 5
+    adaptive_max_execution_time_seconds: int = 180
+    adaptive_max_tool_calls: int = 20
+    adaptive_max_tokens: int = 25000
+    adaptive_max_retries: int = 3
+    adaptive_artifact_char_threshold: int = 4000
+    adaptive_artifact_token_threshold: int = 1000
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -118,6 +157,9 @@ class _LazySettings:
 
     def __getattr__(self, name: str):
         return getattr(get_settings(), name)
+
+    def __setattr__(self, name: str, value: Any):
+        setattr(get_settings(), name, value)
 
 
 settings = _LazySettings()

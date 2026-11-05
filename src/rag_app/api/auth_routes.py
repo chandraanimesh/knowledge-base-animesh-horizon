@@ -28,6 +28,18 @@ async def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
+    reg_status = getattr(user, "registration_status", "APPROVED")
+    if reg_status == "PENDING":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your registration is pending administrator approval.",
+        )
+    if reg_status == "REJECTED":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your registration request has been declined.",
+        )
+
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -36,6 +48,66 @@ async def login(
         
     access_token = create_access_token(subject=str(user.id))
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+from pydantic import BaseModel, EmailStr, Field
+from rag_app.core.config import get_settings
+from rag_app.security.authentication import get_password_hash
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    requested_department: str | None = None
+    reason: str | None = None
+
+
+@router.post("/auth/register", status_code=status.HTTP_201_CREATED)
+async def register(
+    payload: RegisterRequest,
+    session: DbSession,
+):
+    """
+    Self-registration endpoint. Creates an inactive user with status='PENDING'.
+    Does not issue JWT tokens until approved by an administrator.
+    """
+    settings = get_settings()
+    if not getattr(settings, "enable_self_registration", True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Self-registration is disabled by system policy.",
+        )
+
+    email_clean = payload.email.lower().strip()
+    existing = await session.scalar(select(User).where(User.email == email_clean))
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An account with this email already exists.",
+        )
+
+    hashed_pw = get_password_hash(payload.password)
+    user = User(
+        email=email_clean,
+        hashed_password=hashed_pw,
+        role="USER",
+        is_active=False,
+        registration_status="PENDING",
+        profile_json={
+            "requested_department": payload.requested_department,
+            "registration_reason": payload.reason,
+        },
+    )
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+
+    return {
+        "status": "PENDING_APPROVAL",
+        "message": "Your registration request has been submitted and is pending administrator approval.",
+        "user_id": str(user.id),
+        "email": user.email,
+    }
 
 from rag_app.api.dependencies.auth import get_current_user
 from rag_app.schemas.users import UserResponse

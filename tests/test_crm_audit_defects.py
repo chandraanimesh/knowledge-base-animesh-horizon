@@ -424,3 +424,155 @@ async def test_remediation_webhook_http_missing_signature_rejected():
     finally:
         settings.twenty_webhook_secret = orig_secret
 
+
+@pytest.mark.asyncio
+async def test_remediation_webhook_expired_timestamp_rejected():
+    """SEC-06: Webhook rejects timestamp older than 300s with 401 Unauthorized."""
+    from rag_app.core.config import settings
+
+    orig_secret = settings.twenty_webhook_secret
+    try:
+        secret = "test-freshness-secret-key"
+        settings.twenty_webhook_secret = secret
+
+        # Timestamp 600s in the past
+        old_ts = str(int((datetime.now(timezone.utc) - timedelta(seconds=600)).timestamp() * 1000))
+        payload = {"event": "company.updated", "record": {"id": "c-test-01"}}
+        raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        sig = hmac.new(secret.encode("utf-8"), f"{old_ts}:{raw_body.decode('utf-8')}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                "/crm/webhooks/twenty",
+                content=raw_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Twenty-Webhook-Timestamp": old_ts,
+                    "X-Twenty-Webhook-Signature": sig,
+                    "X-Twenty-Webhook-Nonce": "test-nonce-expired",
+                },
+            )
+            assert resp.status_code == 401
+            assert "expired" in resp.json()["detail"].lower()
+    finally:
+        settings.twenty_webhook_secret = orig_secret
+
+
+@pytest.mark.asyncio
+async def test_remediation_webhook_future_timestamp_rejected():
+    """SEC-06: Webhook rejects timestamp significantly in the future (>60s) with 401."""
+    from rag_app.core.config import settings
+
+    orig_secret = settings.twenty_webhook_secret
+    try:
+        secret = "test-future-secret-key"
+        settings.twenty_webhook_secret = secret
+
+        # Timestamp 10 minutes in the future
+        future_ts = str(int((datetime.now(timezone.utc) + timedelta(seconds=600)).timestamp() * 1000))
+        payload = {"event": "company.updated", "record": {"id": "c-test-02"}}
+        raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        sig = hmac.new(secret.encode("utf-8"), f"{future_ts}:{raw_body.decode('utf-8')}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                "/crm/webhooks/twenty",
+                content=raw_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Twenty-Webhook-Timestamp": future_ts,
+                    "X-Twenty-Webhook-Signature": sig,
+                    "X-Twenty-Webhook-Nonce": "test-nonce-future",
+                },
+            )
+            assert resp.status_code == 401
+            assert "in the future" in resp.json()["detail"].lower()
+    finally:
+        settings.twenty_webhook_secret = orig_secret
+
+
+@pytest.mark.asyncio
+async def test_remediation_webhook_query_param_tampering_rejected(setup_dept_and_users):
+    """SEC-07: Unsigned query parameter tampering does not override server-side mapping."""
+    from rag_app.core.config import settings
+
+    orig_secret = settings.twenty_webhook_secret
+    orig_mappings = settings.twenty_webhook_mappings
+    try:
+        secret = "test-tamper-secret-key"
+        settings.twenty_webhook_secret = secret
+        settings.twenty_webhook_mappings = {
+            "wh-authorized-uuid-001": {"department_id": "AUDIT_DEPT"}
+        }
+
+        fresh_ts = str(int(datetime.now(timezone.utc).timestamp() * 1000))
+        # Payload cryptographically signed with authorized webhookId
+        payload = {
+            "webhookId": "wh-authorized-uuid-001",
+            "eventName": "company.updated",
+            "record": {"id": "c-test-03"},
+        }
+        raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        sig = hmac.new(secret.encode("utf-8"), f"{fresh_ts}:{raw_body.decode('utf-8')}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # Attacker attempts to redirect ingestion to a different department via unsigned query param
+            resp = await client.post(
+                "/crm/webhooks/twenty?department_id=SOME_UNAUTHORIZED_DEPT",
+                content=raw_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Twenty-Webhook-Timestamp": fresh_ts,
+                    "X-Twenty-Webhook-Signature": sig,
+                    "X-Twenty-Webhook-Nonce": "test-nonce-tamper-01",
+                },
+            )
+            assert resp.status_code == 401
+            assert "does not match server-side authorization mapping" in resp.json()["detail"]
+    finally:
+        settings.twenty_webhook_secret = orig_secret
+        settings.twenty_webhook_mappings = orig_mappings
+
+
+@pytest.mark.asyncio
+async def test_remediation_webhook_unknown_identity_rejected():
+    """SEC-08: Unknown/unregistered webhookId in signed payload fails closed."""
+    from rag_app.core.config import settings
+
+    orig_secret = settings.twenty_webhook_secret
+    orig_mappings = settings.twenty_webhook_mappings
+    try:
+        secret = "test-unknown-id-secret"
+        settings.twenty_webhook_secret = secret
+        settings.twenty_webhook_mappings = {
+            "wh-known-uuid": {"department_id": "AUDIT_DEPT"}
+        }
+
+        fresh_ts = str(int(datetime.now(timezone.utc).timestamp() * 1000))
+        # Valid signature, but webhookId is NOT registered in server-side mappings
+        payload = {
+            "webhookId": "wh-malicious-or-unregistered-id",
+            "eventName": "company.updated",
+            "record": {"id": "c-test-04"},
+        }
+        raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        sig = hmac.new(secret.encode("utf-8"), f"{fresh_ts}:{raw_body.decode('utf-8')}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                "/crm/webhooks/twenty",
+                content=raw_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Twenty-Webhook-Timestamp": fresh_ts,
+                    "X-Twenty-Webhook-Signature": sig,
+                    "X-Twenty-Webhook-Nonce": "test-nonce-unknown-01",
+                },
+            )
+            assert resp.status_code == 401
+            assert "unauthorized or unregistered webhook identity" in resp.json()["detail"].lower()
+    finally:
+        settings.twenty_webhook_secret = orig_secret
+        settings.twenty_webhook_mappings = orig_mappings
+
+

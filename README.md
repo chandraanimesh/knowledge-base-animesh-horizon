@@ -1,59 +1,170 @@
 # Enterprise Adaptive RAG, Agentic Orchestration & Research Platform
 
-A production-grade, extensible **Retrieval-Augmented Generation (RAG) and Agentic Workflow Platform**. It integrates **Hybrid Multi-Strategy Retrieval (Dense Vector + BM25 + RRF + Cross-Encoder)**, **Hierarchical Section-Aware Context Compilation (OpenViking)**, **Adaptive DAG-Based Task Orchestration**, **Human-in-the-Loop Cryptographic Approval Gates**, **Model Context Protocol (MCP) Hub & Spoke Architecture**, **Live CRM Write-Back & Two-Step Write Recovery**, **Deep Web Research (TinyFish)**, and **Multi-Format Artifact Generation (PDF, DOCX, CSV, JSON)**.
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Python](https://img.shields.io/badge/Python-3.12+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![React](https://img.shields.io/badge/React-19.0-61DAFB.svg?logo=react&logoColor=black)](https://react.dev/)
+[![Vite](https://img.shields.io/badge/Vite-8.0-646CFF.svg?logo=vite&logoColor=white)](https://vitejs.dev/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16_with_pgvector-336791.svg?logo=postgresql&logoColor=white)](https://github.com/pgvector/pgvector)
+[![MCP](https://img.shields.io/badge/Model_Context_Protocol-FastMCP_4+-8A2BE2.svg)](https://modelcontextprotocol.io/)
+[![Package Manager](https://img.shields.io/badge/uv-Astral-FF69B4.svg)](https://astral.sh/uv)
+
+An enterprise-grade, extensible **Retrieval-Augmented Generation (RAG) and Multi-Agent Orchestration Platform**. It pairs **Hybrid Multi-Strategy Retrieval** (Dense Vector + BM25 + RRF + Cross-Encoder) and **Hierarchical Section-Aware Context Compilation (OpenViking)** with an **Adaptive DAG Task Orchestrator**, **Human-in-the-Loop Cryptographic Approval Gates**, **Model Context Protocol (MCP) Hub & Spoke Architecture**, **Signed Inbound Webhooks & Event Automation (Twenty CRM & n8n)**, **Deep Web Research (TinyFish & Firecrawl)**, and **Multi-Format Publication-Ready Artifact Generation (PDF, DOCX, CSV, JSON, Markdown)**.
 
 ---
 
-## 1. System Requirements & Tech Stack
+## Table of Contents
 
-### Core System Requirements
-| Component | Supported Version | Notes |
+- [1. System Requirements & Architecture](#1-system-requirements--architecture)
+- [2. 1-Click Docker Compose Deployment (Recommended)](#2-1-click-docker-compose-deployment-recommended)
+- [3. Quickstart on Windows (Local Dev)](#3-quickstart-on-windows-local-dev)
+- [4. Quickstart on macOS (Local Dev)](#4-quickstart-on-macos-local-dev)
+- [5. Complete Environment Configuration (`.env`)](#5-complete-environment-configuration-env)
+- [5. Model Context Protocol (MCP) Guide](#5-model-context-protocol-mcp-guide)
+  - [Connecting Cursor IDE](#1-cursor-ide-setup)
+  - [Connecting ChatGPT](#2-chatgpt-web--desktop-setup)
+  - [Connecting Claude Desktop](#3-claude-desktop-setup)
+  - [Outbound MCP (Twenty CRM)](#4-outbound-mcp-twenty-crm)
+- [6. Inbound Webhooks & n8n / Twenty CRM Automation](#6-inbound-webhooks--n8n--twenty-crm-automation)
+  - [Cryptographic Verification Contract](#webhook-cryptographic-contract)
+  - [Configuring n8n Webhook Workflow](#configuring-n8n-workflow)
+  - [Testing Webhooks Locally via Terminal](#testing-webhooks-locally)
+- [7. Web Search & Deep Research Guide (TinyFish & Firecrawl)](#7-web-search--deep-research-guide)
+- [8. Human-in-the-Loop (HITL) Mutation Approval & Two-Step Write Recovery](#8-human-in-the-loop-hitl-approval--write-recovery)
+- [9. Testing & Quality Verification](#9-testing--quality-verification)
+- [10. Troubleshooting & Common Issues (macOS & Windows)](#10-troubleshooting--common-issues)
+- [11. Repository Structure](#11-repository-structure)
+
+---
+
+## 1. System Requirements & Architecture
+
+### Prerequisites Matrix
+
+| Component | Minimum Version | Recommended Version | Purpose / Notes |
+| :--- | :--- | :--- | :--- |
+| **Operating System** | Windows 10/11 or macOS 13+ (Ventura/Sonoma/Sequoia) | Windows 11 / macOS 14+ | Full cross-platform support (Intel & Apple Silicon M1/M2/M3) |
+| **Python** | `>= 3.11` | `3.12+` | Managed strictly via `uv` for reproducible builds and fast dependency resolution |
+| **Node.js** | `>= 18.x` | `20.x` or `22.x LTS` | Powers React 19, TypeScript, and Vite 8 frontend |
+| **PostgreSQL** | `>= 15.x` | `16.x` | **Mandatory:** `pgvector` extension enabled (`v0.5.0+`) |
+| **Package Managers**| `uv` + `npm` | Latest `uv` + `npm` | `uv` manages Python lockfile (`uv.lock`); `npm` manages frontend |
+| **Docker** *(Optional)* | Docker Desktop | Docker Desktop / Docker Engine | Recommended for running PostgreSQL + `pgvector` with zero local configuration |
+
+### System Architecture Overview
+
+```mermaid
+flowchart TD
+    UserQuery([User Prompt / Workflow Goal]) --> Router{Intent & Task Classifier}
+
+    Router -->|Conversational / Memory| DirectLLM[Direct LLM Handler + Episodic Memory]
+    Router -->|Document / Enterprise RAG| HybridRetrieval[Multi-Strategy Hybrid Retrieval]
+    Router -->|Complex / Multi-Step Goal| AdaptiveDAG[Adaptive DAG Task Planner]
+    Router -->|Inbound Webhook Event| WebhookTrigger[Signed Webhook Receiver]
+
+    subgraph HybridEngine [Hybrid Retrieval Pipeline]
+        HybridRetrieval --> VectorSearch[Dense Vector HNSW pgvector 384-dim]
+        HybridRetrieval --> BM25[BM25 / ts_rank_cd Lexical Search]
+        HybridRetrieval --> HierarchicalTree[OpenViking Tree L0/L1/L2 Summaries]
+    end
+
+    VectorSearch & BM25 & HierarchicalTree --> RRF[Reciprocal Rank Fusion RRF]
+    RRF --> CrossEncoder[CrossEncoder Re-ranker ms-marco-MiniLM]
+    CrossEncoder --> SufficiencyGate{Sufficiency Evaluator}
+
+    SufficiencyGate -->|Sufficient| ContextCompiler[Hierarchical Context Compiler]
+    SufficiencyGate -->|Insufficient / Web Trigger| WebResearch[TinyFish / Firecrawl Deep Web Search]
+    WebResearch --> ContextCompiler
+
+    ContextCompiler --> GroundedGen[Grounded LLM Generation Service]
+    GroundedGen --> ProvenanceEngine[Citation & Grounding Verification]
+
+    subgraph AgentOrchestration [Adaptive DAG Execution Engine]
+        AdaptiveDAG --> DAGValidator[DAG Validator & Budget Guardrails]
+        DAGValidator --> TaskLeasing[Task Fencing & Safe Worker Leasing]
+        TaskLeasing --> ReadTools[Read-Only Knowledge & MCP Query Tools]
+        TaskLeasing --> MutationProposal[HITL Mutation Proposal Tool]
+        MutationProposal --> ApprovalTicket{Single-Use Approval Gate}
+        ApprovalTicket -->|Rejected| Terminate([Aborted / Zero Writes])
+        ApprovalTicket -->|Approved| TwoStepWrite[Two-Step Idempotent Write Recovery]
+        TwoStepWrite --> ExternalSvc[(Twenty CRM / Remote MCP Server)]
+    end
+
+    WebhookTrigger --> AdaptiveDAG
+    GroundedGen & AgentOrchestration --> ArtifactEngine[Multi-Format Artifact Renderer PDF/DOCX/CSV/JSON]
+    ArtifactEngine --> ProtectedStorage[(storage/artifacts Directory)]
+    ProvenanceEngine --> FinalOutput([Verified Interactive Chat & Downloadable Reports])
+```
+
+---
+
+## 2. 1-Click Docker Compose Deployment (Recommended)
+
+The entire platform (PostgreSQL `pgvector`, FastAPI backend, and React 19 / Vite production frontend) can be spun up in a single command with zero manual environment configuration.
+
+### Step 1: Configure Environment Variables
+Copy the `.env.example` file to `.env` and fill in your API keys (e.g. `GROQ_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `TINYFISH_API_KEY`):
+
+```bash
+# Windows PowerShell
+copy .env.example .env
+
+# macOS / Linux
+cp .env.example .env
+```
+
+### Step 2: Build and Start All Services
+```bash
+docker compose up -d --build
+```
+
+### Step 3: Access the Applications
+
+| Component | URL | Notes |
 | :--- | :--- | :--- |
-| **Python** | `>= 3.11` (Recommended `3.12+`) | Managed via `uv` |
-| **Node.js** | `>= 18.x` (Recommended `20.x` / `22.x LTS`) | For React 19 / Vite Frontend |
-| **PostgreSQL** | `>= 15.x` / `16.x` | With `pgvector` extension enabled (`v0.5.0+`) |
-| **Package Managers** | `uv` (Python) & `npm` (Node) | High-speed dependency resolution and lockfile enforcement |
-| **Docker** *(Optional)* | Docker Desktop / Docker Engine | Recommended for running PostgreSQL + `pgvector` seamlessly |
+| **Frontend Web App** | `http://localhost:8443` or `http://localhost:5173` | React 19 + Vite SPA served via Nginx reverse proxy |
+| **Backend REST API** | `http://localhost:8000` | FastAPI ASGI server |
+| **Interactive API Docs**| `http://localhost:8000/docs` | Swagger UI documentation |
+| **PostgreSQL pgvector** | `localhost:5433` | Database: `ragdb`, User: `rag`, Pass: `rag` |
 
-### Key Backend Libraries
-- **API & Core**: `fastapi>=0.115.0`, `uvicorn[standard]>=0.30.0`, `pydantic>=2.7.0`, `pydantic-settings>=2.3.0`
-- **Database & Vectors**: `sqlalchemy[asyncio]>=2.0.30`, `asyncpg>=0.29.0`, `pgvector>=0.3.0`, `alembic>=1.13.0`
-- **Retrieval & Reranking**: `sentence-transformers>=5.6.0`, `rank-bm25>=0.2.2`, `CrossEncoder` (`ms-marco-MiniLM-L-6-v2`)
-- **Document Parsing & OCR**: `docling[rapidocr]>=2.121.0`, `pymupdf>=1.24.0`, `pytesseract>=0.3.13`, `paddleocr>=2.10.0`
-- **Workflow & Orchestration**: `langgraph>=1.2.12`, `langchain-core`, `langchain-groq>=1.1.3`
-- **LLM & Embeddings Providers**: `groq`, `openai>=1.35.0`, `google-generativeai>=0.7.0`
-- **MCP Protocols**: `fastmcp>=4.0.11`, SSE & Streamable-HTTP dual transport
-- **Web Research**: `firecrawl-py>=4.44.0`, TinyFish search and scrape adapters
-- **Security & Auth**: `PyJWT>=2.8.0`, `passlib[bcrypt]>=1.7.4`, `bcrypt==4.0.1`
+Default administrative credentials seeded on first startup:
+* **Email:** `admin@enterprise-rag.internal`
+* **Password:** `AdminSecretPass123!`
 
-### Frontend Stack
-- **Framework**: React 19 (`react`, `react-dom`, `react-router-dom 7`)
-- **Bundler & Styling**: `vite 8`, `tailwindcss 4`
-- **Language**: TypeScript 5.7+
-- **Test Runner**: Node test runner with `--experimental-strip-types`
+To view logs or shut down:
+```bash
+# View live streaming logs across all services
+docker compose logs -f
+
+# Stop all containers
+docker compose down
+```
 
 ---
 
-## 2. OS Setup & Installation Guide
+## 3. Quickstart on Windows (Local Dev)
 
-### Option A: Setup on Windows
+Follow these steps on a clean Windows machine using **PowerShell**:
 
-#### 1. Install Prerequisites on Windows
-Open **PowerShell as Administrator** or run in your terminal:
+### Step 1: Install Required Tools
+Open **PowerShell as Administrator** and install `uv`, `Node.js LTS`, and `Git`:
 
 ```powershell
-# 1. Install uv (Python Package Manager)
+# 1. Install uv (Fast Python Package Manager)
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-# 2. Install Node.js LTS (v20+) and Git (via Windows Package Manager winget)
+# 2. Install Node.js LTS and Git using winget
 winget install OpenJS.NodeJS.LTS
 winget install Git.Git
+
+# 3. (Optional but Recommended) Install Docker Desktop
+winget install Docker.DockerDesktop
 ```
-*Restart your PowerShell session after installation so environment paths update.*
 
-#### 2. Setup PostgreSQL with pgvector on Windows
+> [!NOTE]
+> Close and reopen your PowerShell window after running `winget` so your system `PATH` updates.
 
-**Recommended (via Docker Desktop):**
+### Step 2: Start PostgreSQL with pgvector
+
+**Method 1: Using Docker (Fastest & Recommended)**
 ```powershell
 docker run -d `
   --name rag-postgres `
@@ -64,75 +175,77 @@ docker run -d `
   pgvector/pgvector:pg16
 ```
 
-**Alternative (Native Windows Installer):**
-1. Download and run the PostgreSQL 16 installer from [EnterpriseDB](https://www.enterprisedb.com/downloads/postgres-postgresql-downloads).
-2. Download precompiled `pgvector` binaries for your PostgreSQL version from [pgvector releases](https://github.com/pgvector/pgvector/releases).
-3. Copy `vector.dll` into `C:\Program Files\PostgreSQL\16\lib` and extension files into `C:\Program Files\PostgreSQL\16\share\extension`.
-4. Run in `psql`:
+**Method 2: Using Native Windows PostgreSQL**
+1. Install PostgreSQL 16 from [EnterpriseDB](https://www.enterprisedb.com/downloads/postgres-postgresql-downloads).
+2. Download precompiled `pgvector` binaries for PostgreSQL 16 from [pgvector releases](https://github.com/pgvector/pgvector/releases).
+3. Copy `vector.dll` into `C:\Program Files\PostgreSQL\16\lib` and extension control/sql files into `C:\Program Files\PostgreSQL\16\share\extension`.
+4. Open `psql` and execute:
    ```sql
    CREATE DATABASE ragdb;
    \c ragdb
    CREATE EXTENSION IF NOT EXISTS vector;
    ```
 
-#### 3. Setup Project & Environment
+### Step 3: Clone Project & Set Up Backend
+
 ```powershell
-# Clone the repository
+# 1. Clone repository and navigate to root
 git clone <repo-url>
 cd ragdemo1
 
-# Create .env from template
+# 2. Copy the environment template
 copy .env.example .env
 
-# Install backend dependencies via uv
+# 3. Synchronize Python virtual environment and dependencies via uv
 uv sync
 
-# Run database migrations
+# 4. Run database migrations
 uv run alembic upgrade head
+
+# 5. Seed default administrator and canonical departments
+uv run python scripts/seed_admin.py
 ```
 
-#### 4. Run Backend & Frontend on Windows
-- **Start Backend**:
-  ```powershell
-  uv run uvicorn rag_app.main:app --reload --port 8000
-  ```
-- **Start Frontend** (in a separate terminal):
-  ```powershell
-  cd frontend
-  npm install
-  npm run dev
-  ```
-  *Frontend runs at `http://localhost:8443` (or `http://localhost:5173`).*
+### Step 4: Start Backend Server
+```powershell
+uv run uvicorn rag_app.main:app --reload --port 8000
+```
+*Backend API and Swagger Documentation will be live at `http://localhost:8000/docs`.*
+
+### Step 5: Start Frontend Application
+Open a **new PowerShell terminal window**:
+
+```powershell
+cd ragdemo1\frontend
+
+# Install frontend dependencies
+npm install
+
+# Start Vite development server
+npm run dev
+```
+*The frontend is accessible at `http://localhost:8443`.*
 
 ---
 
-### Option B: Setup on macOS
+## 4. Quickstart on macOS (Local Dev)
 
-#### 1. Install Prerequisites on macOS
-Open your terminal:
+Follow these steps on macOS (compatible with both **Apple Silicon M1/M2/M3/M4** and **Intel** Macs):
+
+### Step 1: Install Required Tools
+Open **Terminal** and install `Homebrew`, `uv`, `Node.js`, and `Git`:
 
 ```bash
 # 1. Install Homebrew (if not already installed)
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-# 2. Install uv, Node.js, and Git
+# 2. Install uv, Node.js LTS, and Git
 brew install uv node git
 ```
 
-#### 2. Setup PostgreSQL with pgvector on macOS
+### Step 2: Start PostgreSQL with pgvector
 
-**Method 1 (Native Homebrew):**
-```bash
-# Install PostgreSQL 16 and pgvector
-brew install postgresql@16 pgvector
-brew services start postgresql@16
-
-# Create database and enable pgvector
-createdb ragdb
-psql -d ragdb -c "CREATE EXTENSION IF NOT EXISTS vector;"
-```
-
-**Method 2 (via Docker):**
+**Method 1: Using Docker Desktop (Recommended)**
 ```bash
 docker run -d \
   --name rag-postgres \
@@ -143,72 +256,164 @@ docker run -d \
   pgvector/pgvector:pg16
 ```
 
-#### 3. Setup Project & Environment
+**Method 2: Using Native Homebrew**
 ```bash
-# Clone the repository
+brew install postgresql@16 pgvector
+brew services start postgresql@16
+
+# Create database and activate pgvector extension
+createdb ragdb
+psql -d ragdb -c "CREATE EXTENSION IF NOT EXISTS vector;"
+```
+
+### Step 3: Clone Project & Set Up Backend
+
+```bash
+# 1. Clone repository and navigate to root
 git clone <repo-url>
 cd ragdemo1
 
-# Create .env file
+# 2. Create local .env from template
 cp .env.example .env
 
-# Install backend dependencies via uv
+# 3. Install virtualenv & all dependencies with uv
 uv sync
 
-# Run database migrations
+# 4. Run database migrations
 uv run alembic upgrade head
+
+# 5. Seed default administrator and canonical departments
+uv run python scripts/seed_admin.py
 ```
 
-#### 4. Run Backend & Frontend on macOS
-- **Start Backend**:
-  ```bash
-  uv run uvicorn rag_app.main:app --reload --port 8000
-  ```
-- **Start Frontend** (in a separate terminal):
-  ```bash
-  cd frontend
-  npm install
-  npm run dev
-  ```
+### Step 4: Start Backend Server
+```bash
+uv run uvicorn rag_app.main:app --reload --port 8000
+```
+
+### Step 5: Start Frontend Application
+Open a **new Terminal window**:
+
+```bash
+cd ragdemo1/frontend
+
+# Install frontend packages
+npm install
+
+# Start Vite development server
+npm run dev
+```
+*Access the React application at `http://localhost:8443`.*
 
 ---
 
-## 3. Environment Configuration (`.env`)
+## 4. Complete Environment Configuration (`.env`)
 
-Create `.env` in the root folder with the following configuration:
+Configure your `.env` file based on your requirements. Below is the full annotated configuration:
 
 ```ini
-# Core Application Configuration
+# ==============================================================================
+# 1. CORE APPLICATION & DATABASE SETTINGS
+# ==============================================================================
 APP_NAME=production-rag-backend
 ENV=dev
 LOG_LEVEL=INFO
 
-# Database Configuration (PostgreSQL with pgvector)
+# PostgreSQL connection string with asyncpg driver and pgvector enabled
 DATABASE_URL=postgresql+asyncpg://rag:rag@localhost:5432/ragdb
 
-# Embedding Provider Configuration
-# Supported: sentence_transformers | openai | fake
+# ==============================================================================
+# 2. EMBEDDING PROVIDER CONFIGURATION
+# ==============================================================================
+# Options: 'sentence_transformers' (Local/Free) | 'openai' | 'fake'
 EMBEDDING_PROVIDER=sentence_transformers
 EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 EMBEDDING_DIM=384
 
-# LLM Provider Configuration
-# Supported: groq | openai | gemini | fake
+# ==============================================================================
+# 3. LLM INFERENCE PROVIDERS
+# ==============================================================================
+# Options: 'groq' (Recommended for fast inference) | 'openai' | 'gemini' | 'fake'
 LLM_PROVIDER=groq
-GROQ_API_KEY=gsk_your_groq_api_key_here
-GROQ_MODEL=qwen/qwen3.8-27b
-OPENAI_API_KEY=
-GOOGLE_API_KEY=
 
-# Web Research & External Data Fetching (TinyFish / Firecrawl)
+# Groq Configuration (Free high-speed API keys at console.groq.com)
+GROQ_API_KEY=gsk_your_groq_api_key_here
+GROQ_MODEL=openai/gpt-oss-20b
+
+# OpenAI Configuration (Optional)
+OPENAI_API_KEY=
+OPENAI_CHAT_MODEL=gpt-4o-mini
+
+# Google Gemini Configuration (Optional)
+GOOGLE_API_KEY=
+GEMINI_MODEL=gemini-1.5-flash
+
+# ==============================================================================
+# 4. WEB SEARCH & DEEP RESEARCH (TinyFish & Firecrawl)
+# ==============================================================================
 ENABLE_WEB_RESEARCH=true
+
+# Choose provider: 'tinyfish' | 'firecrawl' | 'fake'
 WEB_SEARCH_PROVIDER=tinyfish
+
+# TinyFish Search & Fetch APIs
 TINYFISH_API_KEY=your_tinyfish_api_key_here
 TINYFISH_SEARCH_URL=https://api.search.tinyfish.ai
 TINYFISH_FETCH_URL=https://api.fetch.tinyfish.ai
 
-# Retrieval & Hybrid Ranking Hyperparameters
+# Firecrawl Configuration (Alternative)
+FIRECRAWL_API_KEY=
+FIRECRAWL_BASE_URL=https://api.firecrawl.dev
+
+# Web Research Guardrails & Budget Bounds
+WEB_RESEARCH_TARGET_PAGES=2
+WEB_RESEARCH_MAX_SCRAPES=4
+WEB_RESEARCH_MAX_CANDIDATES_PER_DOMAIN=1
+
+# ==============================================================================
+# 5. SECURITY, ENCRYPTION & AUTHENTICATION
+# ==============================================================================
+# Mandatory 32+ char secret for HS256 JWT access tokens
+JWT_SECRET_KEY=super_secure_jwt_secret_key_change_in_production_min_32_chars
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60
+
+# Dedicated Fernet key for workspace credential encryption (MultiFernet rotation support)
+APP_ENCRYPTION_KEY=
+
+# Default Seed Administrator Account
+ADMIN_EMAIL=admin@local.dev
+ADMIN_PASSWORD=Admin@12345
+
+# ==============================================================================
+# 6. SIGNED INBOUND WEBHOOKS & EVENT AUTOMATION (Twenty CRM & n8n)
+# ==============================================================================
+# Shared secret for HMAC-SHA256 signature verification on inbound webhooks
+TWENTY_WEBHOOK_SECRET=your_webhook_hmac_secret_key_here
+TWENTY_WEBHOOK_MAX_BYTES=1048576
+
+# Server-side mapping of Webhook IDs to internal workspace/department codes
+TWENTY_WEBHOOK_MAPPINGS={"default-webhook-id":{"department_id":"SALES"}}
+
+# Background Scheduler Loop Interval (in seconds)
+SCHEDULER_INTERVAL_SECONDS=60
+
+# ==============================================================================
+# 7. OUTBOUND MCP & TWENTY CRM INTEGRATION
+# ==============================================================================
+ENABLE_CRM_INTEGRATION=true
+TWENTY_BASE_URL=http://localhost:3000
+TWENTY_API_KEY=
+TWENTY_MCP_ENABLED=false
+TWENTY_MCP_URL=http://localhost:3000/mcp
+
+# ==============================================================================
+# 8. RAG HYPERPARAMETERS & ARTIFACT ENGINE
+# ==============================================================================
+CHUNK_SIZE=900
+CHUNK_OVERLAP=150
 DEFAULT_TOP_K=5
+MAX_CHUNKS_PER_DOCUMENT=4
 MIN_VECTOR_SIMILARITY=0.25
 RETRIEVAL_CANDIDATE_K=20
 RRF_K=60
@@ -218,215 +423,346 @@ STRUCTURED_SEARCH_WEIGHT=2.0
 HIERARCHICAL_SEARCH_WEIGHT=0.8
 HIERARCHICAL_MAX_DESCENDANT_DEPTH=3
 
-# Hierarchical Context Bounds (OpenViking L0/L1)
 NODE_L0_MAX_CHARS=300
 NODE_L1_MAX_CHARS=600
-CHUNK_SIZE=900
-CHUNK_OVERLAP=150
 
-# Security & JWT Authentication
-JWT_SECRET_KEY=super_secure_jwt_secret_key_change_in_production
-JWT_ALGORITHM=HS256
-JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60
-
-# Default Seed Administrator
-ADMIN_EMAIL=admin@local.dev
-ADMIN_PASSWORD=Admin@12345
-
-# Twenty CRM Integration (Optional Local Service)
-TWENTY_BASE_URL=http://localhost:3000
-TWENTY_API_KEY=
-ENABLE_CRM_INTEGRATION=true
+ARTIFACT_STORAGE_DIR=storage/artifacts
+ARTIFACT_RETENTION_HOURS=48
+ARTIFACT_MAX_BYTES=26214400
+ARTIFACT_MAX_ROWS=500
 ```
 
 ---
 
-## 4. Current Architecture & Key Subsystems
+## 5. Model Context Protocol (MCP) Guide
 
-```mermaid
-flowchart TD
-    UserQuery([User Query / Workflow Goal]) --> Router{Intent & Task Router}
-    
-    Router -->|Conversational / Greeting| DirectLLM[Direct Conversational Handler]
-    Router -->|Document / Factual RAG| MultiRetrieval[Multi-Strategy Hybrid Retrieval]
-    Router -->|Multi-Step Deep Research| AdaptiveDAG[Adaptive DAG Task Planner]
-    
-    subgraph MultiRetrievalEngine [Hybrid Retrieval Pipeline]
-        MultiRetrieval --> VectorSearch[Dense Vector HNSW pgvector]
-        MultiRetrieval --> BM25[BM25 / Full-Text Search ts_rank_cd]
-        MultiRetrieval --> GraphTriples[Graph Entity Triples 1-Hop / 2-Hop]
-        MultiRetrieval --> HierarchicalTree[Hierarchical Node Tree L0 / L1 / L2]
-    end
-    
-    VectorSearch & BM25 & GraphTriples & HierarchicalTree --> RRF[Reciprocal Rank Fusion RRF]
-    RRF --> CrossEncoder[CrossEncoder Re-ranker ms-marco]
-    CrossEncoder --> ACLFilter[Department & Workspace ACL Gate]
-    
-    ACLFilter --> SufficiencyCheck{Sufficiency Gate}
-    SufficiencyCheck -->|Sufficient| ContextCompiler[Hierarchical Context Compiler]
-    SufficiencyCheck -->|Insufficient / Web Trigger| WebResearch[TinyFish Deep Web Research]
-    WebResearch --> ContextCompiler
-    
-    ContextCompiler --> GroundedGen[Grounded LLM Generation Service]
-    GroundedGen --> ProvenanceEngine[Citation & Span Verification Engine]
-    
-    subgraph OrchestrationEngine [Adaptive Workflow & Mutation Engine]
-        AdaptiveDAG --> DAGValidator[DAG Validator & Budget Enforcer]
-        DAGValidator --> Executor[DAG Parallel / Sequential Execution Engine]
-        Executor --> ReadMCP[Read-only MCP Tool Binding]
-        Executor --> ProposalTool[Mutation Proposal Tool]
-        ProposalTool --> ApprovalGate{Human-in-the-Loop Approval Ticket}
-        ApprovalGate -->|Rejected| Terminate([Workflow Terminated / 0 Writes])
-        ApprovalGate -->|Approved| WriteRecovery[Two-Step Idempotent Write-Back]
-        WriteRecovery --> TwentyCRM[(Twenty CRM / External MCP Server)]
-    end
-    
-    GroundedGen & Executor --> ArtifactGenerator[Multi-Format Artifact Renderer PDF/DOCX/CSV]
-    ArtifactGenerator --> ProtectedStorage[(storage/artifacts Directory)]
-    
-    ProvenanceEngine --> FinalAnswer([Verified Answer + Interactive Citations])
+The platform functions as both an **Inbound MCP Server** (exposing authoritative enterprise tools to AI IDEs and clients) and an **Outbound MCP Client** (connecting to external business tools like Twenty CRM).
+
+### MCP Server Endpoints
+- **Streamable-HTTP Transport**: `http://localhost:8000/mcp`
+- **Server-Sent Events (SSE) Transport**: `http://localhost:8000/mcp/sse`
+
+### Generating an MCP Authentication Token
+To connect authenticated external clients, generate a 30-day JWT token:
+```bash
+uv run python scripts/generate_mcp_token.py
 ```
-
-### Detailed Subsystems
-
-#### 1. Multi-Strategy Hybrid Retrieval Engine
-- **Dense Vector Search**: Powered by `pgvector` HNSW indexes using Cosine distance.
-- **Full-Text Keyword Search**: PostgreSQL English tsvector dictionary with `ts_rank_cd` scoring.
-- **Reciprocal Rank Fusion (RRF)**: Merges rank lists with weighted multipliers:
-  $$RRF(d) = \sum_{m \in M} \frac{w_m}{k + \text{rank}_m(d)}$$
-- **Cross-Encoder Reranking**: Re-scores top candidate pairs using `cross-encoder/ms-marco-MiniLM-L-6-v2`.
-- **OpenViking Hierarchical Compilation**: Section-aware hierarchical context parsing (L0 Abstract $\le 300$ chars, L1 Overview $\le 600$ chars, L2 Content Chunks).
-
-#### 2. Adaptive DAG Task Orchestrator (Milestone 2)
-- **Dynamic Task Planning**: Breaks down high-level research questions into a Directed Acyclic Graph (DAG) with explicit dependencies (`depends_on`).
-- **Safety & Guardrails**:
-  - Cycle detection & topological validation.
-  - Fail-closed execution with bounded concurrency, runtime limits, and provider token/call budgets.
-  - Task identity leasing with fencing tokens: stale `RUNNING` tasks are recovered safely to `READY` on node failure.
-  - External tool outputs treated as untrusted evidence, detecting and resolving contradictory findings.
-
-#### 3. Model Context Protocol (MCP) Hub & Spoke (Milestone 6)
-- **Inbound MCP Server**: Dual-transport endpoint (`/mcp` Streamable-HTTP and `/mcp/sse`) exposing 52 authoritative tools to AI hosts like **ChatGPT**, **Cursor IDE**, and **Claude Desktop**.
-- **Outbound MCP Client**: Integrates with external servers such as **Twenty CRM** (`http://localhost:3000/mcp`) or custom business tools.
-- **Server-Verified Tool Risk Classification**:
-  - `Read`: Verified safe query tools (accessible to `VIEWER`+).
-  - `Write (Approval Gated)`: Mutating tools requiring explicit operator review and tickets.
-  - `Restricted`: Unverified or dangerous tools blocked by default-deny policy.
-
-#### 4. Human-in-the-Loop Approval & Two-Step Write Recovery (Milestones 6E, 6E.1, 6F.1)
-- **Proposal-Only Agent Binding**: Autonomous agents cannot directly invoke remote mutations; they emit deterministic proposal tickets (`mcp_propose_create_one_note`).
-- **Cryptographic Draft Integrity**: Canonical SHA-256 draft hashing. Any modification of proposed parameters invalidates the ticket (`409 Conflict`).
-- **Durable Outcome State Machine**:
-  - Tracks operations through `PENDING` $\to$ `IN_FLIGHT` $\to$ `CONFIRMED` / `UNKNOWN` / `RECONCILIATION_REQUIRED`.
-  - Ambiguous remote timeouts are marked `UNKNOWN` and block blind retries.
-  - Automated reconciliation confirms committed writes before retrying.
-  - Replays with identical idempotency keys return cached results with `is_replay: True`.
-
-#### 5. Deep Web Research (TinyFish Integration)
-- Autonomous web research triggered when internal knowledge base sufficiency is low.
-- Multi-query formulation, domain-diversity filtering, and full-page content scraping with grounding validation.
-
-#### 6. Multi-Format Generated Artifacts System
-- Generates publication-ready artifacts in **PDF**, **DOCX**, **CSV**, **JSON**, and **Markdown**.
-- Versioned drafts, cryptographic approval verification, and protected downloads via `/reports` endpoints.
-- Real-time review and download directly in the frontend (`ArtifactList.tsx`).
+This prints the raw Bearer token and connection details.
 
 ---
 
-## 5. Connecting External MCP Clients
+### 1. Cursor IDE Setup
+Cursor connects directly to the backend over SSE:
 
-### 1. Cursor IDE
-Cursor connects directly to your local instance over SSE:
-1. Open Cursor **Settings → Features → MCP**.
-2. Click **"+ Add New MCP Server"**:
-   - **Name**: `rag-backend`
+1. Open Cursor and navigate to **Settings** (`Cmd + ,` or `Ctrl + ,`).
+2. Go to **Features** $\to$ **MCP**.
+3. Click **"+ Add New MCP Server"**:
+   - **Name**: `rag-platform`
    - **Type**: `sse`
    - **Server URL**: `http://localhost:8000/mcp/sse`
-3. Click **Add**. The status dot will turn green and expose all 52 tools.
+4. Click **Add**. The status indicator will turn green, exposing the platform's tools to Cursor's Composer and Agent.
 
-### 2. ChatGPT (Web & Desktop)
-ChatGPT requires an encrypted public HTTPS endpoint:
-1. Start a Cloudflare tunnel:
+---
+
+### 2. ChatGPT (Web & Desktop) Setup
+ChatGPT requires an encrypted public HTTPS tunnel:
+
+1. Start a Cloudflare tunnel pointing to your backend:
    ```bash
    cloudflared tunnel --url http://localhost:8000
    ```
-2. In ChatGPT: Go to **Settings → Connected Apps → + Add custom MCP server**.
-3. Set URL to `https://<your-tunnel-url>.trycloudflare.com/mcp` and select **No authentication**.
+2. In ChatGPT, go to **Settings** $\to$ **Connected Apps** $\to$ **+ Add custom MCP server**.
+3. Set URL to:
+   ```text
+   https://<your-subdomain>.trycloudflare.com/mcp
+   ```
+4. Choose **No authentication** (or configure Custom Header `Authorization: Bearer <token>`).
 
-### 3. Claude Desktop
-Add the following to your `claude_desktop_config.json`:
+---
+
+### 3. Claude Desktop Setup
+Configure Claude Desktop by editing your configuration file:
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
+Add the following entry:
 ```json
 {
   "mcpServers": {
-    "production-rag": {
+    "enterprise-rag": {
       "command": "npx",
       "args": ["-y", "mcp-remote", "http://localhost:8000/mcp/sse"]
     }
   }
 }
 ```
+Restart Claude Desktop. The hammer icon will show all available tools.
 
 ---
 
-## 6. Verification & Testing
+### 4. Outbound MCP (Twenty CRM)
+The orchestrator connects to external MCP servers to execute approved actions:
+1. Set `TWENTY_MCP_ENABLED=true` in `.env`.
+2. Configure `TWENTY_MCP_URL=http://localhost:3000/mcp`.
+3. The platform will dynamically discover tools, classify them into **Read** vs **Approval-Gated Write**, and enforce cryptographic approval before execution.
+
+---
+
+## 6. Inbound Webhooks & n8n / Twenty CRM Automation
+
+The platform provides hardened webhook ingestion endpoints to automate tasks triggered by external platforms like **Twenty CRM**, **n8n**, or **GitHub**.
+
+### Inbound Endpoints
+- `POST /triggers/webhook` — General event trigger for workflow execution.
+- `POST /crm/webhooks/twenty` — Dedicated Twenty CRM entity synchronization.
+
+---
+
+### Webhook Cryptographic Contract
+
+Inbound webhook requests enforce a fail-closed cryptographic contract:
+
+1. **HMAC-SHA256 Signature Header (`X-Twenty-Webhook-Signature`)**:
+   Computed using the secret key configured in `TWENTY_WEBHOOK_SECRET`:
+   $$\text{signature} = \text{HMAC-SHA256}(\text{key} = \text{TWENTY\_WEBHOOK\_SECRET}, \text{msg} = \text{raw\_body})$$
+2. **Timestamp Verification (`X-Twenty-Webhook-Timestamp`)**:
+   Enforces a maximum **300-second (5-minute)** clock drift window to prevent replay attacks.
+3. **Nonce Header (`X-Twenty-Webhook-Nonce`)**:
+   Unique event identifier checked against a durable database replay table (`crm_webhook_events`).
+4. **Server-Side Tenant Routing**:
+   The `webhookId` inside the payload is validated against `TWENTY_WEBHOOK_MAPPINGS`. Payloads with unknown webhook IDs are rejected.
+
+---
+
+### Configuring n8n Workflow
+
+To trigger automated workflows from [n8n](https://n8n.io/):
+
+1. **Webhook Trigger / Schedule Node**: Collect the event payload in n8n.
+2. **Crypto Node / Code Node**: Compute the HMAC-SHA256 signature of the JSON body.
+   ```javascript
+   const crypto = require('crypto');
+   const secret = "your_webhook_hmac_secret_key_here";
+   const body = JSON.stringify($input.all()[0].json);
+   const timestamp = Math.floor(Date.now() / 1000).toString();
+   const nonce = crypto.randomUUID();
+   const signature = crypto.createHmac('sha256', secret).update(body).digest('hex');
+
+   return {
+     headers: {
+       'Content-Type': 'application/json',
+       'X-Twenty-Webhook-Signature': signature,
+       'X-Twenty-Webhook-Timestamp': timestamp,
+       'X-Twenty-Webhook-Nonce': nonce
+     },
+     body: body
+   };
+   ```
+3. **HTTP Request Node**:
+   - **Method**: `POST`
+   - **URL**: `http://localhost:8000/triggers/webhook`
+   - **Headers**: Map headers from the Crypto/Code step.
+   - **Body**: Send the raw JSON payload.
+
+---
+
+### Testing Webhooks Locally
+
+You can test signed webhook ingestion using Python or terminal commands.
+
+#### Using Python Test Script:
+```python
+import hmac, hashlib, time, uuid, httpx
+
+secret = "your_webhook_hmac_secret_key_here"
+payload = '{"webhookId": "default-webhook-id", "event": "deal.created", "data": {"amount": 50000}}'
+timestamp = str(int(time.time()))
+nonce = str(uuid.uuid4())
+
+sig = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+headers = {
+    "Content-Type": "application/json",
+    "X-Twenty-Webhook-Signature": sig,
+    "X-Twenty-Webhook-Timestamp": timestamp,
+    "X-Twenty-Webhook-Nonce": nonce,
+}
+
+response = httpx.post("http://localhost:8000/triggers/webhook", content=payload, headers=headers)
+print("Status:", response.status_code)
+print("Response:", response.json())
+```
+
+---
+
+## 7. Web Search & Deep Research Guide
+
+When the internal knowledge base does not contain sufficient facts to answer a prompt, the platform activates the **Deep Web Research** subsystem.
+
+### Supported Providers
+1. **TinyFish (`tinyfish`)**: Default, high-speed, structured research and full-page markdown scraper.
+2. **Firecrawl (`firecrawl`)**: Deep web crawler with anti-bot bypass and clean markdown conversion.
+3. **Fake (`fake`)**: Zero-cost simulated search engine for testing.
+
+### How It Operates
+1. **Intent & Sufficiency Check**: The Cross-Encoder evaluates retrieval relevance score. If average relevance is below `MIN_VECTOR_SIMILARITY` (default `0.25`) or explicit search keywords are used, web research is triggered.
+2. **Query Formulation**: LLM transforms the user goal into targeted search queries.
+3. **Domain Diversity Guardrail**: Limits candidate pages to `WEB_RESEARCH_MAX_CANDIDATES_PER_DOMAIN=1` to prevent domain concentration.
+4. **Scraping & Grounding**: Downloads sanitized markdown, splits into semantic chunks, and merges into the hierarchical context compiler.
+5. **Citations & Provenance**: Every web statement is referenced with full URL citations in the generated output.
+
+---
+
+## 8. Human-in-the-Loop (HITL) Approval & Write Recovery
+
+Autonomous agents must never perform destructive or mutating operations without human supervision.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Operator / Admin
+    participant Agent as Autonomous Agent
+    participant Gate as Approval Gate
+    participant Recovery as Two-Step Write Recovery
+    participant Ext as External System (CRM/MCP)
+
+    Agent->>Gate: Propose Action (Draft Parameters)
+    Gate-->>Agent: Ticket Created (Status: PENDING, SHA-256 Hash)
+    Gate->>User: Surface Interactive Approval Card in UI
+    alt Operator Approves
+        User->>Gate: Approve Ticket with Canonical Draft Hash
+        Gate->>Recovery: Transition: IN_FLIGHT + Idempotency Key
+        Recovery->>Ext: Dispatch Remote API Mutation
+        Ext-->>Recovery: Success 200 OK
+        Recovery-->>Gate: Status: CONFIRMED
+        Gate-->>User: Mutation Applied Successfully
+    else Operator Rejects
+        User->>Gate: Reject Ticket with Reason
+        Gate-->>Agent: Ticket CANCELLED (0 Writes Performed)
+    end
+```
+
+### Safety Guarantees
+- **Draft Hash Integrity**: The approval payload must contain the exact SHA-256 hash of the proposed mutation. Any tampering invalidates the request with a `409 Conflict`.
+- **Two-Step Idempotency**: If a remote call times out, the durable state transitions to `UNKNOWN`. The recovery engine queries the remote system before attempting any retry, ensuring zero accidental double writes.
+
+---
+
+## 9. Testing & Quality Verification
+
+The repository contains automated unit, integration, and security test suites for both backend and frontend.
 
 ### Running Backend Tests
-The backend test suite covers RAG retrieval, context compilation, DAG orchestration, MCP security, and CRM write recovery:
+Execute test suites across RAG retrieval, DAG orchestration, and MCP security:
 
 ```bash
-# Run all backend tests
+# Run the entire backend test suite
 uv run pytest tests/ -v
 
-# Run MCP and Workflow-specific test suites
-uv run pytest tests/test_mcp_security_and_resilience.py tests/test_mcp_approval_writeback.py tests/test_mcp_two_step_write_recovery.py -v
+# Run Adaptive DAG Orchestrator tests
+uv run pytest tests/test_milestone2_adaptive_dag.py -v
 
-# Run DAG Orchestrator and Vertical Slice tests
-uv run pytest tests/test_milestone2_adaptive_dag.py tests/test_vertical_slice_workflow.py -v
+# Run MCP Security and Two-Step Write Recovery tests
+uv run pytest tests/test_mcp_security_and_resilience.py tests/test_mcp_two_step_write_recovery.py -v
+
+# Run Inbound Webhook and Trigger tests
+uv run pytest tests/test_workflow_triggers.py -v
 ```
 
 ### Running Frontend Tests & Production Build
 ```bash
 cd frontend
 
-# Run frontend unit tests
+# Run TypeScript unit tests (110+ passing tests)
 npm test
 
-# Verify production build compilation
+# Test production build bundling
 npm run build
+```
+
+### API Health Verification
+Verify that backend services and database connections are operational:
+```bash
+curl http://localhost:8000/health
+```
+Expected response:
+```json
+{
+  "status": "healthy",
+  "database": "connected",
+  "version": "1.0.0"
+}
 ```
 
 ---
 
-## 7. Project Structure
+## 10. Troubleshooting & Common Issues
+
+### 1. `pgvector` Extension Error on Database Migration
+**Symptom**: `alembic upgrade head` fails with `type "vector" does not exist`.  
+**Cause**: The PostgreSQL instance does not have the `pgvector` extension installed.  
+**Fix**: Ensure you are using the `pgvector/pgvector:pg16` Docker image, or run `CREATE EXTENSION IF NOT EXISTS vector;` in your PostgreSQL database as superuser.
+
+### 2. Port Collisions (5432, 8000, 8443)
+**Symptom**: `bind: address already in use`.  
+**Fix**:
+- **Port 5432**: If local Postgres is already running, run the Docker container on port `5433:5432` and update `DATABASE_URL=postgresql+asyncpg://rag:rag@localhost:5433/ragdb` in `.env`.
+- **Port 8000**: Run uvicorn on another port: `uv run uvicorn rag_app.main:app --port 8001`.
+- **Port 8443**: Set `PORT=3000 npm run dev` in the `frontend` folder.
+
+### 3. Missing `JWT_SECRET_KEY` on Startup
+**Symptom**: `ValidationError: Field required: jwt_secret_key`.  
+**Fix**: Ensure `.env` is created from `.env.example`. The `JWT_SECRET_KEY` variable must be present and at least 32 characters long.
+
+### 4. Webhook Rejection (`401 Unauthorized` / `Invalid HMAC Signature`)
+**Symptom**: Inbound webhooks return `Invalid webhook HMAC-SHA256 signature`.  
+**Fix**:
+1. Verify `TWENTY_WEBHOOK_SECRET` matches in both your sender (n8n/script) and `.env`.
+2. Ensure the signature is computed over the **exact raw byte stream** of the request body before any JSON formatting or whitespace alterations.
+3. Check system clocks: if your timestamp deviates by more than 300 seconds from server UTC, the request is rejected.
+
+### 5. First-Time HuggingFace Model Download Delay
+**Symptom**: First retrieval query hangs for 15–30 seconds.  
+**Explanation**: On the initial run, `sentence-transformers` automatically downloads `all-MiniLM-L6-v2` (~90 MB) and caches it in `~/.cache/huggingface`. Subsequent executions run instantaneously offline.
+
+---
+
+## 11. Repository Structure
 
 ```text
 ragdemo1/
+├── .env.example               # Complete environment variables template
+├── docker-compose.yml         # Container definitions (PostgreSQL + pgvector + Twenty)
+├── pyproject.toml             # Python package configuration and dependencies
+├── uv.lock                    # Deterministic uv lockfile for Python
+├── alembic.ini                # Alembic migration configuration
 ├── src/
 │   └── rag_app/
-│       ├── api/               # FastAPI REST & SSE routes (workspaces, workflows, artifacts, MCP)
-│       ├── context/           # Hierarchical context compiler & tokenizer
-│       ├── crm/               # Twenty CRM client, factory, and durable sync service
-│       ├── db/                # SQLAlchemy async models & database session management
-│       ├── generation/        # Grounded generation, citation validation, and prompt templates
-│       ├── mcp/               # FastMCP dual-transport server, client security, and tool bindings
-│       ├── orchestration/     # Adaptive DAG planner, DAG execution engine, evidence & budget gates
-│       ├── providers/         # Pluggable provider architecture (LLMs, embeddings, web search)
-│       ├── reports/           # Multi-format artifact renderers (PDF, DOCX, CSV, JSON)
-│       ├── research/          # LangGraph state machine, query planning, and TinyFish web research
-│       ├── retrieval/         # Vector, BM25, RRF, and CrossEncoder hybrid retrieval
-│       └── security/          # Fernet credential encryption, JWT auth, and RBAC enforcement
+│       ├── api/               # FastAPI route controllers (chat, workflows, artifacts, MCP, webhooks)
+│       ├── context/           # Hierarchical OpenViking context compiler & token budgets
+│       ├── core/              # Global application settings and lifespan management
+│       ├── crm/               # Twenty CRM client, sync service, and reconciliation loop
+│       ├── db/                # SQLAlchemy models, session engine, and pgvector schemas
+│       ├── generation/        # Grounded LLM response generation and citation validation
+│       ├── mcp/               # FastMCP dual-transport server, tool bindings, and risk gates
+│       ├── orchestration/     # Adaptive DAG planner, task leasing, and trigger service
+│       ├── providers/         # Pluggable capability adapters (LLMs, embeddings, web search)
+│       ├── reports/           # Multi-format artifact generation (PDF, DOCX, CSV, JSON)
+│       ├── research/          # LangGraph state machine, query planning, and TinyFish integration
+│       ├── retrieval/         # Vector, BM25, RRF, and CrossEncoder hybrid retrieval pipeline
+│       └── security/          # JWT authentication, RBAC authorization, and MultiFernet encryption
 ├── frontend/
-│   ├── src/
-│   │   ├── api/               # API clients for chat, workspaces, workflows, and MCP connections
-│   │   ├── components/        # React 19 UI (RAG view, MCP Integrations, Workflow Progress, Artifacts)
-│   │   └── ...
-│   ├── package.json
-│   └── vite.config.ts         # Vite config with backend proxy and port 8443
-├── migrations/                # Alembic database migrations (pgvector, MCP, workflows, artifacts)
-├── tests/                     # 100+ pytest test suites covering RAG, MCP, DAG, and Security
-├── pyproject.toml             # Python package definition and dependencies
-└── README.md
+│   ├── src/                   # React 19 UI (Chat, Workflow Studio, Execution Canvas, Artifacts)
+│   ├── package.json           # Frontend dependencies and test runner scripts
+│   └── vite.config.ts         # Vite configuration with backend API proxying
+├── migrations/                # Alembic database migration scripts
+├── scripts/                   # Administration and utility scripts (seed_admin, generate_mcp_token)
+├── storage/                   # Protected local artifact and report storage
+└── tests/                     # 100+ pytest test suites covering all platform capabilities
 ```
+
+---
+
+## License
+
+This project is licensed under the Apache 2.0 License.

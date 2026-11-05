@@ -3,6 +3,8 @@ from typing import Annotated, Any, Optional
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
+from pydantic import BaseModel
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, BackgroundTasks
 from fastapi.responses import FileResponse, PlainTextResponse
 from sqlalchemy import select, or_, and_, text
@@ -246,6 +248,89 @@ async def list_document_chunks(
         )
         for c in chunks
     ]
+
+
+class CheckHashResponse(BaseModel):
+    exists: bool
+    document_id: str | None = None
+    file_name: str | None = None
+    scope: str | None = None
+
+
+@router.get("/documents/check-hash", response_model=CheckHashResponse)
+async def check_document_hash(
+    session: DbSession,
+    hash: str = Query(..., min_length=64, max_length=64, description="SHA-256 hash of the file"),
+    department_code: Optional[str] = Query(None, description="Target department code"),
+    workspace_id: Optional[str] = Query(None, description="Target workspace ID or code"),
+    user: User = Depends(get_current_user),
+) -> CheckHashResponse:
+    from rag_app.db.models import Department, Document, Workspace, WorkspaceMember
+    from rag_app.security.authorization import get_allowed_departments
+
+    clean_hash = hash.lower().strip()
+
+    # 1. Workspace scope check
+    target_workspace_id = None
+    if workspace_id:
+        ws = None
+        try:
+            ws_uuid = UUID(str(workspace_id))
+            ws = await session.get(Workspace, ws_uuid)
+        except (ValueError, TypeError):
+            ws = await session.scalar(select(Workspace).where(Workspace.code == str(workspace_id).upper()))
+
+        if not ws:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+
+        if user.role != "ADMIN":
+            member = await session.scalar(
+                select(WorkspaceMember).where(
+                    WorkspaceMember.workspace_id == ws.id,
+                    WorkspaceMember.user_id == user.id,
+                )
+            )
+            if not member:
+                raise HTTPException(status_code=403, detail="Not authorized to access this workspace")
+        target_workspace_id = ws.id
+
+    # 2. Department scope check
+    target_department_id = None
+    if department_code:
+        dept = await session.scalar(
+            select(Department).where(Department.code == department_code.upper().strip(), Department.is_active == True)
+        )
+        if not dept:
+            raise HTTPException(status_code=404, detail="Department not found")
+
+        if user.role != "ADMIN":
+            allowed = await get_allowed_departments(session, user)
+            if allowed is not None and str(dept.id) not in {str(d) for d in allowed}:
+                raise HTTPException(status_code=403, detail="Not authorized to access this department")
+        target_department_id = dept.id
+
+    # 3. Query document within authorized scope
+    stmt = select(Document).where(Document.content_hash == clean_hash)
+    if target_workspace_id:
+        stmt = stmt.where(Document.workspace_id == target_workspace_id)
+    elif target_department_id:
+        stmt = stmt.where(Document.department_id == target_department_id)
+    else:
+        if user.role != "ADMIN":
+            allowed = await get_allowed_departments(session, user)
+            if not allowed:
+                return CheckHashResponse(exists=False)
+            stmt = stmt.where(Document.department_id.in_(allowed))
+
+    doc = await session.scalar(stmt)
+    if doc:
+        return CheckHashResponse(
+            exists=True,
+            document_id=str(doc.id),
+            file_name=doc.file_name,
+            scope="workspace" if doc.workspace_id else "department",
+        )
+    return CheckHashResponse(exists=False)
 
 
 @router.post("/documents/upload", response_model=IngestResponse)
@@ -571,6 +656,10 @@ async def ask_question(
             sources=[],
         )
         metrics = finalize_request_metrics()
+        if metrics:
+            metrics.routing_mode = AdaptiveRouteMode.ADAPTIVE_PLAN.value
+            metrics.workflow_run_id = str(wf_run.id)
+            metrics.routing_reason = "Adaptive Task Planner decomposed the complex query into a multi-step DAG."
         return GenerateResponse(
             answer=ans,
             citations=[],
@@ -607,6 +696,10 @@ async def ask_question(
             sources=[],
         )
         metrics = finalize_request_metrics()
+        if metrics:
+            metrics.routing_mode = AdaptiveRouteMode.ADAPTIVE_PLAN.value
+            metrics.workflow_run_id = str(wf_run.id)
+            metrics.routing_reason = "Adaptive Task Planner decomposed the complex query into a multi-step DAG."
         return GenerateResponse(
             answer=ans,
             citations=[],
@@ -667,6 +760,10 @@ async def ask_question(
             sources=[],
         )
         metrics = finalize_request_metrics()
+        if metrics:
+            metrics.routing_mode = AdaptiveRouteMode.ADAPTIVE_PLAN.value
+            metrics.workflow_run_id = str(wf_run.id)
+            metrics.routing_reason = "Adaptive Task Planner decomposed the complex query into a multi-step DAG."
         return GenerateResponse(
             answer=ans,
             citations=[],
@@ -739,6 +836,10 @@ async def ask_question(
             sources=[],
         )
         metrics = finalize_request_metrics()
+        if metrics:
+            metrics.routing_mode = AdaptiveRouteMode.ADAPTIVE_PLAN.value
+            metrics.workflow_run_id = str(wf_run.id)
+            metrics.routing_reason = "Adaptive Task Planner decomposed the complex query into a multi-step DAG."
         return GenerateResponse(
             answer=ans,
             citations=[],
@@ -791,27 +892,34 @@ async def ask_question(
         )
         return auth_resp
 
-    # 3. Execution Mode Selection & Adaptive Workflow Dispatch
+    # 3. Execution Mode Selection & Adaptive Workflow Dispatch (Milestone 10A)
     from rag_app.orchestration.service import WorkflowService
     from rag_app.schemas.workflow import WorkflowRunCreate, BudgetLimits
+    from rag_app.orchestration.router import AdaptiveRequestRouter, AdaptiveRouteMode
+
+    adaptive_router = AdaptiveRequestRouter()
+    target_mode: AdaptiveRouteMode | None = None
+
+    if request.execution_mode:
+        m = request.execution_mode.lower().strip()
+        if m in ("adaptive_workflow", "adaptive_plan", "workflow"):
+            target_mode = AdaptiveRouteMode.ADAPTIVE_PLAN
+        elif m in ("contextual", "context"):
+            target_mode = AdaptiveRouteMode.CONTEXTUAL
+        elif m in ("fast_path", "fast_rag"):
+            target_mode = AdaptiveRouteMode.FAST_RAG
 
     # Mutating actions (CRM writebacks, workflow runs) must NEVER bypass the adaptive workflow approval gate,
-    # regardless of client-supplied execution_mode.
+    # regardless of client-supplied execution_mode (fail-closed policy).
     is_mutation_action = not WorkflowService.is_fast_path(request.query)
-
-    should_use_workflow = False
     if is_mutation_action:
-        # Fail-closed security: Force adaptive workflow for mutations regardless of client param
-        should_use_workflow = True
-    elif request.execution_mode == "adaptive_workflow":
-        should_use_workflow = True
-    elif request.execution_mode == "fast_path":
-        should_use_workflow = False
-    else:
-        # Backward-compatible automatic evaluation using verified WorkflowService heuristics
-        should_use_workflow = not WorkflowService.is_fast_path(request.query)
+        target_mode = AdaptiveRouteMode.ADAPTIVE_PLAN
 
-    if should_use_workflow:
+    if not target_mode:
+        classification = await adaptive_router.classify(request.query)
+        target_mode = classification.route
+
+    if target_mode == AdaptiveRouteMode.ADAPTIVE_PLAN:
         import uuid as _uuid
         workflow_service = WorkflowService(session=session)
         ws_uuid = None
@@ -854,6 +962,10 @@ async def ask_question(
             sources=[],
         )
         metrics = finalize_request_metrics()
+        if metrics:
+            metrics.routing_mode = AdaptiveRouteMode.ADAPTIVE_PLAN.value
+            metrics.workflow_run_id = str(wf_run.id)
+            metrics.routing_reason = "Adaptive Task Planner decomposed the complex query into a multi-step DAG."
         return GenerateResponse(
             answer=ans_content,
             citations=[],
@@ -864,6 +976,7 @@ async def ask_question(
             message_id=str(asst_msg.id),
             workflow_run_id=str(wf_run.id),
             workflow_status=wf_run.status,
+            routing_mode=AdaptiveRouteMode.ADAPTIVE_PLAN.value,
         )
 
     # Check natural language structured task and follow-up intent
@@ -1225,6 +1338,13 @@ async def ask_question(
         resp.execution_metrics = metrics
         resp.conversation_id = str(conv_id)
         resp.conversation_title = conv_title
+        resp.routing_mode = target_mode.value if hasattr(target_mode, "value") else str(target_mode)
+        if metrics:
+            metrics.routing_mode = resp.routing_mode
+            if hasattr(resp, "routing_reason") and resp.routing_reason:
+                metrics.routing_reason = resp.routing_reason
+            if hasattr(resp, "workflow_run_id") and resp.workflow_run_id:
+                metrics.workflow_run_id = resp.workflow_run_id
         
         from rag_app.context.sources import (
             deduplicate_sources_payload,

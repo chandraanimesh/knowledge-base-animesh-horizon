@@ -104,6 +104,10 @@ async def _get_workflow_draft_and_approval(session: AsyncSession, run: WorkflowR
         result["approval_id"] = approval.id
         result["intended_action"] = getattr(approval, "intended_action", "CRM_CREATE_NOTE")
         result["target_record_id"] = approval.external_record_id
+        result["approval_status"] = approval.status
+        result["approval_expires_at"] = approval.expires_at
+        result["approval_requested_by"] = approval.requested_by
+        result["target_object"] = approval.target_object
 
     # Fetch evidence items from tasks
     all_tasks = (await session.scalars(
@@ -122,8 +126,12 @@ def _build_workflow_run_response(
     run: WorkflowRun,
     tasks: list[WorkflowTask],
     extra_details: Optional[dict[str, Any]] = None,
+    user_role: Optional[str] = None,
 ) -> WorkflowRunResponse:
     extra = extra_details or {}
+    from rag_app.orchestration.runtime_snapshot import sanitize_snapshot_for_api
+    sanitized_snapshot = sanitize_snapshot_for_api(getattr(run, "provider_snapshot", None), user_role=user_role)
+
     task_responses = [
         WorkflowTaskResponse(
             id=t.id,
@@ -153,6 +161,8 @@ def _build_workflow_run_response(
         workspace_id=run.workspace_id,
         department_id=run.department_id,
         conversation_id=run.conversation_id,
+        workflow_id=run.workflow_id,
+        workflow_version_id=run.workflow_version_id,
         scope_type=run.scope_type,
         thread_id=run.thread_id,
         status=WorkflowStatus(run.status) if hasattr(WorkflowStatus, run.status) else run.status,
@@ -182,6 +192,21 @@ def _build_workflow_run_response(
         approval_id=extra.get("approval_id"),
         intended_action=extra.get("intended_action"),
         target_record_id=extra.get("target_record_id"),
+        approval_status=extra.get("approval_status"),
+        approval_expires_at=extra.get("approval_expires_at"),
+        approval_requested_by=extra.get("approval_requested_by"),
+        target_object=extra.get("target_object"),
+        is_test=bool(
+            (run.thread_id and run.thread_id.startswith("test:"))
+            or (run.idempotency_key and run.idempotency_key.startswith("test:"))
+            or extra.get("is_test", False)
+        ),
+        execution_mode="TEST" if bool(
+            (run.thread_id and run.thread_id.startswith("test:"))
+            or (run.idempotency_key and run.idempotency_key.startswith("test:"))
+            or extra.get("is_test", False)
+        ) else "PRODUCTION",
+        provider_snapshot=sanitized_snapshot,
     )
 
 
@@ -212,7 +237,47 @@ async def create_and_execute_workflow(
     tasks = (await session.scalars(tasks_stmt)).all()
     extra_details = await _get_workflow_draft_and_approval(session, run)
 
-    return _build_workflow_run_response(run, list(tasks), extra_details)
+    return _build_workflow_run_response(run, list(tasks), extra_details, user_role=user.role)
+
+
+@router.get("/runs", response_model=list[WorkflowRunResponse], status_code=status.HTTP_200_OK)
+async def list_workflow_runs(
+    user: CurrentUser,
+    session: DbSession,
+    workspace_id: Optional[uuid.UUID] = Query(None, description="Filter by workspace ID"),
+    workflow_id: Optional[uuid.UUID] = Query(None, description="Filter by workflow definition ID"),
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0),
+) -> list[WorkflowRunResponse]:
+    """
+    Lists historical and active WorkflowRuns matching workspace_id or workflow_id.
+    Enforces workspace authorization for non-admin callers.
+    """
+    stmt = select(WorkflowRun)
+    if workflow_id is not None:
+        stmt = stmt.where(WorkflowRun.workflow_id == workflow_id)
+    if workspace_id is not None:
+        if user.role != "ADMIN":
+            await _verify_workspace_authorization(session, user, workspace_id)
+        stmt = stmt.where(WorkflowRun.workspace_id == workspace_id)
+    elif user.role != "ADMIN" and workflow_id is None:
+        stmt = stmt.where(WorkflowRun.user_id == user.id)
+
+    stmt = stmt.order_by(WorkflowRun.created_at.desc()).offset(skip).limit(limit)
+    runs = (await session.scalars(stmt)).all()
+
+    results: list[WorkflowRunResponse] = []
+    for r in runs:
+        tasks_stmt = (
+            select(WorkflowTask)
+            .where(WorkflowTask.workflow_run_id == r.id)
+            .order_by(WorkflowTask.created_at.asc())
+        )
+        tasks = (await session.scalars(tasks_stmt)).all()
+        extra_details = await _get_workflow_draft_and_approval(session, r)
+        results.append(_build_workflow_run_response(r, list(tasks), extra_details, user_role=user.role))
+
+    return results
 
 
 @router.get("/runs/{run_id}", response_model=WorkflowRunResponse, status_code=status.HTTP_200_OK)
@@ -246,7 +311,7 @@ async def get_workflow_run(
     tasks = (await session.scalars(tasks_stmt)).all()
     extra_details = await _get_workflow_draft_and_approval(session, run)
 
-    return _build_workflow_run_response(run, list(tasks), extra_details)
+    return _build_workflow_run_response(run, list(tasks), extra_details, user_role=user.role)
 
 
 @router.post("/runs/{run_id}/approval", response_model=WorkflowApprovalResponse, status_code=status.HTTP_200_OK)

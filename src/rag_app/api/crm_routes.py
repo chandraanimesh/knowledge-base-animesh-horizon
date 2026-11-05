@@ -182,8 +182,11 @@ async def get_sync_job_status(
 async def handle_twenty_webhook(
     request: Request,
     session: DbSession,
+    x_twenty_webhook_signature: Optional[str] = Header(None, alias="X-Twenty-Webhook-Signature"),
     x_twenty_signature: Optional[str] = Header(None, alias="X-Twenty-Signature"),
     x_signature: Optional[str] = Header(None, alias="X-Signature"),
+    x_twenty_webhook_timestamp: Optional[str] = Header(None, alias="X-Twenty-Webhook-Timestamp"),
+    x_twenty_webhook_nonce: Optional[str] = Header(None, alias="X-Twenty-Webhook-Nonce"),
     department_id: Optional[str] = Query(None, description="Target department UUID or code for ingestion"),
 ) -> dict[str, Any]:
     # 1. Enforce payload size limit (SEC-05)
@@ -222,11 +225,11 @@ async def handle_twenty_webhook(
         )
 
     # 3. Enforce presence of signature header
-    signature = x_twenty_signature or x_signature
+    signature = x_twenty_webhook_signature or x_twenty_signature or x_signature
     if not signature:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing webhook signature header (X-Twenty-Signature).",
+            detail="Missing webhook signature header (X-Twenty-Signature or X-Twenty-Webhook-Signature).",
         )
 
     service = CRMSyncService(session)
@@ -237,9 +240,12 @@ async def handle_twenty_webhook(
             signature_header=signature,
             secret=secret,
             department_id=department_id,
+            timestamp=x_twenty_webhook_timestamp,
+            event_id=x_twenty_webhook_nonce,
         )
         return result
     except ValueError as ve:
+        logger.warning("Twenty CRM webhook ValueError: %s", ve, exc_info=True)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(ve))
     except Exception as ex:
         logger.error("Webhook processing error: %s", ex, exc_info=True)

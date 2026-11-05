@@ -17,6 +17,7 @@ SENSITIVE_PII_PATTERNS = [
     re.compile(r"\bcredit card\b", re.IGNORECASE),
     re.compile(r"\bphone number\b", re.IGNORECASE),
     re.compile(r"\bemail address\b", re.IGNORECASE),
+    re.compile(r"\b(secret token|api[_-]?key|private[_-]?key|bearer\s+[a-z0-9_\-\.]+|sk-[a-z0-9_\-]+)\b", re.IGNORECASE),
 ]
 
 

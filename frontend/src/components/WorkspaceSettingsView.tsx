@@ -8,6 +8,8 @@ import {
 } from '../api/workspaces';
 import CustomDropdown, { DropdownOption } from './CustomDropdown';
 import WorkspaceMCPIntegrationsView from './WorkspaceMCPIntegrationsView';
+import { MemoryPrivacyModal } from './MemoryPrivacyModal';
+import { MemoryExecutionInspector } from './MemoryExecutionInspector';
 import {
   SettingsIcon,
   UsersIcon,
@@ -24,6 +26,15 @@ import {
   CheckIcon,
   ServerIcon,
 } from './mcpIcons';
+
+export function BrainIcon({ size = 16, color = 'currentColor', style }: { size?: number; color?: string; style?: React.CSSProperties }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={style}>
+      <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.04z" />
+      <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.04z" />
+    </svg>
+  );
+}
 
 export function OpenAIIcon({ size = 16, color = 'currentColor', style }: { size?: number; color?: string; style?: React.CSSProperties }) {
   return (
@@ -79,6 +90,7 @@ type SettingsSection =
   | 'rag_retrieval'
   | 'web_search'
   | 'integrations'
+  | 'memory_privacy'
   | 'security'
   | 'usage_limits'
   | 'advanced';
@@ -143,6 +155,17 @@ export default function WorkspaceSettingsView({
   const [llmCredRef, setLlmCredRef] = useState<string>('');
   const [temperature, setTemperature] = useState<number>(0.2);
   const [isDefaultLlm, setIsDefaultLlm] = useState(true);
+  const [customBaseUrl, setCustomBaseUrl] = useState<string>('');
+  const [showDirectKeyInput, setShowDirectKeyInput] = useState<boolean>(false);
+  const [directApiKey, setDirectApiKey] = useState<string>('');
+  const [savingDirectKey, setSavingDirectKey] = useState<boolean>(false);
+  const [directKeyFeedback, setDirectKeyFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // Web Direct Key State
+  const [showWebDirectKeyInput, setShowWebDirectKeyInput] = useState<boolean>(false);
+  const [directWebApiKey, setDirectWebApiKey] = useState<string>('');
+  const [savingWebDirectKey, setSavingWebDirectKey] = useState<boolean>(false);
+  const [webDirectKeyFeedback, setWebDirectKeyFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   // 2. Embedding Provider State
   const [embeddingEnabled, setEmbeddingEnabled] = useState(true);
@@ -181,11 +204,18 @@ export default function WorkspaceSettingsView({
   // Review & Confirmation Modal State
   const [showConfirmReview, setShowConfirmReview] = useState(false);
 
+  // Memory & Privacy Modals State
+  const [showMemoryPrivacyModal, setShowMemoryPrivacyModal] = useState(false);
+  const [showMemoryInspector, setShowMemoryInspector] = useState(false);
+
   // Dropdown Options
   const llmProviderOptions: DropdownOption[] = useMemo(
     () => [
       { value: 'groq', label: 'Groq', description: 'Ultra-fast cloud inference (Llama 3.3)', icon: <ZapIcon size={14} color="#18181b" /> },
-      { value: 'openai', label: 'OpenAI', description: 'GPT-4o, GPT-4o-mini', icon: <OpenAIBadge size={18} iconSize={12} /> },
+      { value: 'openai', label: 'OpenAI', description: 'Official GPT-4o, GPT-4o-mini', icon: <OpenAIBadge size={18} iconSize={12} /> },
+      { value: 'custom', label: 'Custom / Any Platform', description: 'DeepSeek, OpenRouter, Mistral, Ollama, vLLM, etc.', icon: <CpuIcon size={14} color="#7c3aed" />, badge: 'Universal' },
+      { value: 'deepseek', label: 'DeepSeek', description: 'deepseek-chat, deepseek-reasoner', icon: <ZapIcon size={14} color="#0284c7" /> },
+      { value: 'openrouter', label: 'OpenRouter', description: 'Universal router (Claude, Llama, Gemini, Qwen)', icon: <GlobeIcon size={14} color="#059669" /> },
       { value: 'mock', label: 'Mock LLM', description: 'Deterministic test engine (Zero-network)', icon: <CpuIcon size={14} color="#71717a" /> },
       { value: 'anthropic', label: 'Anthropic', description: 'Claude 3.5 Sonnet', icon: <CpuIcon size={14} color="#a1a1aa" />, disabled: true, badge: 'Unavailable on server' },
       { value: 'gemini', label: 'Google Gemini', description: 'Gemini 1.5 Pro / Flash', icon: <CpuIcon size={14} color="#a1a1aa" />, disabled: true, badge: 'Unavailable on server' },
@@ -200,10 +230,32 @@ export default function WorkspaceSettingsView({
     if (llmProvider === 'openai') {
       return OPENAI_MODELS.map((m) => ({ value: m, label: m }));
     }
+    if (llmProvider === 'deepseek') {
+      return [
+        { value: 'deepseek-chat', label: 'deepseek-chat (V3)' },
+        { value: 'deepseek-reasoner', label: 'deepseek-reasoner (R1)' },
+      ];
+    }
+    if (llmProvider === 'openrouter') {
+      return [
+        { value: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { value: 'deepseek/deepseek-chat', label: 'DeepSeek V3' },
+        { value: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B' },
+        { value: 'google/gemini-flash-1.5', label: 'Gemini 1.5 Flash' },
+      ];
+    }
     if (llmProvider === 'mock') {
       return MOCK_MODELS.map((m) => ({ value: m, label: m }));
     }
-    return [{ value: llmModel, label: llmModel }];
+    return [
+      { value: 'deepseek-chat', label: 'deepseek-chat' },
+      { value: 'gpt-4o', label: 'gpt-4o' },
+      { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
+      { value: 'custom-model', label: 'Custom Model' },
+      ...(llmModel && !['deepseek-chat', 'gpt-4o', 'gpt-4o-mini', 'custom-model'].includes(llmModel)
+        ? [{ value: llmModel, label: llmModel }]
+        : []),
+    ];
   }, [llmProvider, llmModel]);
 
   const handleLlmProviderChange = (val: string) => {
@@ -212,6 +264,15 @@ export default function WorkspaceSettingsView({
       setLlmModel('llama-3.3-70b-versatile');
     } else if (val === 'openai' && !OPENAI_MODELS.includes(llmModel)) {
       setLlmModel('gpt-4o');
+    } else if (val === 'deepseek') {
+      setLlmModel('deepseek-chat');
+      if (!customBaseUrl) setCustomBaseUrl('https://api.deepseek.com');
+    } else if (val === 'openrouter') {
+      setLlmModel('anthropic/claude-3.5-sonnet');
+      if (!customBaseUrl) setCustomBaseUrl('https://openrouter.ai/api/v1');
+    } else if (val === 'custom') {
+      if (!llmModel || llmModel === 'gpt-4o') setLlmModel('deepseek-chat');
+      if (!customBaseUrl) setCustomBaseUrl('https://api.openai.com/v1');
     } else if (val === 'mock' && !MOCK_MODELS.includes(llmModel)) {
       setLlmModel('mock-deterministic-v1');
     }
@@ -226,7 +287,7 @@ export default function WorkspaceSettingsView({
 
   const embeddingModelOptions: DropdownOption[] = useMemo(
     () => [
-      { value: 'all-MiniLM-L6-v2 (384 dim)', label: 'all-MiniLM-L6-v2 (384 dim)', badge: 'Compatible' },
+      { value: 'all-MiniLM-L6-v2 (384 dim)', label: 'all-MiniLM-L6-v2 (384 dim)', badge: 'Index-Bound (Active)' },
       { value: 'text-embedding-3-small', label: 'text-embedding-3-small (1536 dim)', disabled: true, badge: 'Incompatible dimension' },
     ],
     []
@@ -248,7 +309,7 @@ export default function WorkspaceSettingsView({
   const webProviderOptions: DropdownOption[] = useMemo(
     () => [
       { value: 'tinyfish', label: 'TinyFish Search API', description: 'Real-time agentic web search & fast retrieval', icon: <SearchIcon size={14} color="#18181b" /> },
-      { value: 'tavily', label: 'Tavily Search API', description: 'Real-time AI search API', icon: <GlobeIcon size={14} color="#18181b" /> },
+      { value: 'tavily', label: 'Tavily Search API', description: 'Real-time AI search API (Universal search)', icon: <GlobeIcon size={14} color="#0284c7" /> },
       { value: 'firecrawl', label: 'Firecrawl Search & Reader', description: 'Web search & document scraper', icon: <GlobeIcon size={14} color="#71717a" /> },
     ],
     []
@@ -309,6 +370,7 @@ export default function WorkspaceSettingsView({
 
         // JSONB configuration options
         const cfg = profile.configuration || {};
+        if (typeof cfg.base_url === 'string') setCustomBaseUrl(cfg.base_url);
         if (typeof cfg.temperature === 'number') setTemperature(cfg.temperature);
         if (typeof cfg.is_default_llm === 'boolean') setIsDefaultLlm(cfg.is_default_llm);
         if (typeof cfg.is_default_embedding === 'boolean') setIsDefaultEmbedding(cfg.is_default_embedding);
@@ -514,12 +576,18 @@ export default function WorkspaceSettingsView({
     setTestingStatus((prev) => ({ ...prev, [capability]: true }));
     setTestResults((prev) => ({ ...prev, [capability]: null }));
 
+    const extraConfig: Record<string, any> = { temperature };
+    if (capability === 'llm' && customBaseUrl.trim()) {
+      extraConfig.base_url = customBaseUrl.trim();
+    }
+
     try {
       const res = await workspaceApi.testProviderConnection(token, workspace.id, {
         capability,
         provider: prov,
         model: model.trim() || null,
         credential_ref: credRef.trim() || null,
+        extra_config: extraConfig,
       });
       setTestResults((prev) => ({ ...prev, [capability]: res }));
       if (res.success) {
@@ -544,6 +612,53 @@ export default function WorkspaceSettingsView({
       addActivity(`${capability.toUpperCase()} probe error`, err.message, 'warning');
     } finally {
       setTestingStatus((prev) => ({ ...prev, [capability]: false }));
+    }
+  };
+
+  // Direct API Key Save to Server Environment
+  const handleSaveDirectApiKey = async (capability: 'llm' | 'web') => {
+    const rawKey = capability === 'llm' ? directApiKey.trim() : directWebApiKey.trim();
+    if (!rawKey) return;
+
+    if (capability === 'llm') {
+      setSavingDirectKey(true);
+      setDirectKeyFeedback(null);
+    } else {
+      setSavingWebDirectKey(true);
+      setWebDirectKeyFeedback(null);
+    }
+
+    try {
+      const res = await workspaceApi.setWorkspaceApiKey(token, workspace.id, {
+        capability,
+        provider: capability === 'llm' ? llmProvider : webProvider,
+        api_key: rawKey,
+      });
+      if (capability === 'llm') {
+        setDirectKeyFeedback({ type: 'success', message: res.message });
+        setLlmCredRef(res.env_var_name);
+        setDirectApiKey('');
+      } else {
+        setWebDirectKeyFeedback({ type: 'success', message: res.message });
+        setWebCredRef(res.env_var_name);
+        setDirectWebApiKey('');
+      }
+      onToast?.('success', res.message);
+      addActivity(`API key saved for ${res.provider}`, `Stored securely as ${res.env_var_name}`, 'success');
+    } catch (err: any) {
+      const msg = err.message || 'Failed to save API key to server environment.';
+      if (capability === 'llm') {
+        setDirectKeyFeedback({ type: 'error', message: msg });
+      } else {
+        setWebDirectKeyFeedback({ type: 'error', message: msg });
+      }
+      onToast?.('error', msg);
+    } finally {
+      if (capability === 'llm') {
+        setSavingDirectKey(false);
+      } else {
+        setSavingWebDirectKey(false);
+      }
     }
   };
 
@@ -587,6 +702,7 @@ export default function WorkspaceSettingsView({
       web_credential_ref: webCredRef.trim() || null,
       configuration: {
         ...(originalProfile?.configuration || {}),
+        base_url: customBaseUrl.trim() || undefined,
         temperature,
         is_default_llm: isDefaultLlm,
         is_default_embedding: isDefaultEmbedding,
@@ -697,7 +813,9 @@ export default function WorkspaceSettingsView({
             <span>Workspace Settings</span>
             <span>›</span>
             <span style={{ color: '#0f172a', fontWeight: 600 }}>
-              {activeSection === 'integrations'
+              {activeSection === 'memory_privacy'
+                ? 'Memory & Privacy'
+                : activeSection === 'integrations'
                 ? 'MCP Integrations'
                 : activeSection === 'rag_retrieval'
                 ? 'RAG Retrieval'
@@ -707,7 +825,9 @@ export default function WorkspaceSettingsView({
             </span>
           </div>
           <h1 style={{ fontSize: '20px', fontWeight: 700, margin: 0, color: '#0f172a' }}>
-            {activeSection === 'integrations'
+            {activeSection === 'memory_privacy'
+              ? 'Memory & Privacy Controls'
+              : activeSection === 'integrations'
               ? 'MCP Integrations'
               : activeSection === 'rag_retrieval'
               ? 'RAG Retrieval'
@@ -716,7 +836,9 @@ export default function WorkspaceSettingsView({
               : 'AI & Model Providers'}
           </h1>
           <p style={{ margin: '2px 0 0 0', fontSize: '13px', color: '#64748b' }}>
-            {activeSection === 'integrations'
+            {activeSection === 'memory_privacy'
+              ? `Manage conversational memory, autonomous dreaming, and privacy controls for ${workspace.name}.`
+              : activeSection === 'integrations'
               ? `Manage external MCP server connections and tools for ${workspace.name}.`
               : `Configure model providers, embeddings, reranking, and search services for ${workspace.name}.`}
           </p>
@@ -834,6 +956,7 @@ export default function WorkspaceSettingsView({
             { id: 'rag_retrieval', label: 'RAG & Retrieval', desc: 'Retrieval settings and sources', icon: BookIcon },
             { id: 'web_search', label: 'Web Search', desc: 'Web search providers', icon: SearchIcon },
             { id: 'integrations', label: 'Integrations', desc: 'Connect external tools (MCP/CRM)', icon: PlugIcon },
+            { id: 'memory_privacy', label: 'Memory & Privacy', desc: 'Autonomous memory, dreaming & retention', icon: BrainIcon },
             { id: 'security', label: 'Security', desc: 'Access control and permissions', icon: ShieldIcon },
             { id: 'usage_limits', label: 'Usage & Limits', desc: 'Resource quotas and tokens', icon: BarChartIcon },
             { id: 'advanced', label: 'Advanced', desc: 'Configuration exports & API', icon: ZapIcon },
@@ -919,7 +1042,192 @@ export default function WorkspaceSettingsView({
               isOwnerOrAdmin={isOwnerOrAdmin}
               onToast={onToast}
             />
-          ) : activeSection !== 'ai_providers' && activeSection !== 'rag_retrieval' && activeSection !== 'web_search' ? (
+          ) : activeSection === 'memory_privacy' ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', maxWidth: '880px' }}>
+              {/* Header Banner - Minimalist & Clean */}
+              <div
+                style={{
+                  background: '#FFFFFF',
+                  border: '1px solid #E2E8F0',
+                  borderRadius: '8px',
+                  padding: '20px 24px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '16px',
+                }}
+              >
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                    <h3 style={{ fontSize: '15px', fontWeight: 600, color: '#0F172A', margin: 0 }}>
+                      Intelligent Memory &amp; Autonomous Dreaming
+                    </h3>
+                    <span style={{ fontSize: '10.5px', fontWeight: 500, padding: '2px 7px', borderRadius: '4px', background: '#F1F5F9', color: '#475569' }}>
+                      Active
+                    </span>
+                  </div>
+                  <p style={{ fontSize: '12.5px', color: '#64748B', margin: 0, lineHeight: 1.5, maxWidth: '580px' }}>
+                    Conversational memory capture, background dreaming consolidation, living user profiles, and privacy lifecycle controls for workspace <strong>{workspace.name}</strong>.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                  <button
+                    type="button"
+                    onClick={() => setShowMemoryInspector(true)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      padding: '7px 14px',
+                      background: '#0F172A',
+                      color: '#FFFFFF',
+                      border: '1px solid #0F172A',
+                      borderRadius: '6px',
+                      fontSize: '12px',
+                      fontWeight: 500,
+                      cursor: 'pointer',
+                      transition: 'background 0.12s ease',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = '#1E293B'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = '#0F172A'; }}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.04z" />
+                      <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.04z" />
+                    </svg>
+                    <span>Execution Inspector</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowMemoryPrivacyModal(true)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      padding: '7px 14px',
+                      background: '#FFFFFF',
+                      color: '#334155',
+                      border: '1px solid #CBD5E1',
+                      borderRadius: '6px',
+                      fontSize: '12px',
+                      fontWeight: 500,
+                      cursor: 'pointer',
+                      transition: 'background 0.12s ease',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = '#F8FAFC'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = '#FFFFFF'; }}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                    </svg>
+                    <span>Privacy &amp; Retention</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Status and Capability Cards - Minimalist Clean Theme */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '14px' }}>
+                {/* Card 1: Automatic Memory Capture */}
+                <div style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', borderRadius: '8px', padding: '16px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                    <span style={{ fontSize: '13px', fontWeight: 600, color: '#0F172A' }}>Automatic Capture</span>
+                    <span style={{ fontSize: '11px', fontWeight: 500, color: '#166534', background: '#F0FDF4', padding: '1px 6px', borderRadius: '4px', border: '1px solid #BBF7D0' }}>Active</span>
+                  </div>
+                  <p style={{ fontSize: '12px', color: '#64748B', margin: '0 0 12px 0', lineHeight: 1.45 }}>
+                    Extracts durable preferences, work context, and procedures from normal conversations without requiring manual commands.
+                  </p>
+                  <div style={{ fontSize: '11px', color: '#475569', background: '#F8FAFC', border: '1px solid #F1F5F9', padding: '7px 10px', borderRadius: '6px' }}>
+                    Types: EPISODIC, SEMANTIC, PROCEDURAL, STATIC, DYNAMIC
+                  </div>
+                </div>
+
+                {/* Card 2: Autonomous Dreaming Engine */}
+                <div style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', borderRadius: '8px', padding: '16px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                    <span style={{ fontSize: '13px', fontWeight: 600, color: '#0F172A' }}>Dreaming &amp; Consolidation</span>
+                    <span style={{ fontSize: '11px', fontWeight: 500, color: '#334155', background: '#F8FAFC', padding: '1px 6px', borderRadius: '4px', border: '1px solid #E2E8F0' }}>Scheduled</span>
+                  </div>
+                  <p style={{ fontSize: '12px', color: '#64748B', margin: '0 0 12px 0', lineHeight: 1.45 }}>
+                    Consolidates qualifying memory clusters (threshold &ge; 3), resolves conflicts, and tracks temporal supersessions.
+                  </p>
+                  <div style={{ fontSize: '11px', color: '#475569', background: '#F8FAFC', border: '1px solid #F1F5F9', padding: '7px 10px', borderRadius: '6px' }}>
+                    Scheduler: Background cycle (every 60s)
+                  </div>
+                </div>
+
+                {/* Card 3: Privacy & Anti-Resurrection */}
+                <div style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', borderRadius: '8px', padding: '16px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                    <span style={{ fontSize: '13px', fontWeight: 600, color: '#0F172A' }}>Privacy &amp; Tombstones</span>
+                    <span style={{ fontSize: '11px', fontWeight: 500, color: '#0369A1', background: '#F0F9FF', padding: '1px 6px', borderRadius: '4px', border: '1px solid #BAE6FD' }}>Guaranteed</span>
+                  </div>
+                  <p style={{ fontSize: '12px', color: '#64748B', margin: '0 0 12px 0', lineHeight: 1.45 }}>
+                    Deleted memories create immutable tombstone keys preventing resurrection. Secrets and sensitive PII are skipped.
+                  </p>
+                  <div style={{ fontSize: '11px', color: '#475569', background: '#F8FAFC', border: '1px solid #F1F5F9', padding: '7px 10px', borderRadius: '6px' }}>
+                    Precedence: User &gt; Workspace &gt; System policy
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Banner for Slash Commands - Minimalist */}
+              <div
+                style={{
+                  background: '#F8FAFC',
+                  border: '1px solid #E2E8F0',
+                  borderRadius: '8px',
+                  padding: '14px 18px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                }}
+              >
+                <div>
+                  <h4 style={{ fontSize: '12.5px', fontWeight: 600, color: '#0F172A', margin: '0 0 2px 0' }}>
+                    Chat Slash Commands
+                  </h4>
+                  <p style={{ fontSize: '11.5px', color: '#64748B', margin: 0 }}>
+                    Type <code>/rem &lt;text&gt;</code>, <code>/memory</code>, or <code>/forget &lt;keyword&gt;</code> in chat to manage memories.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button
+                    type="button"
+                    onClick={() => setShowMemoryInspector(true)}
+                    style={{
+                      padding: '5px 12px',
+                      borderRadius: '5px',
+                      background: '#FFFFFF',
+                      color: '#0F172A',
+                      border: '1px solid #CBD5E1',
+                      fontSize: '11.5px',
+                      fontWeight: 500,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    View Graph &rarr;
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowMemoryPrivacyModal(true)}
+                    style={{
+                      padding: '5px 12px',
+                      borderRadius: '5px',
+                      background: '#FFFFFF',
+                      color: '#0F172A',
+                      border: '1px solid #CBD5E1',
+                      fontSize: '11.5px',
+                      fontWeight: 500,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    Retention Settings &rarr;
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : activeSection !== 'ai_providers' && activeSection !== 'rag_retrieval' && activeSection !== 'web_search' && activeSection !== 'memory_privacy' ? (
             /* Unfinished Sections Explicitly Marked */
             <div
               style={{
@@ -1081,6 +1389,18 @@ export default function WorkspaceSettingsView({
                         options={llmModelOptions}
                         disabled={!isOwnerOrAdmin}
                       />
+                      {llmProvider === 'custom' && (
+                        <div style={{ marginTop: '6px' }}>
+                          <input
+                            type="text"
+                            value={llmModel}
+                            onChange={(e) => setLlmModel(e.target.value)}
+                            placeholder="Custom model (e.g. mistral-large, qwen2.5:32b)"
+                            disabled={!isOwnerOrAdmin}
+                            style={{ width: '100%', padding: '6px 10px', borderRadius: '6px', border: '1px solid #e4e4e7', fontSize: '12px', background: '#ffffff', color: '#18181b' }}
+                          />
+                        </div>
+                      )}
                     </div>
 
                     <div>
@@ -1098,11 +1418,58 @@ export default function WorkspaceSettingsView({
                     </div>
                   </div>
 
+                  {/* Custom Base URL (For Custom / DeepSeek / OpenRouter / Local LLMs) */}
+                  {(llmProvider === 'custom' || llmProvider === 'deepseek' || llmProvider === 'openrouter') && (
+                    <div style={{ marginTop: '16px' }}>
+                      <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, color: '#52525b', marginBottom: '6px' }}>
+                        Base URL (OpenAI-Compatible API Endpoint)
+                      </label>
+                      <input
+                        type="text"
+                        value={customBaseUrl}
+                        onChange={(e) => setCustomBaseUrl(e.target.value)}
+                        placeholder={
+                          llmProvider === 'deepseek'
+                            ? 'https://api.deepseek.com'
+                            : llmProvider === 'openrouter'
+                            ? 'https://openrouter.ai/api/v1'
+                            : 'https://api.openai.com/v1 (or http://localhost:11434/v1 for Ollama)'
+                        }
+                        disabled={!isOwnerOrAdmin}
+                        style={{ width: '100%', padding: '8px 10px', borderRadius: '6px', border: '1px solid #e4e4e7', fontSize: '13px', background: '#ffffff', color: '#18181b' }}
+                      />
+                      <div style={{ fontSize: '11px', color: '#71717a', marginTop: '4px' }}>
+                        Universal endpoint compatible with DeepSeek, OpenRouter, Mistral, Together AI, Ollama, vLLM, LM Studio, etc.
+                      </div>
+                    </div>
+                  )}
+
                   {/* LLM Environment Variable Reference */}
                   <div style={{ marginTop: '16px' }}>
-                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, color: '#52525b', marginBottom: '6px' }}>
-                      Environment variable name
-                    </label>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                      <label style={{ fontSize: '12px', fontWeight: 500, color: '#52525b' }}>
+                        Environment variable name
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setShowDirectKeyInput(!showDirectKeyInput)}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          color: '#0284c7',
+                          fontSize: '11.5px',
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '4px',
+                        }}
+                      >
+                        <span>🔑</span>
+                        <span>{showDirectKeyInput ? 'Hide key input' : 'Enter / Paste API Key directly'}</span>
+                      </button>
+                    </div>
+
                     <input
                       type="text"
                       value={llmCredRef}
@@ -1112,8 +1479,53 @@ export default function WorkspaceSettingsView({
                       style={{ width: '100%', padding: '8px 10px', borderRadius: '6px', border: '1px solid #e4e4e7', fontSize: '13px', background: '#ffffff', color: '#18181b' }}
                     />
                     <div style={{ fontSize: '11px', color: '#71717a', marginTop: '4px' }}>
-                      Enter the name of a server-side environment variable (e.g. <code style={{ background: '#f4f4f5', padding: '1px 4px', borderRadius: '3px' }}>OPENAI_API_KEY</code> / <code style={{ background: '#f4f4f5', padding: '1px 4px', borderRadius: '3px' }}>GROQ_API_KEY</code>). Leave blank to use server default. Do not enter raw API keys.
+                      Server-side environment variable name. Or click <strong>Enter / Paste API Key directly</strong> above to save directly from UI.
                     </div>
+
+                    {/* Direct API Key Drawer */}
+                    {showDirectKeyInput && (
+                      <div style={{ marginTop: '10px', padding: '12px', borderRadius: '8px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                        <div style={{ fontSize: '12px', fontWeight: 600, color: '#1e293b', marginBottom: '6px' }}>
+                          Paste {llmProvider.toUpperCase()} API Key
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          <input
+                            type="password"
+                            value={directApiKey}
+                            onChange={(e) => setDirectApiKey(e.target.value)}
+                            placeholder="Paste raw API key (e.g. sk-... / gsk_...)"
+                            disabled={!isOwnerOrAdmin || savingDirectKey}
+                            style={{ flex: 1, padding: '7px 10px', borderRadius: '6px', border: '1px solid #cbd5e1', fontSize: '12px', background: '#ffffff' }}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleSaveDirectApiKey('llm')}
+                            disabled={!isOwnerOrAdmin || savingDirectKey || !directApiKey.trim()}
+                            style={{
+                              padding: '7px 14px',
+                              borderRadius: '6px',
+                              border: 'none',
+                              background: '#0284c7',
+                              color: '#ffffff',
+                              fontSize: '12px',
+                              fontWeight: 600,
+                              cursor: savingDirectKey || !directApiKey.trim() ? 'not-allowed' : 'pointer',
+                              opacity: savingDirectKey || !directApiKey.trim() ? 0.6 : 1,
+                            }}
+                          >
+                            {savingDirectKey ? 'Saving…' : 'Save Key'}
+                          </button>
+                        </div>
+                        {directKeyFeedback && (
+                          <div style={{ fontSize: '11px', marginTop: '6px', color: directKeyFeedback.type === 'success' ? '#15803d' : '#b91c1c' }}>
+                            {directKeyFeedback.message}
+                          </div>
+                        )}
+                        <div style={{ fontSize: '10.5px', color: '#64748b', marginTop: '6px' }}>
+                          Key is securely written to server environment and bound to this workspace. Raw keys are never stored unmasked in the database.
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #f4f4f5' }}>
@@ -1210,12 +1622,17 @@ export default function WorkspaceSettingsView({
                     </div>
 
                     <div>
-                      <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, color: '#52525b', marginBottom: '6px' }}>Model</label>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                        <label style={{ fontSize: '12px', fontWeight: 500, color: '#52525b' }}>Model</label>
+                        <span style={{ fontSize: '10px', fontWeight: 600, color: '#d97706', background: '#fef3c7', padding: '1px 6px', borderRadius: '4px' }}>
+                          Index-Bound (384 dim)
+                        </span>
+                      </div>
                       <CustomDropdown
                         value={embeddingModel}
                         onChange={(val) => setEmbeddingModel(val)}
                         options={embeddingModelOptions}
-                        disabled={!isOwnerOrAdmin}
+                        disabled={true}
                       />
                     </div>
                   </div>
@@ -1223,19 +1640,23 @@ export default function WorkspaceSettingsView({
                   <div
                     style={{
                       marginTop: '14px',
-                      padding: '10px 14px',
-                      background: '#fafafa',
-                      border: '1px solid #e4e4e7',
+                      padding: '12px 14px',
+                      background: '#FFFBEB',
+                      border: '1px solid #FDE68A',
                       borderRadius: '6px',
                       fontSize: '12px',
-                      color: '#52525b',
+                      color: '#92400E',
                       display: 'flex',
-                      alignItems: 'center',
+                      alignItems: 'flex-start',
                       gap: '8px',
+                      lineHeight: '1.5',
                     }}
                   >
-                    <ShieldIcon size={14} color="#71717a" style={{ flexShrink: 0 }} />
-                    <span>This model runs locally in-process. 384-dimension vector requirement is enforced by the pgvector schema.</span>
+                    <ShieldIcon size={16} color="#B45309" style={{ flexShrink: 0, marginTop: '2px' }} />
+                    <div>
+                      <strong>Index-Bound Invariant:</strong> The document chunks in this workspace are indexed using 384-dimensional vectors in PostgreSQL pgvector.
+                      Switching to an incompatible model or dimension crashes the database, and changing weights corrupts similarity distance. Any model switch requires an offline re-embedding migration.
+                    </div>
                   </div>
 
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #f4f4f5' }}>
@@ -1568,9 +1989,30 @@ export default function WorkspaceSettingsView({
 
                     {/* Web Search Environment Variable Reference */}
                     <div style={{ marginTop: '12px' }}>
-                      <label style={{ display: 'block', fontSize: '11.5px', fontWeight: 500, color: '#52525b', marginBottom: '5px' }}>
-                        Environment variable name
-                      </label>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '5px' }}>
+                        <label style={{ fontSize: '11.5px', fontWeight: 500, color: '#52525b' }}>
+                          Environment variable name
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => setShowWebDirectKeyInput(!showWebDirectKeyInput)}
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            color: '#0284c7',
+                            fontSize: '11px',
+                            fontWeight: 600,
+                            cursor: 'pointer',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                          }}
+                        >
+                          <span>🔑</span>
+                          <span>{showWebDirectKeyInput ? 'Hide key input' : 'Enter / Paste API Key directly'}</span>
+                        </button>
+                      </div>
+
                       <input
                         type="text"
                         value={webCredRef}
@@ -1580,8 +2022,50 @@ export default function WorkspaceSettingsView({
                         style={{ width: '100%', padding: '7px 10px', borderRadius: '6px', border: '1px solid #e4e4e7', fontSize: '12.5px', background: '#ffffff', color: '#18181b' }}
                       />
                       <div style={{ fontSize: '10.5px', color: '#71717a', marginTop: '4px' }}>
-                        Enter the name of a server-side environment variable (e.g. <code style={{ background: '#f4f4f5', padding: '1px 4px', borderRadius: '3px' }}>TINYFISH_PROD_KEY</code>). Leave blank to inherit server default (<code style={{ background: '#f4f4f5', padding: '1px 4px', borderRadius: '3px' }}>TINYFISH_API_KEY</code> / <code style={{ background: '#f4f4f5', padding: '1px 4px', borderRadius: '3px' }}>TAVILY_API_KEY</code>). Do not enter raw API keys.
+                        Enter server environment variable name (e.g. <code style={{ background: '#f4f4f5', padding: '1px 4px', borderRadius: '3px' }}>TINYFISH_API_KEY</code> / <code style={{ background: '#f4f4f5', padding: '1px 4px', borderRadius: '3px' }}>TAVILY_API_KEY</code>). Or paste key directly above.
                       </div>
+
+                      {/* Web Direct Key Drawer */}
+                      {showWebDirectKeyInput && (
+                        <div style={{ marginTop: '8px', padding: '10px', borderRadius: '6px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                          <div style={{ fontSize: '11.5px', fontWeight: 600, color: '#1e293b', marginBottom: '5px' }}>
+                            Paste {webProvider.toUpperCase()} API Key
+                          </div>
+                          <div style={{ display: 'flex', gap: '8px' }}>
+                            <input
+                              type="password"
+                              value={directWebApiKey}
+                              onChange={(e) => setDirectWebApiKey(e.target.value)}
+                              placeholder={`Paste raw ${webProvider} key (e.g. tvly-...)`}
+                              disabled={!isOwnerOrAdmin || savingWebDirectKey}
+                              style={{ flex: 1, padding: '6px 8px', borderRadius: '5px', border: '1px solid #cbd5e1', fontSize: '11.5px', background: '#ffffff' }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleSaveDirectApiKey('web')}
+                              disabled={!isOwnerOrAdmin || savingWebDirectKey || !directWebApiKey.trim()}
+                              style={{
+                                padding: '6px 12px',
+                                borderRadius: '5px',
+                                border: 'none',
+                                background: '#0284c7',
+                                color: '#ffffff',
+                                fontSize: '11.5px',
+                                fontWeight: 600,
+                                cursor: savingWebDirectKey || !directWebApiKey.trim() ? 'not-allowed' : 'pointer',
+                                opacity: savingWebDirectKey || !directWebApiKey.trim() ? 0.6 : 1,
+                              }}
+                            >
+                              {savingWebDirectKey ? 'Saving…' : 'Save Key'}
+                            </button>
+                          </div>
+                          {webDirectKeyFeedback && (
+                            <div style={{ fontSize: '10.5px', marginTop: '4px', color: webDirectKeyFeedback.type === 'success' ? '#15803d' : '#b91c1c' }}>
+                              {webDirectKeyFeedback.message}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -1946,6 +2430,19 @@ export default function WorkspaceSettingsView({
           </div>
         </div>
       )}
+
+      {/* Memory & Privacy Modals */}
+      <MemoryPrivacyModal
+        isOpen={showMemoryPrivacyModal}
+        onClose={() => setShowMemoryPrivacyModal(false)}
+        token={token}
+        workspaceId={workspace.id}
+      />
+      <MemoryExecutionInspector
+        isOpen={showMemoryInspector}
+        onClose={() => setShowMemoryInspector(false)}
+        token={token}
+      />
     </div>
   );
 }

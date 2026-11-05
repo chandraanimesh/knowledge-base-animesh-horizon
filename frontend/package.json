@@ -7,10 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/slash_commands.test.ts src/upload_queue.test.ts src/source_cards.test.ts src/workspace_settings.test.ts src/workspace_mcp_connections.test.ts",
+    "test": "node --experimental-strip-types --test src/slash_commands.test.ts src/upload_queue.test.ts src/source_cards.test.ts src/workspace_settings.test.ts src/workspace_mcp_connections.test.ts src/chunk_history.test.ts src/quality_evidence.test.ts src/workflow_studio.test.ts src/milestone10h.test.ts",
     "format": "oxfmt"
   },
   "dependencies": {
+    "@xyflow/react": "^12.12.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.18.4"

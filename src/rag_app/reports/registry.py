@@ -4,6 +4,7 @@ from rag_app.reports.base import BaseArtifactRenderer
 from rag_app.reports.csv_renderer import CSVRenderer
 from rag_app.reports.docx_renderer import DOCXRenderer
 from rag_app.reports.json_renderer import JSONRenderer
+from rag_app.reports.md_renderer import MDRenderer
 from rag_app.reports.pdf_renderer import PDFRenderer
 from rag_app.schemas.artifacts import DownloadableArtifactFormat
 
@@ -15,6 +16,7 @@ class RendererRegistry:
             DownloadableArtifactFormat.JSON: JSONRenderer(),
             DownloadableArtifactFormat.PDF: PDFRenderer(),
             DownloadableArtifactFormat.DOCX: DOCXRenderer(),
+            DownloadableArtifactFormat.MD: MDRenderer(),
         }
 
     def get_renderer(self, fmt: DownloadableArtifactFormat | str) -> BaseArtifactRenderer:

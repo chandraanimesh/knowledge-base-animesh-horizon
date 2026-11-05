@@ -15,6 +15,7 @@ class DownloadableArtifactFormat(StrEnum):
     CSV = "csv"    # RFC 4180 compliant comma-separated values
     DOCX = "docx"  # Formatted Word document (python-docx)
     JSON = "json"  # Standalone raw JSON file
+    MD = "md"      # GitHub Flavored Markdown file
 
 
 class OutputPreferences(BaseModel):
@@ -133,3 +134,33 @@ class ArtifactMetadata(BaseModel):
     expires_at: datetime | None = None
     is_expired: bool = False
     error: str | None = None
+
+
+class ArtifactPreviewResponse(BaseModel):
+    """Authenticated preview payload for execution and report artifacts."""
+    artifact_id: uuid.UUID
+    title: str
+    format: str
+    mime_type: str
+    content: str
+    byte_size: int
+    checksum_sha256: str
+    is_truncated: bool = False
+    is_binary: bool = False
+    expires_at: datetime | None = None
+
+
+
+class ArtifactPreviewResponse(BaseModel):
+    """Authenticated preview payload for execution and report artifacts."""
+    artifact_id: uuid.UUID
+    title: str
+    format: str
+    mime_type: str
+    content: str
+    byte_size: int
+    checksum_sha256: str
+    is_truncated: bool = False
+    is_binary: bool = False
+    expires_at: datetime | None = None
+

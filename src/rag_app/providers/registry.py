@@ -158,11 +158,23 @@ class ProviderRegistry:
             self.register("vector_store", "postgresql", _vector_store_factory)
             self._defaults["vector_store"] = "pgvector"
 
-        # Additional LLM & Reranker aliases for UI parity
+        # OpenAI & Universal OpenAI-Compatible Adapters (DeepSeek, OpenRouter, Ollama, etc.)
+        def _openai_factory(model: str | None = None, api_key: str | None = None, base_url: str | None = None, **kw: Any):
+            from rag_app.providers.adapters.llm.openai import OpenAILLMAdapter
+            return OpenAILLMAdapter(model=model, api_key=api_key, base_url=base_url, **kw)
+
+        for p in ("openai", "custom", "openai_compatible"):
+            self.register("llm", p, _openai_factory)
+
+        self.register("llm", "deepseek", lambda **kw: _openai_factory(base_url=kw.pop("base_url", "https://api.deepseek.com"), **kw))
+        self.register("llm", "openrouter", lambda **kw: _openai_factory(base_url=kw.pop("base_url", "https://openrouter.ai/api/v1"), **kw))
+        self.register("llm", "ollama", lambda **kw: _openai_factory(base_url=kw.pop("base_url", "http://localhost:11434/v1"), **kw))
+
+        # Stubs for other vendors
         def _unsupported_stub(**kw: Any):
             raise NotImplementedError("Provider requires external API credentials.")
 
-        for p in ("openai", "anthropic", "gemini"):
+        for p in ("anthropic", "gemini"):
             if p not in self._factories.get("llm", {}):
                 self.register("llm", p, _unsupported_stub)
 

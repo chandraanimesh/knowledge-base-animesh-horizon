@@ -82,15 +82,23 @@ class DAGExecutionEngine:
         self.task_results: dict[str, TaskExecutionResult] = {}
         self.task_fencing_tokens: dict[str, int] = {}
         self.db_task_records: dict[str, WorkflowTask] = {}
+        self.execution_context: dict[str, Any] = {}
         self._lock = asyncio.Lock()
         self._db_lock = asyncio.Lock()
 
     def _register_default_handlers(self) -> None:
-        self.task_handlers[TaskType.RETRIEVAL.value] = self._handle_retrieval
-        self.task_handlers[TaskType.WEB_SEARCH.value] = self._handle_web_search
-        self.task_handlers[TaskType.EXTRACTION.value] = self._handle_extraction
-        self.task_handlers[TaskType.GROUNDING.value] = self._handle_grounding
-        self.task_handlers[TaskType.SYNTHESIS.value] = self._handle_synthesis
+        try:
+            from rag_app.orchestration.action_registry import get_action_registry
+            registry = get_action_registry()
+            handlers = registry.to_task_handlers(engine=self)
+            self.task_handlers.update(handlers)
+        except Exception as exc:
+            logger.warning("Could not initialize handlers from action registry: %s", exc)
+            self.task_handlers[TaskType.RETRIEVAL.value] = self._handle_retrieval
+            self.task_handlers[TaskType.WEB_SEARCH.value] = self._handle_web_search
+            self.task_handlers[TaskType.EXTRACTION.value] = self._handle_extraction
+            self.task_handlers[TaskType.GROUNDING.value] = self._handle_grounding
+            self.task_handlers[TaskType.SYNTHESIS.value] = self._handle_synthesis
 
     def register_handler(self, task_type: str, handler: TaskHandler) -> None:
         self.task_handlers[task_type] = handler
@@ -99,10 +107,31 @@ class DAGExecutionEngine:
         self,
         plan: AdaptiveTaskPlan,
         run: WorkflowRun,
+        context: Optional[dict[str, Any]] = None,
     ) -> dict[str, TaskExecutionResult]:
         """
         Executes the validated DAG plan while tracking dependencies and persisting state.
         """
+        # 0. Initialize execution context for variable resolution
+        self.execution_context = dict(context or {})
+        if "trigger" not in self.execution_context and getattr(plan, "metadata", None):
+            self.execution_context["trigger"] = plan.metadata.get("trigger_payload", {})
+        if "run" not in self.execution_context:
+            self.execution_context["run"] = {
+                "id": str(getattr(run, "id", "")),
+                "workspace_id": str(getattr(run, "workspace_id", None)),
+                "workflow_id": str(getattr(run, "workflow_id", None)),
+                "workflow_version_id": str(getattr(run, "workflow_version_id", None)),
+            }
+
+        # 0.1 Phase 5E.1: Safe one-time compatibility snapshot for active legacy runs without provider_snapshot
+        if self.session is not None and getattr(run, "provider_snapshot", None) is None:
+            try:
+                from rag_app.orchestration.runtime_snapshot import ensure_run_runtime_snapshot
+                await ensure_run_runtime_snapshot(run, self.session)
+            except Exception as exc:
+                logger.warning("Failed to evaluate one-time compatibility snapshot for run %s: %s", getattr(run, "id", "unknown"), exc)
+
         # 1. Deterministic plan validation
         validation = validate_task_dag(
             plan,
@@ -234,13 +263,43 @@ class DAGExecutionEngine:
                         if any(dep in failed_or_skipped_keys for dep in deps):
                             logger.warning(f"Task '{key}' skipped due to failed prerequisite.")
                             self.task_states[key] = WorkflowTaskStatus.SKIPPED
+                            self.task_results[key] = TaskExecutionResult(
+                                task_key=key,
+                                status=WorkflowTaskStatus.SKIPPED,
+                                output_result={"status": "skipped", "reason": "prerequisite_failed_or_skipped"},
+                            )
                             failed_or_skipped_keys.add(key)
                             if self.session is not None and key in self.db_task_records:
                                 await self._persist_task_skipped(self.db_task_records[key].id)
                         # Check if all dependencies completed successfully
                         elif all(dep in completed_keys for dep in deps):
-                            self.task_states[key] = WorkflowTaskStatus.READY
-                            ready_keys.append(key)
+                            # Check if task is conditional on an upstream IF_ELSE branch
+                            task_item = task_map[key]
+                            branch_cond = task_item.input_payload.get("execute_if_branch")
+                            should_skip = False
+                            if branch_cond and isinstance(branch_cond, dict):
+                                source_step = branch_cond.get("step_id")
+                                expected_branch = branch_cond.get("branch")
+                                if source_step and expected_branch:
+                                    step_ctx = self.execution_context.get(source_step, {})
+                                    actual_branch = step_ctx.get("output", {}).get("branch")
+                                    if actual_branch is not None and str(actual_branch) != str(expected_branch):
+                                        should_skip = True
+
+                            if should_skip:
+                                logger.info(f"Task '{key}' skipped due to branch condition not met.")
+                                self.task_states[key] = WorkflowTaskStatus.SKIPPED
+                                self.task_results[key] = TaskExecutionResult(
+                                    task_key=key,
+                                    status=WorkflowTaskStatus.SKIPPED,
+                                    output_result={"status": "skipped", "reason": "branch_condition_not_met"},
+                                )
+                                failed_or_skipped_keys.add(key)
+                                if self.session is not None and key in self.db_task_records:
+                                    await self._persist_task_skipped(self.db_task_records[key].id)
+                            else:
+                                self.task_states[key] = WorkflowTaskStatus.READY
+                                ready_keys.append(key)
 
             # If no tasks are running and no new tasks are ready, we are blocked/finished
             if not ready_keys and not running_tasks:
@@ -305,24 +364,49 @@ class DAGExecutionEngine:
             actual_tokens = 0
             actual_calls = 0
             try:
+                # 2.5 Safe Variable Resolution on input_payload
+                resolved_payload = task.input_payload
+                try:
+                    from rag_app.orchestration.variable_resolver import resolve_variables
+                    resolved_payload = resolve_variables(task.input_payload, self.execution_context)
+                except Exception as var_exc:
+                    logger.error("Variable resolution failed for task '%s': %s", task.task_key, var_exc)
+                    await self._release_reserved_budget(
+                        run_id=run.id,
+                        est_tokens=task.estimated_tokens,
+                        est_calls=task.estimated_provider_calls,
+                    )
+                    await self._fail_task(task, f"Variable resolution failed: {var_exc}", fencing_token)
+                    async with self._lock:
+                        self.task_states[task.task_key] = WorkflowTaskStatus.FAILED
+
+                    return TaskExecutionResult(
+                        task_key=task.task_key,
+                        status=WorkflowTaskStatus.FAILED,
+                        error_message=f"Variable resolution failed: {var_exc}",
+                        fencing_token=fencing_token,
+                    )
+
+                task_to_execute = task.model_copy(update={"input_payload": resolved_payload})
+
                 # 3. Dispatch task to registered handler or default runner
-                task_type_str = task.task_type.value if hasattr(task.task_type, "value") else str(task.task_type)
+                task_type_str = task_to_execute.task_type.value if hasattr(task_to_execute.task_type, "value") else str(task_to_execute.task_type)
                 handler = self.task_handlers.get(task_type_str)
                 if handler:
                     result = await asyncio.wait_for(
-                        handler(task, self.session, run),
-                        timeout=task.timeout_seconds,
+                        handler(task_to_execute, self.session, run),
+                        timeout=task_to_execute.timeout_seconds,
                     )
                 else:
                     # Default generic handler (e.g. read-only extraction / MCP / mock)
-                    result = await self._default_task_execution(task, run=run)
+                    result = await self._default_task_execution(task_to_execute, run=run)
 
                 actual_tokens = result.tokens_spent
                 actual_calls = result.provider_calls_spent
 
                 # 4. Fencing token check & persistence on completion
                 await self._complete_task(
-                    task=task,
+                    task=task_to_execute,
                     result=result,
                     fencing_token=fencing_token,
                 )
@@ -338,6 +422,11 @@ class DAGExecutionEngine:
 
                 async with self._lock:
                     self.task_states[task.task_key] = WorkflowTaskStatus.COMPLETED
+                    self.execution_context[task.task_key] = {
+                        "output": result.output_result or {},
+                        "status": result.status.value,
+                        "evidence": [ev.model_dump() for ev in result.evidence_items],
+                    }
                 result.fencing_token = fencing_token
                 return result
 

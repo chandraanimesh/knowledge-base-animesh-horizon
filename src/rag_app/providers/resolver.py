@@ -103,8 +103,30 @@ async def resolve_providers_for_workspace(
         # Prepare profile kwargs (e.g. model)
         kwargs: dict[str, Any] = {}
         if profile is not None:
-            if capability == "llm" and profile.llm_model:
-                kwargs["model"] = profile.llm_model
+            if capability == "llm":
+                if profile.llm_model:
+                    kwargs["model"] = profile.llm_model
+                if profile.configuration and isinstance(profile.configuration, dict):
+                    if profile.configuration.get("base_url"):
+                        kwargs["base_url"] = profile.configuration["base_url"]
+                    if profile.configuration.get("temperature") is not None:
+                        kwargs["temperature"] = float(profile.configuration["temperature"])
+
+                import os
+                api_key = None
+                if profile.llm_credential_ref:
+                    api_key = os.getenv(profile.llm_credential_ref)
+                if not api_key:
+                    if provider_name in ("openai", "custom", "openai_compatible"):
+                        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("CUSTOM_LLM_API_KEY")
+                    elif provider_name == "deepseek":
+                        api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+                    elif provider_name == "openrouter":
+                        api_key = os.getenv("OPENROUTER_API_KEY")
+                    elif provider_name == "groq":
+                        api_key = os.getenv("GROQ_API_KEY")
+                if api_key:
+                    kwargs["api_key"] = api_key
             elif capability == "embedding" and profile.embedding_model:
                 kwargs["model_name"] = profile.embedding_model
             elif capability == "reranker" and profile.reranker_model:

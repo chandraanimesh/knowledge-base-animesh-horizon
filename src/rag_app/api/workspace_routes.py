@@ -19,6 +19,8 @@ from rag_app.schemas.workspace import (
     ProviderRegistrySummary,
     ProviderTestConnectionRequest,
     ProviderTestConnectionResponse,
+    WorkspaceApiKeySetRequest,
+    WorkspaceApiKeySetResponse,
 )
 from rag_app.workspace.service import WorkspaceService
 
@@ -212,6 +214,26 @@ async def test_workspace_provider_connection(
 ) -> ProviderTestConnectionResponse:
     service = WorkspaceService(session)
     return await service.test_provider_connection(user, workspace_id, payload)
+
+
+@router.post(
+    "/{workspace_id}/set-api-key",
+    response_model=WorkspaceApiKeySetResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Securely configure provider API key on server",
+    description=(
+        "Saves an API key directly into server environment without manual .env edits. "
+        "Binds credential_ref securely for the workspace. Requires workspace OWNER or ADMIN."
+    ),
+)
+async def set_workspace_api_key(
+    workspace_id: uuid.UUID,
+    payload: WorkspaceApiKeySetRequest,
+    user: CurrentUser,
+    session: DbSession,
+) -> WorkspaceApiKeySetResponse:
+    service = WorkspaceService(session)
+    return await service.set_workspace_api_key(user, workspace_id, payload)
 
 
 # ------------------------------------------------------------------

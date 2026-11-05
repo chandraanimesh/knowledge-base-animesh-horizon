@@ -23,12 +23,31 @@ async def create_memory_job(
     workspace_id: Optional[uuid.UUID] = None,
     source_message_id: Optional[uuid.UUID] = None,
     conversation_id: Optional[uuid.UUID] = None,
-) -> MemoryProcessingJob:
+) -> Optional[MemoryProcessingJob]:
     """
     Creates a durable memory evaluation job / outbox record.
     Idempotent per (source_message_id, trigger_kind) when source_message_id is present.
     Uses PostgreSQL savepoints and unique constraint to safely resolve concurrent insertions.
+    Checks memory privacy policy: If collection is disabled/paused, drops job creation.
     """
+    from rag_app.memory.privacy_service import MemoryPrivacyService
+
+    is_enabled = await MemoryPrivacyService.is_collection_enabled(
+        session=session,
+        user_id=owner_user_id,
+        workspace_id=workspace_id,
+    )
+    if not is_enabled:
+        logger.info(
+            "skipped_memory_job_creation_policy_paused",
+            extra={
+                "event": "skipped_memory_job_creation_policy_paused",
+                "user_id": str(owner_user_id),
+                "workspace_id": str(workspace_id) if workspace_id else None,
+            },
+        )
+        return None
+
     stmt = None
     if source_message_id is not None:
         stmt = (
@@ -113,6 +132,21 @@ async def execute_memory_job(
     await session.flush()
 
     try:
+        from rag_app.memory.privacy_service import MemoryPrivacyService
+        is_extract_enabled = await MemoryPrivacyService.is_extraction_enabled(
+            session=session,
+            user_id=job.owner_user_id,
+            workspace_id=job.workspace_id,
+        )
+        if not is_extract_enabled:
+            job.status = JobStatus.SKIPPED_POLICY_PAUSED.value
+            job.error_message = "Memory extraction skipped: collection or extraction paused by privacy policy"
+            job.processed_at = now
+            job.locked_at = None
+            job.locked_by = None
+            await session.flush()
+            return JobStatus.SKIPPED_POLICY_PAUSED, [], job.error_message
+
         text_content = job.source_text_snapshot.strip()
         materialized_items: list[MemoryItem] = []
 
@@ -234,6 +268,66 @@ async def execute_memory_job(
             job.locked_by = None
             await session.flush()
             return JobStatus.SKIPPED_NOT_MEMORABLE, [], job.error_message
+
+        # Milestone 9C: Relationship analysis & linking (Deduplication, Conflicts, Complements)
+        try:
+            from rag_app.memory.consolidation import MemoryConsolidationService
+            for rec in materialized_items:
+                # 1. Duplicates
+                dups = await MemoryConsolidationService.detect_duplicates(
+                    session=session,
+                    user_id=job.owner_user_id,
+                    content=rec.content,
+                    embedding=rec.embedding,
+                    exclude_id=rec.id,
+                )
+                for dup_item, score, reason in dups:
+                    await MemoryConsolidationService.record_relationship(
+                        session=session,
+                        source_memory_id=dup_item.id,
+                        target_memory_id=rec.id,
+                        relationship_type="DUPLICATE",
+                        confidence=score,
+                        reason=reason,
+                    )
+
+                # 2. Conflicts
+                conflicts = await MemoryConsolidationService.detect_conflicts(
+                    session=session,
+                    user_id=job.owner_user_id,
+                    content=rec.content,
+                    canonical_key=rec.canonical_key,
+                    exclude_id=rec.id,
+                )
+                for conf_item, reason in conflicts:
+                    await MemoryConsolidationService.record_relationship(
+                        session=session,
+                        source_memory_id=conf_item.id,
+                        target_memory_id=rec.id,
+                        relationship_type="CONTRADICTS",
+                        confidence=0.9,
+                        reason=reason,
+                    )
+
+                # 3. Complements
+                comps = await MemoryConsolidationService.detect_complements(
+                    session=session,
+                    user_id=job.owner_user_id,
+                    content=rec.content,
+                    canonical_key=rec.canonical_key,
+                    exclude_id=rec.id,
+                )
+                for comp_item, reason in comps:
+                    await MemoryConsolidationService.record_relationship(
+                        session=session,
+                        source_memory_id=comp_item.id,
+                        target_memory_id=rec.id,
+                        relationship_type="COMPLEMENTS",
+                        confidence=0.85,
+                        reason=reason,
+                    )
+        except Exception as link_err:
+            logger.warning(f"Memory relationship linking skipped: {link_err}")
 
         job.status = JobStatus.SUCCEEDED.value
         job.processed_at = datetime.now(timezone.utc)

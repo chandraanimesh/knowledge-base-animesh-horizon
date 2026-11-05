@@ -15,6 +15,91 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    networks:
+      - rag_network
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: production-rag-backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rag:rag@postgres:5432/ragdb
+      POSTGRES_PORT: 5432
+      SECRET_KEY: ${SECRET_KEY:-enterprise_rag_secret_key_change_in_production_12345}
+      JWT_SECRET: ${JWT_SECRET:-enterprise_rag_jwt_secret_key_change_in_production_12345}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      TINYFISH_API_KEY: ${TINYFISH_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - rag_artifacts:/app/storage/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - rag_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: production-rag-frontend
+    ports:
+      - "8443:80"
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - rag_network
+
+  twenty-worker:
+    image: twentycrm/twenty:v2.45.0
+    container_name: twenty-worker-1
+    profiles:
+      - crm
+    command: ["node", "dist/queue-worker/queue-worker"]
+    environment:
+      PG_DATABASE_URL: postgres://postgres:d1d587623025ce4b37b6039389f04e2e95a08b8226895ccbf82feeb9abe42597@db:5432/default
+      REDIS_URL: redis://redis:6379
+      SERVER_URL: http://twenty-server-1:3000
+      STORAGE_TYPE: local
+      DISABLE_DB_MIGRATIONS: "true"
+      DISABLE_CRON_JOBS_REGISTRATION: "true"
+      NODE_ENV: production
+      APP_SECRET: "nu22xnmR/m3whAzzGT/wyr3y/D7YA8HQtfrEebIsk74="
+      ENCRYPTION_KEY: "DBTuIqswwLRb1vjYdicFDLMw6iwNPwwOj7uCd6EnWpE="
+      OUTBOUND_HTTP_ALLOWED_INTERNAL_HOSTS: "host.docker.internal"
+    networks:
+      - twenty_default
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'dist/queue-worker' && nc -z -w 2 redis 6379 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   rag_pg_data:
+  rag_artifacts:
+
+networks:
+  rag_network:
+    driver: bridge
+  twenty_default:
+    external: true

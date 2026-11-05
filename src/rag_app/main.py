@@ -28,8 +28,35 @@ mcp_http_app = get_mcp_asgi_app(transport="streamable-http", path="/")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     bm25 = GlobalBM25Index.get_instance()
-    async with AsyncSessionLocal() as session:
-        await bm25.build(session)
+    try:
+        async with AsyncSessionLocal() as session:
+            await bm25.build(session)
+    except Exception as bm25_err:
+        is_prod = getattr(settings, "env", "dev").lower() in ("prod", "production")
+        is_test_env = (
+            getattr(settings, "env", "").lower() in ("test", "testing")
+            or "test" in str(getattr(settings, "database_url", "")).lower()
+        )
+        if is_prod:
+            logger.critical(
+                "Fatal: BM25 index initialization failed in production schema: %s",
+                bm25_err,
+                exc_info=True,
+            )
+            raise RuntimeError(
+                f"Production startup aborted: BM25 index initialization failed: {bm25_err}"
+            ) from bm25_err
+        elif is_test_env:
+            logger.warning(
+                "Gracefully tolerating missing or uninitialized BM25 index in test/disposable environment: %s",
+                bm25_err,
+            )
+        else:
+            logger.error(
+                "BM25 index build failed during startup (check database migrations / schema): %s",
+                bm25_err,
+                exc_info=True,
+            )
 
     from rag_app.research.registry import get_provider_registry, DuplicateProviderError
     from rag_app.research.providers.firecrawl import FirecrawlProvider
@@ -56,7 +83,7 @@ async def lifespan(app: FastAPI):
         pass
 
     from rag_app.knowledge.scheduler import get_reconciliation_scheduler
-    reconciliation_scheduler = get_reconciliation_scheduler()
+    reconciliation_scheduler = get_reconciliation_scheduler(interval_seconds=settings.scheduler_interval_seconds)
     try:
         await reconciliation_scheduler.start()
         logger.info("Durable reconciliation scheduler started successfully.")
@@ -166,7 +193,14 @@ from rag_app.api.connection_routes import router as connection_router
 from rag_app.api.crm_routes import router as crm_router
 from rag_app.api.artifact_routes import router as artifact_router
 from rag_app.api.workflow_routes import router as workflow_router
+from rag_app.api.workflow_definition_routes import router as workflow_definition_router
+from rag_app.api.workflow_trigger_routes import router as workflow_trigger_router
 from rag_app.api.workspace_mcp_routes import router as workspace_mcp_router
+from rag_app.api.chunk_curation_routes import router as chunk_curation_router
+from rag_app.api.document_note_routes import router as document_note_router
+from rag_app.api.streaming_routes import router as streaming_router
+from rag_app.api.registration_routes import router as registration_router
+from rag_app.api.living_article_routes import router as living_article_router
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(doc_admin_router)
@@ -179,10 +213,20 @@ app.include_router(knowledge_router)
 app.include_router(connection_router)
 app.include_router(crm_router)
 app.include_router(memory_router)
+app.include_router(memory_router, prefix="/api")
+app.include_router(memory_router, prefix="/api/v1")
 app.include_router(task_router)
 app.include_router(artifact_router)
 app.include_router(artifact_router, prefix="/api")
 app.include_router(workflow_router)
+app.include_router(workflow_definition_router)
+app.include_router(workflow_trigger_router)
+app.include_router(chunk_curation_router)
+app.include_router(chunk_curation_router, prefix="/api/v1")
+app.include_router(document_note_router)
+app.include_router(streaming_router)
+app.include_router(registration_router)
+app.include_router(living_article_router)
 app.include_router(router)
 
 # ── Unified MCP Gateway Middleware ──────────────────────────────────────────

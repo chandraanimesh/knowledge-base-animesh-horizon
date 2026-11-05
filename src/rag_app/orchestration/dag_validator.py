@@ -5,7 +5,7 @@ task allowlists, fan-out/concurrency limits, and budget sanity.
 """
 
 from collections import defaultdict, deque
-from typing import Optional
+from typing import Any, Optional
 
 from rag_app.schemas.workflow import (
     AdaptiveTaskPlan,
@@ -28,6 +28,7 @@ def validate_task_dag(
     max_concurrency_limit: int = 5,
     max_tasks_limit: int = 15,
     max_replan_iterations: int = 3,
+    capability_registry: Optional[Any] = None,
     raise_on_error: bool = False,
 ) -> DAGValidationResult:
     """
@@ -91,6 +92,14 @@ def validate_task_dag(
             errors.append(f"Task '{task.task_key}' has negative estimated_provider_calls.")
         if task.timeout_seconds < 1:
             errors.append(f"Task '{task.task_key}' has invalid timeout_seconds ({task.timeout_seconds}).")
+
+        # Unknown capability verification (fail closed)
+        if capability_registry is not None and task.capability_id:
+            cap = capability_registry.get(task.capability_id)
+            if not cap:
+                errors.append(
+                    f"Task '{task.task_key}' references unknown or unregistered capability '{task.capability_id}'."
+                )
 
     # 4. Dependency existence check
     for task in plan.tasks:

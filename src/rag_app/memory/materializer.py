@@ -127,14 +127,35 @@ class MemoryMaterializer:
         if not candidate.user_id:
             raise ValueError("user_id is required to materialize memory")
 
+        from datetime import datetime, timezone, timedelta
+        from rag_app.db.models import MemoryProcessingJob, ChatMessage, MemoryTombstone
+        from rag_app.memory.privacy_service import MemoryPrivacyService
+
+        # Policy Gate: Check if memory collection is enabled for this user/workspace scope
+        is_enabled = await MemoryPrivacyService.is_collection_enabled(
+            session=session,
+            user_id=candidate.user_id,
+            workspace_id=candidate.workspace_id,
+        )
+        if not is_enabled:
+            logger.info(
+                "skipped_memory_collection_disabled_by_policy",
+                extra={
+                    "event": "skipped_memory_collection_disabled_by_policy",
+                    "user_id": str(candidate.user_id),
+                    "workspace_id": str(candidate.workspace_id) if candidate.workspace_id else None,
+                },
+            )
+            return None
+
         raw_type = (
             candidate.memory_type.value
             if hasattr(candidate.memory_type, "value")
             else str(candidate.memory_type).upper()
         )
-        # Map to database constraint ('STATIC', 'DYNAMIC') while preserving granular category in structured_data
-        if raw_type in ("STATIC", "SEMANTIC"):
-            mem_type = "STATIC"
+        # Support full Milestone 9 structured memory types + legacy tiers
+        if raw_type in ("EPISODIC", "SEMANTIC", "PROCEDURAL", "STATIC", "DYNAMIC"):
+            mem_type = raw_type
         else:
             mem_type = "DYNAMIC"
 
@@ -149,11 +170,26 @@ class MemoryMaterializer:
             candidate.content,
         )
 
-        # 0. Check tombstone: Has this canonical fact been archived/forgotten by the user?
-        # A delayed or retried job whose source event was created on or before the archive timestamp
-        # must NOT resurrect a forgotten memory.
-        from datetime import datetime, timezone
-        from rag_app.db.models import MemoryProcessingJob, ChatMessage
+        # 0. Anti-resurrection check: Has this canonical key been tombstoned?
+        tombstone = await session.scalar(
+            select(MemoryTombstone)
+            .where(
+                MemoryTombstone.user_id == candidate.user_id,
+                MemoryTombstone.canonical_key == canonical_key,
+            )
+            .limit(1)
+        )
+        if tombstone:
+            logger.info(
+                "skipped_tombstoned_memory_materialization",
+                extra={
+                    "event": "skipped_tombstoned_memory_materialization",
+                    "user_id": str(candidate.user_id),
+                    "canonical_key": canonical_key,
+                    "reason": tombstone.reason,
+                },
+            )
+            return None
 
         source_time = None
         if candidate.source_job_id:
@@ -235,11 +271,18 @@ class MemoryMaterializer:
                 )
                 .values(
                     status="SUPERSEDED",
+                    valid_until=func.now(),
                     updated_at=func.now(),
                 )
             )
 
         # 2. Upsert MemoryItem with appropriate conflict target based on scope
+        retention_exp = candidate.retention_expires_at
+        if retention_exp is None:
+            policy = await MemoryPrivacyService.get_effective_policy(session, candidate.user_id, candidate.workspace_id)
+            if policy.retention_days is not None:
+                retention_exp = datetime.now(timezone.utc) + timedelta(days=policy.retention_days)
+
         insert_values = dict(
             user_id=candidate.user_id,
             workspace_id=candidate.workspace_id,
@@ -252,7 +295,7 @@ class MemoryMaterializer:
             confidence=candidate.confidence,
             valid_from=candidate.valid_from,
             valid_until=candidate.valid_until,
-            retention_expires_at=candidate.retention_expires_at,
+            retention_expires_at=retention_exp,
             source_job_id=candidate.source_job_id,
             source_type=candidate.source_type,
             conversation_id=candidate.conversation_id,
@@ -320,6 +363,13 @@ class MemoryMaterializer:
                 workspace_id=candidate.workspace_id,
             )
 
+        # 4. Living User Profile recompile hook
+        try:
+            from rag_app.memory.profile_compiler import compile_user_profile
+            await compile_user_profile(user_id=candidate.user_id, session=session)
+        except Exception as p_err:
+            logger.warning(f"Profile compilation hook skipped: {p_err}")
+
         return memory_item
 
     @staticmethod
@@ -360,6 +410,7 @@ class MemoryMaterializer:
             .values(
                 status="SUPERSEDED",
                 superseded_by_id=new_memory_id,
+                valid_until=func.now(),
                 updated_at=func.now(),
             )
         )

@@ -184,6 +184,8 @@ export interface GenerateResponse {
   coverage?: CoverageReport | null;
   workflow_run_id?: string | null;
   workflow_status?: string | null;
+  routing_mode?: string | null;
+  routing_reason?: string | null;
 }
 
 export interface ConversationItem {
@@ -207,6 +209,10 @@ export interface ChatMessageRecord {
   created_at: string;
   artifacts?: ArtifactMetadata[];
   coverage?: CoverageReport | null;
+  workflow_run_id?: string | null;
+  workflow_status?: string | null;
+  routing_mode?: string | null;
+  routing_reason?: string | null;
 }
 
 export interface ConversationDetail {
@@ -255,5 +261,85 @@ export async function deleteConversation(id: string, token: string): Promise<{ s
   return apiClient<{ status: string; id: string }>(`/conversations/${id}`, {
     method: 'DELETE',
   }, token);
+}
+
+export interface StreamChatHandlers {
+  onStart?: (event: { request_id: string; conversation_id: string; query: string; routing_mode?: string; routing_reason?: string }) => void;
+  onToken?: (delta: string) => void;
+  onToolStart?: (event: { tool: string; input: any }) => void;
+  onTrace?: (trace: any) => void;
+  onDone?: (data: GenerateResponse) => void;
+  onError?: (err: Error) => void;
+}
+
+export async function streamChat(
+  request: GenerateRequest,
+  token: string,
+  handlers: StreamChatHandlers,
+  signal?: AbortSignal
+): Promise<void> {
+  const response = await fetch('/chat/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(request),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(errText || `Streaming failed with status ${response.status}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No readable stream available in response');
+
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop() || '';
+
+      for (const block of lines) {
+        if (!block.trim()) continue;
+        const eventMatch = block.match(/^event:\s*(\w+)/m);
+        const dataMatch = block.match(/^data:\s*(.+)$/m);
+
+        const eventType = eventMatch ? eventMatch[1] : 'token';
+        const rawData = dataMatch ? dataMatch[1] : '{}';
+
+        try {
+          const parsed = JSON.parse(rawData);
+          if (eventType === 'start') {
+            handlers.onStart?.(parsed);
+          } else if (eventType === 'token' && parsed.delta) {
+            handlers.onToken?.(parsed.delta);
+          } else if (eventType === 'tool_start') {
+            handlers.onToolStart?.(parsed);
+          } else if (eventType === 'trace') {
+            handlers.onTrace?.(parsed);
+          } else if (eventType === 'done') {
+            handlers.onDone?.(parsed);
+          } else if (eventType === 'error') {
+            handlers.onError?.(new Error(parsed.message || 'Stream error'));
+          }
+        } catch {
+          // If parsing block fails, ignore malformed fragment
+        }
+      }
+    }
+  } catch (err: any) {
+    if (signal?.aborted) return;
+    handlers.onError?.(err);
+    throw err;
+  }
 }
 

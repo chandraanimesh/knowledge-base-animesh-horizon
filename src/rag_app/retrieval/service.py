@@ -1,6 +1,7 @@
 
 import logging
 import math
+from typing import Any
 from dataclasses import dataclass
 import uuid
 import time
@@ -139,6 +140,7 @@ class RetrievalService:
         allowed_departments: list[uuid.UUID] | None = None,
         allowed_documents: list[uuid.UUID] | None = None,
         workspace_id: uuid.UUID | None = None,
+        workspace_config: dict[str, Any] | None = None,
     ) -> RetrievalResponse:
         record_stage_start("retrieval")
         try:
@@ -149,6 +151,7 @@ class RetrievalService:
                 allowed_departments=allowed_departments,
                 allowed_documents=allowed_documents,
                 workspace_id=workspace_id,
+                workspace_config=workspace_config,
             )
         finally:
             record_stage_end("retrieval")
@@ -161,10 +164,14 @@ class RetrievalService:
         allowed_departments: list[uuid.UUID] | None = None,
         allowed_documents: list[uuid.UUID] | None = None,
         workspace_id: uuid.UUID | None = None,
+        workspace_config: dict[str, Any] | None = None,
     ) -> RetrievalResponse:
 
         ws_cfg: dict = {}
-        if workspace_id and self.session:
+        if workspace_config is not None:
+            # Phase 5E: Use frozen runtime configuration snapshot if provided
+            ws_cfg = workspace_config
+        elif workspace_id and self.session:
             from rag_app.db.models import WorkspaceProviderProfile
             ws_prof = await self.session.scalar(
                 select(WorkspaceProviderProfile).where(
@@ -1106,6 +1113,8 @@ class RetrievalService:
             allowed_departments=allowed_departments,
         )
 
+        results = await self._inject_active_errata_overrides(results)
+
         return RetrievalResponse(
             query=query,
             results=results,
@@ -1209,6 +1218,9 @@ class RetrievalService:
                 Document,
                 Document.id
                 == DocumentChunk.document_id,
+            )
+            .where(
+                DocumentChunk.is_active.is_(True),
             )
         )
 
@@ -1328,7 +1340,8 @@ class RetrievalService:
                 Document.id == DocumentChunk.document_id,
             )
             .where(
-                DocumentChunk.id.in_(best_chunk_ids)
+                DocumentChunk.id.in_(best_chunk_ids),
+                DocumentChunk.is_active.is_(True),
             )
         )
 
@@ -1646,7 +1659,10 @@ class RetrievalService:
         chunk_stmt = (
             select(DocumentChunk, Document)
             .join(Document, Document.id == DocumentChunk.document_id)
-            .where(DocumentChunk.node_id.in_(all_expanded_section_ids))
+            .where(
+                DocumentChunk.node_id.in_(all_expanded_section_ids),
+                DocumentChunk.is_active.is_(True),
+            )
         )
         if allowed_departments is not None or allowed_documents is not None:
             doc_conds = []
@@ -2523,3 +2539,68 @@ class RetrievalService:
                 )
 
         return chunk_hierarchy
+
+    async def _inject_active_errata_overrides(
+        self,
+        chunks: list[RetrievedChunk],
+    ) -> list[RetrievedChunk]:
+        """
+        Feature 3: Document Errata / Verified Correction Layer
+        Batch-queries active, approved errata notes for all parent documents in chunks
+        using a single IN query (strictly 0 N+1 queries).
+        Augments chunks with verified correction headers while preserving original source text.
+        """
+        if not chunks:
+            return chunks
+
+        doc_uuids = []
+        for c in chunks:
+            try:
+                doc_uuids.append(uuid.UUID(str(c.document_id)))
+            except (ValueError, TypeError):
+                continue
+
+        if not doc_uuids:
+            return chunks
+
+        from rag_app.knowledge.errata_service import ErrataService
+        errata_svc = ErrataService(self.session)
+        notes_by_doc = await errata_svc.get_active_errata_for_documents(list(set(doc_uuids)))
+
+        if not notes_by_doc:
+            return chunks
+
+        augmented_chunks = []
+        for c in chunks:
+            try:
+                doc_id = uuid.UUID(str(c.document_id))
+            except (ValueError, TypeError):
+                augmented_chunks.append(c)
+                continue
+
+            active_notes = notes_by_doc.get(doc_id)
+            if not active_notes:
+                augmented_chunks.append(c)
+                continue
+
+            errata_lines = []
+            note_texts = []
+            for note in active_notes:
+                ref_str = f" (Evidence: {note.evidence_reference})" if note.evidence_reference else ""
+                errata_lines.append(f"• [VERIFIED CORRECTION | Status: {note.approval_status}]: {note.correction_text}{ref_str}")
+                note_texts.append(note.correction_text)
+
+            augmented_text = (
+                f"⚠️ [ACTIVE DOCUMENT ERRATA / VERIFIED CORRECTION]:\n"
+                + "\n".join(errata_lines)
+                + f"\n\n[ORIGINAL DOCUMENT TEXT]:\n{c.text}"
+            )
+
+            augmented_c = c.model_copy(update={
+                "text": augmented_text,
+                "has_errata": True,
+                "errata_notes": note_texts,
+            })
+            augmented_chunks.append(augmented_c)
+
+        return augmented_chunks

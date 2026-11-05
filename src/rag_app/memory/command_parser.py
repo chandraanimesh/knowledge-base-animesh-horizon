@@ -189,7 +189,20 @@ def detect_memory_candidate_rules(text: str) -> tuple[bool, bool, dict]:
     if any(re.search(pat, norm) for pat in transient_patterns):
         return False, True, {}
 
-    # 2. Check clear preferences (STATIC / ETERNAL)
+    # 2. Check procedural instructions & guidelines (PROCEDURAL / STABLE)
+    # Evaluated before general preferences so "I prefer step-by-step explanations" -> PROCEDURAL
+    procedural_patterns = [
+        r"\b(?:always\s+format|always\s+respond|always\s+generate|follow\s+pep|coding\s+standard|workflow\s+rule|naming\s+convention|response\s+format|in\s+json\s+format|in\s+markdown\s+table|step-by-step(?:\s+explanations?)?|bullet\s+points?)\b",
+    ]
+    if any(re.search(pat, norm) for pat in procedural_patterns):
+        return True, False, {
+            "memory_type": MemoryType.PROCEDURAL,
+            "stability_tier": StabilityTier.STABLE,
+            "importance_signals": ["instruction", "convention"],
+            "topic_key": extract_memory_topic_key(clean),
+        }
+
+    # 3. Check clear preferences (STATIC / ETERNAL)
     preference_patterns = [
         (r"\b(?:i\s+prefer|i\s+like|i\s+always\s+want|my\s+preference\s+is)\b", "preference", StabilityTier.ETERNAL),
         (r"\b(?:my\s+role\s+is|i\s+am\s+a|i'm\s+a|i\s+work\s+as)\b", "role", StabilityTier.ETERNAL),
@@ -205,7 +218,7 @@ def detect_memory_candidate_rules(text: str) -> tuple[bool, bool, dict]:
                 "topic_key": extract_memory_topic_key(clean),
             }
 
-    # 3. Check commitments / active task context (DYNAMIC / EVOLVING)
+    # 4. Check commitments / active task context (DYNAMIC / EVOLVING)
     task_patterns = [
         r"\b(?:i\s+am\s+currently\s+working\s+on|working\s+on\s+ticket|reviewing\s+the)\b",
         r"\b(?:i\s+will\s+deliver|committed\s+to|planning\s+to|scheduled\s+to)\b",
@@ -218,15 +231,27 @@ def detect_memory_candidate_rules(text: str) -> tuple[bool, bool, dict]:
             "topic_key": extract_memory_topic_key(clean),
         }
 
-    # 4. Check durable decisions / project conventions (SEMANTIC / STABLE)
+    # 5. Check durable decisions / project conventions (SEMANTIC / STABLE)
     decision_patterns = [
-        r"\b(?:we\s+decided\s+to|our\s+decision\s+is|agreed\s+to\s+use|we\s+adopt)\b",
+        r"\b(?:(?:our\s+)?(?:backend|frontend|database|system|stack|app|service|server)\s+(?:uses|is\s+built\s+with|is\s+based\s+on)|we\s+decided\s+to|our\s+decision\s+is|agreed\s+to\s+use|we\s+adopt|architecture\s+is|stack\s+is)\b",
     ]
     if any(re.search(pat, norm) for pat in decision_patterns):
         return True, False, {
             "memory_type": MemoryType.SEMANTIC,
             "stability_tier": StabilityTier.STABLE,
-            "importance_signals": ["decision"],
+            "importance_signals": ["decision", "project_architecture"],
+            "topic_key": extract_memory_topic_key(clean),
+        }
+
+    # 6. Check episodic events & milestones (EPISODIC / EVOLVING)
+    episodic_patterns = [
+        r"\b(?:(?:yesterday|last\s+week|last\s+month|on\s+monday|on\s+friday)\s+(?:i|we)|(?:i|we)\s+attended\b|completed\s+(?:the\s+)?(?:migration|sprint|release|project|review|milestone)|deployed\s+version|incident\s+occurred|met\s+with\s+client|meeting\s+with\s+client)\b",
+    ]
+    if any(re.search(pat, norm) for pat in episodic_patterns):
+        return True, False, {
+            "memory_type": MemoryType.EPISODIC,
+            "stability_tier": StabilityTier.EVOLVING,
+            "importance_signals": ["event", "milestone"],
             "topic_key": extract_memory_topic_key(clean),
         }
 

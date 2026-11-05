@@ -57,6 +57,19 @@ class MemoryRetrievalService:
         if not user_id:
             raise ValueError("user_id is required for memory retrieval")
 
+        from rag_app.db.models import MemoryTombstone
+        from rag_app.memory.privacy_service import MemoryPrivacyService
+
+        # Privacy Policy Check: Is personal memory retrieval permitted?
+        is_retrieval_ok = await MemoryPrivacyService.is_retrieval_enabled(session, user_id, workspace_id)
+        if not is_retrieval_ok:
+            logger.info("memory_retrieval_blocked_by_policy", extra={"event": "memory_retrieval_blocked_by_policy", "user_id": str(user_id)})
+            return MemoryRetrievalResponse(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                total_count=0,
+            )
+
         now = reference_time or datetime.now(timezone.utc)
 
         workspace_filter = (
@@ -65,11 +78,18 @@ class MemoryRetrievalService:
             else MemoryItem.workspace_id.is_(None)
         )
 
-        # Base filter: strict user and workspace isolation, ACTIVE status only, valid time window, storage retention
+        tombstone_subquery = (
+            select(MemoryTombstone.canonical_key)
+            .where(MemoryTombstone.user_id == user_id)
+            .scalar_subquery()
+        )
+
+        # Base filter: strict user and workspace isolation, ACTIVE status only, valid time window, storage retention, anti-resurrection
         base_filters = [
             MemoryItem.user_id == user_id,
             workspace_filter,
             MemoryItem.status == MemoryStatus.ACTIVE.value,
+            MemoryItem.canonical_key.not_in(tombstone_subquery),
             or_(
                 MemoryItem.valid_until.is_(None),
                 MemoryItem.valid_until > now,
